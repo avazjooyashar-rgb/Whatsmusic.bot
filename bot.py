@@ -1,5 +1,6 @@
-import json, asyncio, sqlite3, datetime, os, re, tempfile, glob, time, hmac, hashlib, base64, uuid, subprocess, logging
-from urllib.parse import quote
+import json, asyncio, sqlite3, datetime, os, re, tempfile, glob, time, hmac, hashlib, base64, uuid, subprocess, logging, html, shutil
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import quote, urlparse, parse_qs
 import requests
 import yt_dlp
 from telegram import (Update, InlineKeyboardButton as Btn, InlineKeyboardMarkup as Markup,
@@ -7,15 +8,23 @@ from telegram import (Update, InlineKeyboardButton as Btn, InlineKeyboardMarkup 
 from telegram.ext import (Application, CommandHandler, MessageHandler, CallbackQueryHandler,
                           InlineQueryHandler, filters, ContextTypes)
 
+try:  # python-telegram-bot >= 21
+    from telegram import LinkPreviewOptions
+    NO_PREVIEW = {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
+except ImportError:  # older versions
+    NO_PREVIEW = {"disable_web_page_preview": True}
+
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "Whatsmuziccbot").lstrip("@")
 ACR_HOST = os.environ.get("ACR_HOST")
 ACR_KEY = os.environ.get("ACR_KEY")
 ACR_SECRET = os.environ.get("ACR_SECRET")
 AUDD_TOKEN = os.environ.get("AUDD_TOKEN")
+ODESLI_KEY = os.environ.get("ODESLI_KEY")  # optional
 ENGINE_ORDER = os.environ.get("ENGINES", "acr,audd").split(",")
 DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "20"))
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
@@ -29,6 +38,32 @@ URL_RE = re.compile(r"https?://\S+")
 DIRECT_HOSTS = ("youtube.com", "youtu.be", "instagram.com", "music.youtube.com")
 CLIP_HOSTS = ("youtube.com", "youtu.be", "instagram.com")
 MP3_PREFIX = "🎵 "
+
+esc = html.escape
+
+
+# ---------- URL helpers ----------
+def norm_url(url: str) -> str:
+    """Clean a link so the same clip always gets the same cache key."""
+    try:
+        u = urlparse(url)
+        host = u.netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+        if host == "youtu.be":
+            return "https://www.youtube.com/watch?v=" + u.path.strip("/")
+        if host.endswith("youtube.com"):
+            if u.path == "/watch":
+                v = parse_qs(u.query).get("v", [None])[0]
+                if v:
+                    return "https://www.youtube.com/watch?v=" + v
+            if u.path.startswith("/shorts/"):
+                return "https://www.youtube.com/watch?v=" + u.path.split("/")[2]
+        if host.endswith("instagram.com"):
+            return "https://www.instagram.com" + u.path.rstrip("/")
+    except Exception:
+        pass
+    return url
 
 
 # ---------- Engine 1: ACRCloud ----------
@@ -52,11 +87,13 @@ def acr_identify(path: str, acc):
     m = r["metadata"]["music"][0]
     ext = m.get("external_metadata", {})
     link = None
+    yt = None
     if ext.get("spotify", {}).get("track", {}).get("id"):
         link = "https://open.spotify.com/track/" + ext["spotify"]["track"]["id"]
-    elif ext.get("youtube", {}).get("vid"):
-        link = "https://www.youtube.com/watch?v=" + ext["youtube"]["vid"]
-    return {"title": m["title"], "artist": m["artists"][0]["name"], "link": link}
+    if ext.get("youtube", {}).get("vid"):
+        yt = "https://www.youtube.com/watch?v=" + ext["youtube"]["vid"]
+        link = link or yt
+    return {"title": m["title"], "artist": m["artists"][0]["name"], "link": link, "yt": yt}
 
 
 # ---------- Engine 2: AudD ----------
@@ -79,8 +116,11 @@ ENGINE_FN = {"acr": acr_identify, "audd": audd_identify}
 
 
 # ---------- Odesli ----------
-def odesli_to_youtube(link: str):
-    r = requests.get("https://api.song.link/v1-alpha.1/links", params={"url": link}, timeout=20)
+def odesli_to_youtube(link: str, timeout: int = 8):
+    params = {"url": link}
+    if ODESLI_KEY:
+        params["key"] = ODESLI_KEY
+    r = requests.get("https://api.song.link/v1-alpha.1/links", params=params, timeout=timeout)
     if not r.ok:
         return None, None
     j = r.json()
@@ -91,20 +131,50 @@ def odesli_to_youtube(link: str):
     return yt, name
 
 
+def pick_target(song: dict) -> str:
+    """Fastest way to the audio: known YouTube link > Odesli > search."""
+    if song.get("yt"):
+        return song["yt"]
+    link = song.get("link") or ""
+    if "youtube.com/watch" in link or "youtu.be/" in link:
+        return link
+    if link:
+        try:
+            yt, _ = odesli_to_youtube(link, timeout=4)
+            if yt:
+                return yt
+        except Exception:
+            pass
+    return f"ytsearch1:{song['artist']} - {song['title']}"
+
+
 # ---------- yt-dlp ----------
 def ydl_base():
-    o = {"quiet": True, "noplaylist": True}
+    o = {"quiet": True, "noplaylist": True,
+         "concurrent_fragment_downloads": 4,
+         "http_chunk_size": 10 * 1024 * 1024}
     if os.path.exists(COOKIES):
         o["cookiefile"] = COOKIES
     return o
 
 
-def download_mp3(target: str, outdir: str, fallback=None):
-    if not URL_RE.match(target) and not target.startswith("ytsearch"):
+def to_mp3(src: str) -> str:
+    out = os.path.splitext(src)[0] + ".mp3"
+    subprocess.run(["ffmpeg", "-y", "-i", src, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", out],
+                   check=True, capture_output=True, timeout=300)
+    try:
+        os.remove(src)
+    except OSError:
+        pass
+    return out
+
+
+def download_audio(target: str, outdir: str, fallback=None):
+    """Download audio as-is (m4a) without re-encoding. Only converts odd formats to mp3."""
+    if not URL_RE.match(target) and not target.startswith(("ytsearch", "scsearch")):
         target = f"ytsearch1:{target}"
-    opts = {**ydl_base(), "format": "bestaudio/best",
-            "outtmpl": f"{outdir}/%(title).80s.%(ext)s",
-            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]}
+    opts = {**ydl_base(), "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "outtmpl": f"{outdir}/%(id)s.%(ext)s"}
 
     def run(t):
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -122,7 +192,16 @@ def download_mp3(target: str, outdir: str, fallback=None):
             raise
         log.warning("youtube failed (%s), trying soundcloud", str(e)[:80])
         info = run(f"scsearch1:{fallback}")
-    return glob.glob(f"{outdir}/*.mp3")[0], info.get("title", "music")
+    files = [f for f in glob.glob(f"{outdir}/*") if not f.endswith((".part", ".ytdl", ".json"))]
+    if not files:
+        raise RuntimeError("فایل صوتی ساخته نشد")
+    path = max(files, key=os.path.getmtime)
+    if not path.lower().endswith((".m4a", ".mp3")):
+        path = to_mp3(path)
+    vid = info.get("id") if info.get("extractor_key") == "Youtube" else None
+    dur = info.get("duration")
+    return {"path": path, "title": info.get("title", "music"), "vid": vid,
+            "duration": int(dur) if dur else None}
 
 
 def download_clip(url: str, outdir: str):
@@ -178,16 +257,17 @@ def make_samples(src: str, sid: str) -> list:
         offs = [max(0, min(o, d - win)) for o in offs]
     else:
         offs = [0]
-    outs, seen = [], set()
+    jobs, seen = [], set()
     for i, o in enumerate(offs):
         o = round(o)
         if o in seen:
             continue
         seen.add(o)
-        out = os.path.join(SAMPLES_DIR, f"{sid}_{i}.mp3")
-        if cut_sample(src, out, o, win):
-            outs.append(out)
-    return outs
+        jobs.append((os.path.join(SAMPLES_DIR, f"{sid}_{i}.mp3"), o))
+    # cut all samples at the same time instead of one by one
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        res = list(ex.map(lambda j: j[0] if cut_sample(src, j[0], j[1], win) else None, jobs))
+    return [r for r in res if r]
 
 
 def yt_search(query: str, n: int = 10):
@@ -203,11 +283,66 @@ def resolve(text: str):
         url = m.group(0)
         if any(h in url for h in DIRECT_HOSTS):
             return url, None
-        yt, name = odesli_to_youtube(url)
+        yt, name = odesli_to_youtube(url, timeout=20)
         if not yt and not name:
             raise ValueError("این لینک پشتیبانی نمیشه")
         return (yt or f"ytsearch1:{name}"), name
     return text, text
+
+
+# ---------- Lyrics ----------
+def clean_title(t: str) -> str:
+    return re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", t or "").strip()
+
+
+def get_lyrics(artist: str, title: str):
+    key = f"{artist}|{title}".lower()
+    with db() as c:
+        r = c.execute("SELECT text FROM lyrics WHERE key=?", (key,)).fetchone()
+    if r:
+        return r[0]
+    t = clean_title(title) or title
+    a = (artist or "").split("/")[0].split(",")[0].strip()
+    text = None
+    try:
+        tries = []
+        if a:
+            tries.append({"track_name": t, "artist_name": a})
+        tries.append({"q": f"{a} {t}".strip()})
+        for params in tries:
+            r = requests.get("https://lrclib.net/api/search", params=params, timeout=10)
+            if r.ok:
+                for it in r.json():
+                    if it.get("plainLyrics"):
+                        text = it["plainLyrics"]
+                        break
+            if text:
+                break
+    except Exception as e:
+        log.warning("lrclib failed: %s", e)
+    if not text and a:
+        try:
+            r = requests.get(f"https://api.lyrics.ovh/v1/{quote(a, safe='')}/{quote(t, safe='')}", timeout=10)
+            if r.ok:
+                text = r.json().get("lyrics")
+        except Exception as e:
+            log.warning("lyrics.ovh failed: %s", e)
+    if text:
+        with db() as c:
+            c.execute("INSERT OR REPLACE INTO lyrics VALUES(?,?)", (key, text))
+    return text
+
+
+def split_text(t: str, n: int = 4000) -> list:
+    out, cur = [], ""
+    for line in t.splitlines(True):
+        if len(cur) + len(line) > n:
+            out.append(cur)
+            cur = ""
+        cur += line
+    if cur.strip():
+        out.append(cur)
+    return out
 
 
 # ---------- SQLite ----------
@@ -217,13 +352,25 @@ def db():
     c.execute("""CREATE TABLE IF NOT EXISTS accounts(
         id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, host TEXT, key TEXT, secret TEXT,
         enabled INTEGER DEFAULT 1, uses INTEGER DEFAULT 0, errors INTEGER DEFAULT 0)""")
-    c.execute("CREATE TABLE IF NOT EXISTS songs(key TEXT PRIMARY KEY, file_id TEXT, title TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS songs(key TEXT PRIMARY KEY, file_id TEXT, title TEXT, info TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS usage(uid INTEGER, day TEXT, n INTEGER, PRIMARY KEY(uid, day))")
     c.execute("CREATE TABLE IF NOT EXISTS users(uid INTEGER PRIMARY KEY, first_seen TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT)")
     c.execute("""CREATE TABLE IF NOT EXISTS samples(
-        id TEXT PRIMARY KEY, path TEXT, tried TEXT DEFAULT '', last TEXT, created INTEGER)""")
+        id TEXT PRIMARY KEY, path TEXT, tried TEXT DEFAULT '', last TEXT, created INTEGER, src TEXT)""")
+    c.execute("CREATE TABLE IF NOT EXISTS clips(url TEXT PRIMARY KEY, file_id TEXT, song TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS tracks(id TEXT PRIMARY KEY, title TEXT, artist TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS lyrics(key TEXT PRIMARY KEY, text TEXT)")
     return c
+
+
+def migrate():
+    """Add new columns to an old bot.db (safe to run every start)."""
+    with db() as c:
+        for table, col in (("songs", "info"), ("samples", "src")):
+            cols = [r[1] for r in c.execute(f"PRAGMA table_info({table})")]
+            if col not in cols:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
 
 
 def seed_from_env():
@@ -256,14 +403,43 @@ def touch_user(uid: int):
         c.execute("INSERT OR IGNORE INTO users VALUES(?,?)", (uid, datetime.date.today().isoformat()))
 
 
+# audio cache
 def cache_get(key):
     with db() as c:
-        return c.execute("SELECT file_id, title FROM songs WHERE key=?", (key,)).fetchone()
+        return c.execute("SELECT file_id, title, info FROM songs WHERE key=?", (key,)).fetchone()
 
 
-def cache_put(key, file_id, title):
+def cache_put(key, file_id, title, info=None):
     with db() as c:
-        c.execute("INSERT OR REPLACE INTO songs VALUES(?,?,?)", (key, file_id, title))
+        c.execute("INSERT OR REPLACE INTO songs(key,file_id,title,info) VALUES(?,?,?,?)",
+                  (key, file_id, title, info))
+
+
+# clip cache (video file_id + recognized song)
+def clip_get(url):
+    with db() as c:
+        return c.execute("SELECT file_id, song FROM clips WHERE url=?", (url,)).fetchone()
+
+
+def clip_put(url, file_id, song: dict):
+    data = {k: song.get(k) for k in ("title", "artist", "link", "yt")}
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO clips VALUES(?,?,?)",
+                  (url, file_id, json.dumps(data, ensure_ascii=False)))
+
+
+def clip_delete(url):
+    with db() as c:
+        c.execute("DELETE FROM clips WHERE url=?", (url,))
+
+
+# tracks (short id for callback buttons)
+def track_put(song: dict) -> str:
+    title, artist = song.get("title") or "", song.get("artist") or ""
+    tid = hashlib.md5(f"{artist}|{title}".lower().encode()).hexdigest()[:10]
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO tracks VALUES(?,?,?)", (tid, title, artist))
+    return tid
 
 
 def use_quota(uid: int) -> bool:
@@ -280,9 +456,9 @@ def use_quota(uid: int) -> bool:
     return True
 
 
-def add_sample(sid: str, path: str):
+def add_sample(sid: str, path: str, src=None):
     with db() as c:
-        c.execute("INSERT INTO samples(id,path,created) VALUES(?,?,?)", (sid, path, int(time.time())))
+        c.execute("INSERT INTO samples(id,path,src,created) VALUES(?,?,?,?)", (sid, path, src, int(time.time())))
 
 
 def cleanup_samples():
@@ -363,6 +539,31 @@ def recognize(paths, skip=()):
     return None
 
 
+# ---------- Captions & keyboards ----------
+def footer(src=None) -> str:
+    f = f'<a href="https://t.me/{BOT_USERNAME}">{esc(BOT_USERNAME)}</a>'
+    if src:
+        f += f' | <a href="{esc(src, quote=True)}">source</a>'
+    return f
+
+
+def result_caption(song: dict, src=None) -> str:
+    return f"<code>{esc(song['title'])} — {esc(song['artist'])}</code>\n\n{footer(src)}"
+
+
+def plain_caption(title: str, src=None, note: str = "") -> str:
+    cap = f"<code>{esc((title or 'clip')[:150])}</code>"
+    if note:
+        cap += f"\n{esc(note)}"
+    return f"{cap}\n\n{footer(src)}"
+
+
+def audio_caption(info=None) -> str:
+    if info:
+        return f'@{esc(BOT_USERNAME)} | <a href="{esc(info, quote=True)}">info</a>'
+    return f"@{esc(BOT_USERNAME)}"
+
+
 def result_keyboard(sid: str, song: dict):
     q = quote(f"{song['artist']} - {song['title']}")
     link = song.get("link") or ""
@@ -376,54 +577,196 @@ def result_keyboard(sid: str, song: dict):
     ])
 
 
-# ---------- Sending ----------
-async def send_mp3(msg, target: str, title=None, performer=None):
-    hit = cache_get(target)
-    if hit:
-        return await msg.reply_audio(hit[0], title=title or hit[1], performer=performer)
-    with tempfile.TemporaryDirectory() as tmp:
-        fb = f"{performer} - {title}" if (title and performer) else (target[10:] if target.startswith("ytsearch1:") else None)
-        path, ytitle = await asyncio.to_thread(download_mp3, target, tmp, fb)
-        with open(path, "rb") as f:
-            sent = await msg.reply_audio(f, title=title or ytitle, performer=performer,
+def audio_keyboard(tid: str, song: dict):
+    q = f"{song.get('artist', '')} {song.get('title', '')}".strip()[:200]
+    return Markup([[
+        Btn("متن ترانه 🔤", callback_data=f"lyr:{tid}"),
+        Btn("🔍", switch_inline_query_current_chat=q),
+    ]])
+
+
+# ---------- Sending audio ----------
+def song_key(song: dict) -> str:
+    return "s:" + f"{song['artist']}|{song['title']}".lower()
+
+
+async def fetch_audio(target: str, song=None) -> dict:
+    """Download step. On a cache hit returns the file_id right away."""
+    keys = [target] + ([song_key(song)] if song else [])
+    for k in keys:
+        hit = cache_get(k)
+        if hit:
+            return {"file_id": hit["file_id"], "title": hit["title"], "info": hit["info"]}
+    tmp = tempfile.mkdtemp()
+    fb = None
+    if song:
+        fb = f"{song['artist']} - {song['title']}"
+    elif target.startswith("ytsearch1:"):
+        fb = target[10:]
+    try:
+        a = await asyncio.to_thread(download_audio, target, tmp, fb)
+    except Exception:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    a["dir"] = tmp
+    a["keys"] = keys
+    return a
+
+
+async def prepare_song_audio(song: dict) -> dict:
+    target = await asyncio.to_thread(pick_target, song)
+    return await fetch_audio(target, song)
+
+
+async def deliver_audio(msg, a: dict, song=None):
+    title = (song or {}).get("title") or a["title"]
+    performer = (song or {}).get("artist") or None
+    tsong = {"title": title, "artist": performer or ""}
+    kb = audio_keyboard(track_put(tsong), tsong)
+    if "file_id" in a:
+        return await msg.reply_audio(a["file_id"], title=title, performer=performer,
+                                     caption=audio_caption(a.get("info")), parse_mode="HTML",
+                                     reply_markup=kb)
+    info = f"https://song.link/y/{a['vid']}" if a.get("vid") else None
+    try:
+        with open(a["path"], "rb") as f:
+            sent = await msg.reply_audio(f, title=title, performer=performer, duration=a.get("duration"),
+                                         caption=audio_caption(info), parse_mode="HTML", reply_markup=kb,
                                          read_timeout=300, write_timeout=300)
+    finally:
+        shutil.rmtree(a["dir"], ignore_errors=True)
     if sent.audio:
-        cache_put(target, sent.audio.file_id, title or ytitle)
+        for k in a["keys"]:
+            cache_put(k, sent.audio.file_id, title, info)
 
 
-async def send_song_mp3(msg, song: dict):
-    target = None
-    if song.get("link"):
-        try:
-            target, _ = await asyncio.to_thread(odesli_to_youtube, song["link"])
-        except Exception:
-            target = None
-    target = target or f"ytsearch1:{song['artist']} - {song['title']}"
-    await send_mp3(msg, target, title=song["title"], performer=song["artist"])
+async def send_mp3(msg, target: str, title=None, performer=None):
+    song = {"title": title, "artist": performer or ""} if title else None
+    a = await fetch_audio(target, song)
+    await deliver_audio(msg, a, song)
+
+
+# ---------- Clips ----------
+async def upload_video(msg, path: str, caption: str):
+    with open(path, "rb") as f:
+        return await msg.reply_video(f, caption=caption, parse_mode="HTML", supports_streaming=True,
+                                     read_timeout=300, write_timeout=300)
+
+
+async def identify_clip(uid: int, sid: str, meta, src: str, samples_task):
+    """Returns (song or None, quota_blocked)."""
+    try:
+        if meta:
+            if "youtu" in src:
+                meta["link"] = src
+            with open(os.path.join(SAMPLES_DIR, sid + ".json"), "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False)
+            return {"title": meta["title"], "artist": meta["artist"],
+                    "link": meta.get("link"), "engine": "meta#0"}, False
+        if not use_quota(uid):
+            return None, True
+        outs = await samples_task
+        if not outs:
+            return None, False
+        return await asyncio.to_thread(recognize, outs), False
+    except Exception:
+        log.exception("identify_clip failed")
+        return None, False
+
+
+def _msg_video_id(sent):
+    for attr in ("video", "animation", "document"):
+        obj = getattr(sent, attr, None)
+        if obj:
+            return obj.file_id
+    return None
+
+
+async def clip_from_cache(msg, src: str, hit):
+    song = json.loads(hit["song"])
+    sid = uuid.uuid4().hex[:10]
+    add_sample(sid, "", src)
+    with db() as c:
+        c.execute("UPDATE samples SET last=? WHERE id=?", ("cache#0", sid))
+    audio_task = asyncio.create_task(prepare_song_audio(song))
+    try:
+        await msg.reply_video(hit["file_id"], caption=result_caption(song, src), parse_mode="HTML",
+                              reply_markup=result_keyboard(sid, song), supports_streaming=True)
+    except Exception:
+        audio_task.cancel()
+        raise
+    try:
+        a = await audio_task
+        await deliver_audio(msg, a, song)
+    except Exception as e:
+        log.exception("cached clip audio failed")
+        await msg.reply_text(f"❌ خطا: {str(e)[:200]}")
 
 
 async def do_clip(msg, url: str):
+    uid = msg.from_user.id
+    src = norm_url(url)
     cleanup_samples()
+
+    hit = clip_get(src)
+    if hit and hit["song"]:
+        try:
+            return await clip_from_cache(msg, src, hit)
+        except Exception:
+            log.exception("clip cache send failed, re-downloading")
+            clip_delete(src)
+
     with tempfile.TemporaryDirectory() as tmp:
-        path, title, meta = await asyncio.to_thread(download_clip, url, tmp)
+        path, title, meta = await asyncio.to_thread(download_clip, src, tmp)
         if not path:
             return await msg.reply_text("⚠️ کلیپ پیدا نشد یا بزرگ‌تر از ۵۰ مگابایته.")
         sid = uuid.uuid4().hex[:10]
-        outs = await asyncio.to_thread(make_samples, path, sid)
-        kb = None
-        if outs or meta:
-            if meta:
-                if "youtu" in url:
-                    meta["link"] = url
-                with open(os.path.join(SAMPLES_DIR, sid + ".json"), "w", encoding="utf-8") as f:
-                    json.dump(meta, f, ensure_ascii=False)
-            add_sample(sid, outs[0] if outs else "")
-            kb = Markup([[Btn("🎵 شناسایی موسیقی", callback_data=f"rec:{sid}")]])
-        with open(path, "rb") as f:
-            await msg.reply_video(f, caption=title[:200], reply_markup=kb, supports_streaming=True,
-                                  read_timeout=300, write_timeout=300)
+        add_sample(sid, "", src)
+
+        # everything below runs at the same time:
+        samples_task = asyncio.create_task(asyncio.to_thread(make_samples, path, sid))
+        song_task = asyncio.create_task(identify_clip(uid, sid, meta, src, samples_task))
+        upload_task = asyncio.create_task(
+            upload_video(msg, path, f"⏳ در حال شناسایی موسیقی...\n\n{footer(src)}"))
+        audio_task = None
+        try:
+            song, blocked = await song_task
+            if song:
+                with db() as c:
+                    c.execute("UPDATE samples SET last=? WHERE id=?", (song.get("engine"), sid))
+                # start downloading the mp3 while the video is still uploading
+                audio_task = asyncio.create_task(prepare_song_audio(song))
+            sent = await upload_task
+
+            if song:
+                cap, kb = result_caption(song, src), result_keyboard(sid, song)
+                fid = _msg_video_id(sent)
+                if fid:
+                    clip_put(src, fid, song)
+            else:
+                note = "⛔ سقف تشخیص امروزت پر شده" if blocked else ""
+                cap = plain_caption(title, src, note)
+                kb = None if blocked else Markup([[Btn("🎵 شناسایی موسیقی", callback_data=f"rec:{sid}")]])
+            try:
+                await sent.edit_caption(caption=cap, parse_mode="HTML", reply_markup=kb)
+            except Exception:
+                log.warning("edit caption failed", exc_info=True)
+
+            if audio_task:
+                try:
+                    a = await audio_task
+                    await deliver_audio(msg, a, song)
+                except Exception as e:
+                    log.exception("clip audio failed")
+                    await msg.reply_text(f"❌ خطا: {str(e)[:200]}")
+        finally:
+            for t in (audio_task, upload_task):
+                if t and not t.done():
+                    t.cancel()
+            await asyncio.gather(samples_task, return_exceptions=True)
 
 
+# ---------- Voice / audio from user ----------
 async def handle_media(msg, media, status):
     if not use_quota(msg.from_user.id):
         return await status.edit_text("⛔ سقف تشخیص امروزت پر شده، فردا دوباره امتحان کن.")
@@ -444,9 +787,15 @@ async def handle_media(msg, media, status):
         return await status.edit_text("😕 آهنگ رو نشناختم.")
     with db() as c:
         c.execute("UPDATE samples SET last=? WHERE id=?", (song["engine"], sid))
-    caption = f"🎵 {song['artist']} - {song['title']}\n({song['engine']})"
-    await status.edit_text(caption, reply_markup=result_keyboard(sid, song))
-    await send_song_mp3(msg, song)
+    audio_task = asyncio.create_task(prepare_song_audio(song))
+    await status.edit_text(result_caption(song), parse_mode="HTML",
+                           reply_markup=result_keyboard(sid, song), **NO_PREVIEW)
+    try:
+        a = await audio_task
+        await deliver_audio(msg, a, song)
+    except Exception as e:
+        log.exception("mp3 failed")
+        await msg.reply_text(f"❌ خطا: {str(e)[:200]}")
 
 
 async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -486,10 +835,12 @@ async def on_rec(q, data: str):
     uid = q.from_user.id
     with db() as c:
         row = c.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+    if row and action == "bad" and row["src"]:
+        clip_delete(row["src"])  # wrong result must not stay in the clip cache
     paths = sorted(glob.glob(os.path.join(SAMPLES_DIR, f"{sid}_*")))
     mpath = os.path.join(SAMPLES_DIR, f"{sid}.json")
     if not row or not (paths or os.path.exists(mpath)):
-        return await q.answer("نمونه منقضی شده، دوباره بفرست.", show_alert=True)
+        return await q.answer("نمونه منقضی شده، لینک یا فایل رو دوباره بفرست.", show_alert=True)
     tried = [t for t in (row["tried"] or "").split(",") if t]
     if action == "bad" and row["last"]:
         tried.append(row["last"])
@@ -517,20 +868,39 @@ async def on_rec(q, data: str):
         return await q.message.reply_text(txt)
     with db() as c:
         c.execute("UPDATE samples SET last=? WHERE id=?", (song["engine"], sid))
-    caption = f"🎵 {song['artist']} - {song['title']}\n({song['engine']})"
+    src = row["src"]
     kb = result_keyboard(sid, song)
+    cap = result_caption(song, src)
+    audio_task = asyncio.create_task(prepare_song_audio(song))
     try:
         if q.message.text:
-            await q.edit_message_text(caption, reply_markup=kb)
+            await q.edit_message_text(cap, parse_mode="HTML", reply_markup=kb, **NO_PREVIEW)
         else:
-            await q.edit_message_caption(caption=caption, reply_markup=kb)
+            await q.edit_message_caption(caption=cap, parse_mode="HTML", reply_markup=kb)
     except Exception:
-        await q.message.reply_text(caption, reply_markup=kb)
+        await q.message.reply_text(cap, parse_mode="HTML", reply_markup=kb, **NO_PREVIEW)
+    if src and getattr(q.message, "video", None):
+        clip_put(src, q.message.video.file_id, song)
     try:
-        await send_song_mp3(q.message, song)
+        a = await audio_task
+        await deliver_audio(q.message, a, song)
     except Exception as e:
         log.exception("mp3 failed")
         await q.message.reply_text(f"❌ خطا: {str(e)[:200]}")
+
+
+async def on_lyrics(q, data: str):
+    tid = data.split(":", 1)[1]
+    with db() as c:
+        row = c.execute("SELECT * FROM tracks WHERE id=?", (tid,)).fetchone()
+    if not row:
+        return await q.answer("اطلاعات آهنگ پیدا نشد.", show_alert=True)
+    await q.answer("⏳ در حال پیدا کردن متن ترانه...")
+    text = await asyncio.to_thread(get_lyrics, row["artist"], row["title"])
+    if not text:
+        return await q.message.reply_text("😕 متن این آهنگ پیدا نشد.")
+    for chunk in split_text(f"🎤 {row['title']}\n\n{text}"):
+        await q.message.reply_text(chunk)
 
 
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -539,6 +909,8 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     touch_user(q.from_user.id)
     if data.startswith(("rec:", "bad:")):
         return await on_rec(q, data)
+    if data.startswith("lyr:"):
+        return await on_lyrics(q, data)
     if data.startswith(("adm:", "acc:")):
         if q.from_user.id not in ADMIN_IDS:
             return await q.answer("⛔", show_alert=True)
@@ -602,10 +974,12 @@ def stats_text() -> str:
         new = c.execute("SELECT COUNT(*) FROM users WHERE first_seen=?", (day,)).fetchone()[0]
         act, rec = c.execute("SELECT COUNT(*), COALESCE(SUM(n),0) FROM usage WHERE day=?", (day,)).fetchone()
         songs = c.execute("SELECT COUNT(*) FROM songs").fetchone()[0]
+        clips = c.execute("SELECT COUNT(*) FROM clips").fetchone()[0]
         accs = c.execute("SELECT COUNT(*) FROM accounts WHERE enabled=1").fetchone()[0]
     lim = daily_limit()
     return (f"📊 آمار\n👥 کل کاربران: {users}\n🆕 جدید امروز: {new}\n"
             f"🎧 شناسایی امروز: {rec} (از {act} نفر)\n💾 آهنگ‌های کش‌شده: {songs}\n"
+            f"🎬 کلیپ‌های کش‌شده: {clips}\n"
             f"🟢 اکانت فعال: {accs}\n⚙️ سقف روزانه: {'نامحدود' if lim <= 0 else lim}")
 
 
@@ -776,6 +1150,7 @@ async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    migrate()
     seed_from_env()
     app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
     for name, fn in [("start", cmd_start), ("admin", cmd_admin), ("addacr", cmd_addacr),
