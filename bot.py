@@ -1,10 +1,12 @@
 import json, asyncio, sqlite3, datetime, os, re, tempfile, glob, time, hmac, hashlib, base64, uuid, subprocess, logging, html, shutil
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from urllib.parse import quote, urlparse, parse_qs
 import requests
 import yt_dlp
 from telegram import (Update, InlineKeyboardButton as Btn, InlineKeyboardMarkup as Markup,
                       InlineQueryResultArticle, InputTextMessageContent)
+from telegram.constants import ChatAction
 from telegram.ext import (Application, CommandHandler, MessageHandler, CallbackQueryHandler,
                           InlineQueryHandler, filters, ContextTypes)
 
@@ -48,11 +50,27 @@ PREP = {}
 
 # ---------- Languages ----------
 LANGS = {
-    "fa": "🇮🇷 فارسی",
+    "fa": "🇮🇷 زبان فارسی",
     "en": "🇬🇧 English",
-    "tr": "🇹🇷 Türkçe",
-    "ar": "🇸🇦 العربية",
+    "uz": "🇺🇿 O'zbek",
     "ru": "🇷🇺 Русский",
+    "es": "🇪🇸 Español",
+    "ar": "🇸🇦 اللغة العربية",
+    "tr": "🇹🇷 Türkçe",
+    "hi": "🇮🇳 हिंदी",
+    "vi": "🇻🇳 Tiếng Việt",
+    "uk": "🇺🇦 Українська",
+    "id": "🇮🇩 Bahasa Indonesia",
+    "ms": "🇲🇾 Melayu",
+    "ko": "🇰🇷 한국인",
+    "pt": "🇧🇷 Português",
+    "zh": "🇨🇳 中國人",
+    "fr": "🇫🇷 Français",
+    "de": "🇩🇪 Deutsch",
+    "it": "🇮🇹 Italiano",
+    "he": "🇮🇱 עברית",
+    "nl": "🇳🇱 Nederlands",
+    "sv": "🇸🇪 Svenska",
 }
 
 LANG_PROMPT = "🌐 Language · زبان · Dil · اللغة · Язык"
@@ -241,7 +259,26 @@ def tr(lang: str, key: str, **kw) -> str:
 
 def lang_keyboard():
     btns = [Btn(label, callback_data=f"lang:{code}") for code, label in LANGS.items()]
-    return Markup([btns[:2], btns[2:4], btns[4:]])
+    return Markup([btns[i:i + 2] for i in range(0, len(btns), 2)])
+
+
+# ---------- Chat action (text under the bot name) ----------
+@asynccontextmanager
+async def chat_action(bot, chat_id, action=ChatAction.RECORD_VOICE):
+    """Shows 'recording voice...' etc. under the bot name while the block runs."""
+    async def loop():
+        while True:
+            try:
+                await bot.send_chat_action(chat_id, action)
+            except Exception:
+                pass
+            await asyncio.sleep(4)  # Telegram clears it after ~5s
+
+    t = asyncio.create_task(loop())
+    try:
+        yield
+    finally:
+        t.cancel()
 
 
 # ---------- URL helpers ----------
@@ -1044,9 +1081,9 @@ async def show_prepared(q, sid: str, entry: dict, lang: str):
 
 
 # ---------- Voice / audio from user ----------
-async def handle_media(msg, media, status, lang: str):
+async def handle_media(msg, media, lang: str):
     if not use_quota(msg.from_user.id):
-        return await status.edit_text(tr(lang, "quota"))
+        return await msg.reply_text(tr(lang, "quota"))
     cleanup_samples()
     sid = uuid.uuid4().hex[:10]
     raw = os.path.join(SAMPLES_DIR, sid + ".raw")
@@ -1061,12 +1098,12 @@ async def handle_media(msg, media, status, lang: str):
     add_sample(sid, outs[0])
     song = await asyncio.to_thread(recognize, outs)
     if not song:
-        return await status.edit_text(tr(lang, "not_found"))
+        return await msg.reply_text(tr(lang, "not_found"))
     with db() as c:
         c.execute("UPDATE samples SET last=? WHERE id=?", (song["engine"], sid))
     audio_task = asyncio.create_task(prepare_song_audio(song))
-    await status.edit_text(result_caption(song), parse_mode="HTML",
-                           reply_markup=result_keyboard(sid, song, lang), **NO_PREVIEW)
+    await msg.reply_text(result_caption(song), parse_mode="HTML",
+                         reply_markup=result_keyboard(sid, song, lang), **NO_PREVIEW)
     try:
         a = await audio_task
         await deliver_audio(msg, a, song, lang)
@@ -1086,26 +1123,26 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     st = ctx.user_data.get("await")
     if st and uid in ADMIN_IDS and msg.text:
         return await admin_input(update, ctx, st)
-    status = await msg.reply_text(tr(lang, "working"))
+    media = msg.voice or msg.audio or msg.video_note
+    text = (msg.text or "").strip()
+    m = URL_RE.search(text)
+    is_clip = bool(m and any(h in m.group(0) for h in CLIP_HOSTS))
+    action = ChatAction.UPLOAD_VIDEO if is_clip else ChatAction.RECORD_VOICE
     try:
-        media = msg.voice or msg.audio or msg.video_note
-        if media:
-            await handle_media(msg, media, status, lang)
-            return
-        text = (msg.text or "").strip()
-        if text.startswith(MP3_PREFIX):
-            await send_mp3(msg, text[len(MP3_PREFIX):].strip(), lang=lang)
-        else:
-            m = URL_RE.search(text)
-            if m and any(h in m.group(0) for h in CLIP_HOSTS):
+        # no "working..." message: the status shows under the bot name instead
+        async with chat_action(ctx.bot, msg.chat_id, action):
+            if media:
+                await handle_media(msg, media, lang)
+            elif text.startswith(MP3_PREFIX):
+                await send_mp3(msg, text[len(MP3_PREFIX):].strip(), lang=lang)
+            elif is_clip:
                 await do_clip(msg, m.group(0))
             else:
                 target, _ = await asyncio.to_thread(resolve, text)
                 await send_mp3(msg, target, lang=lang)
-        await status.delete()
     except Exception as e:
         log.exception("handle failed")
-        await status.edit_text(tr(lang, "err", e=str(e)[:200]))
+        await msg.reply_text(tr(lang, "err", e=str(e)[:200]))
 
 
 # ---------- Buttons ----------
@@ -1201,12 +1238,14 @@ async def on_lang_button(q, data: str):
     if code not in LANGS:
         return await q.answer()
     set_lang(q.from_user.id, code)
-    await q.answer(tr(code, "lang_set"))
+    toast = tr(code, "lang_set") if code in STR else "✅ " + LANGS[code]
+    await q.answer(toast)
+    # the language list disappears: the message becomes the welcome text, no buttons
+    text = tr(code, "welcome").rsplit("\n\n", 1)[0] + "\n\n🌐 /lang"
     try:
-        await q.edit_message_text(tr(code, "welcome"), parse_mode="HTML",
-                                  reply_markup=lang_keyboard(), **NO_PREVIEW)
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=None, **NO_PREVIEW)
     except Exception:
-        pass  # same language tapped again: message not modified
+        pass
 
 
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1370,11 +1409,9 @@ async def admin_input(update: Update, ctx, st: str):
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    touch_user(u)
-    lang = get_lang(u.id)
-    await update.message.reply_text(tr(lang, "welcome"), parse_mode="HTML",
-                                    reply_markup=lang_keyboard(), **NO_PREVIEW)
+    touch_user(update.effective_user)
+    # only the language list is shown first; after a choice it turns into the welcome text
+    await update.message.reply_text(LANG_PROMPT, reply_markup=lang_keyboard())
 
 
 async def cmd_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
