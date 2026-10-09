@@ -1,4 +1,4 @@
-import json, asyncio, sqlite3, datetime, os, re, tempfile, glob, time, hmac, hashlib, base64, uuid, subprocess, logging, html, shutil, sys, threading
+import json, asyncio, sqlite3, datetime, os, re, tempfile, glob, time, hmac, hashlib, base64, uuid, subprocess, logging, html, shutil, sys, threading, array, unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from urllib.parse import quote, urlparse, parse_qs
@@ -31,12 +31,15 @@ ENGINE_ORDER = os.environ.get("ENGINES", "acr,audd,shazam").split(",")
 # last resort when the melody is not recognized: transcribe the singing and search the words
 LYRICS_ENGINE = os.environ.get("LYRICS_ENGINE", "1") == "1"
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")  # tiny = lighter, small = more accurate
+MAX_SAMPLES = int(os.environ.get("MAX_SAMPLES", "5"))  # how many pieces of the audio may be tried
 DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "20"))
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
 SAMPLES_DIR = os.environ.get("SAMPLES_DIR", "samples")
 COOKIES = os.environ.get("COOKIES_FILE", "cookies.txt")
 MAX_BYTES = 49 * 1024 * 1024
+# aria2c (if installed) downloads with many connections at once: much faster
+ARIA2 = bool(shutil.which("aria2c")) and os.environ.get("ARIA2", "1") == "1"
 os.makedirs(SAMPLES_DIR, exist_ok=True)
 
 URL_RE = re.compile(r"https?://\S+")
@@ -49,6 +52,9 @@ esc = html.escape
 # clips whose recognition + audio download are being prepared in the background
 # sid -> {"task": Task, "src": url, "created": ts, "used": bool}
 PREP = {}
+# other possible answers for a recognized sample (used by the "wrong song" button)
+# sid -> {"alts": [song, ...], "created": ts}
+CANDS = {}
 
 
 # ---------- Languages ----------
@@ -313,6 +319,52 @@ def norm_url(url: str) -> str:
     return url
 
 
+# ---------- Song / artist matching (two singers, feat., remaster, ...) ----------
+_SPLIT_RE = re.compile(r"\s+(?:feat\.?|featuring|ft\.?|with|x|and|و)\s+|\s*[,&;/+،]\s*", re.I)
+_FEAT_RE = re.compile(r"[\(\[]\s*(?:feat\.?|ft\.?|featuring)\s+([^\)\]]+)", re.I)
+
+
+def _fold(s: str) -> str:
+    s = (s or "").lower().replace("ي", "ی").replace("ك", "ک")
+    s = unicodedata.normalize("NFKD", s)
+    return "".join(ch for ch in s if not unicodedata.combining(ch))
+
+
+def title_key(t: str) -> str:
+    """Same song, different spelling: '(feat. X)', '- Remastered 2011', accents... all become one key."""
+    t = re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", t or "")
+    t = re.split(r"\s+[-–—]\s+", t)[0]
+    return re.sub(r"[\W_]+", "", _fold(t))
+
+
+def artist_set(artist: str, title: str = "") -> set:
+    """Every singer of a song as a set of simple keys (includes 'feat.' singers from the title)."""
+    parts = [p for p in _SPLIT_RE.split(artist or "") if p and p.strip()]
+    for m in _FEAT_RE.findall(title or ""):
+        parts += [p for p in _SPLIT_RE.split(m) if p and p.strip()]
+    return {k for k in (re.sub(r"[\W_]+", "", _fold(p)) for p in parts) if k}
+
+
+def first_artist(artist: str) -> str:
+    parts = [p.strip() for p in _SPLIT_RE.split(artist or "") if p and p.strip()]
+    return parts[0] if parts else (artist or "").strip()
+
+
+def same_song(a: dict, b: dict) -> bool:
+    ta, tb = title_key(a.get("title")), title_key(b.get("title"))
+    if not ta or not tb:
+        return False
+    if ta != tb:
+        short, long_ = sorted((ta, tb), key=len)
+        if not (len(short) >= 6 and long_.startswith(short)):
+            return False
+    sa = artist_set(a.get("artist"), a.get("title"))
+    sb = artist_set(b.get("artist"), b.get("title"))
+    if not sa or not sb or (sa & sb):
+        return True
+    return any(x in y or y in x for x in sa for y in sb if len(x) >= 4 and len(y) >= 4)
+
+
 # ---------- Engine 1: ACRCloud ----------
 def acr_identify(path: str, acc):
     ts = str(int(time.time()))
@@ -345,7 +397,8 @@ def acr_identify(path: str, acc):
     if ext.get("youtube", {}).get("vid"):
         yt = "https://www.youtube.com/watch?v=" + ext["youtube"]["vid"]
         link = link or yt
-    artist = ((m.get("artists") or [{}])[0]).get("name", "")
+    # keep EVERY singer of the track, not only the first one
+    artist = ", ".join(a["name"] for a in (m.get("artists") or []) if a.get("name"))
     return {"title": m["title"], "artist": artist, "link": link, "yt": yt}
 
 
@@ -393,7 +446,7 @@ def pick_target(song: dict) -> str:
         return link
     if link:
         try:
-            yt, _ = odesli_to_youtube(link, timeout=4)
+            yt, _ = odesli_to_youtube(link, timeout=3)
             if yt:
                 return yt
         except Exception:
@@ -404,8 +457,9 @@ def pick_target(song: dict) -> str:
 # ---------- yt-dlp ----------
 def ydl_base():
     o = {"quiet": True, "noplaylist": True,
-         "concurrent_fragment_downloads": 4,
-         "http_chunk_size": 10 * 1024 * 1024}
+         "concurrent_fragment_downloads": 8,
+         "http_chunk_size": 10 * 1024 * 1024,
+         "socket_timeout": 20, "retries": 3, "fragment_retries": 3}
     if os.path.exists(COOKIES):
         o["cookiefile"] = COOKIES
     return o
@@ -413,7 +467,7 @@ def ydl_base():
 
 def to_mp3(src: str) -> str:
     out = os.path.splitext(src)[0] + ".mp3"
-    subprocess.run(["ffmpeg", "-y", "-i", src, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", out],
+    subprocess.run(["ffmpeg", "-y", "-i", src, "-vn", "-c:a", "libmp3lame", "-q:a", "3", out],
                    check=True, capture_output=True, timeout=300)
     try:
         os.remove(src)
@@ -426,10 +480,14 @@ def download_audio(target: str, outdir: str, fallback=None):
     """Download audio as-is (m4a) without re-encoding. Only converts odd formats to mp3."""
     if not URL_RE.match(target) and not target.startswith(("ytsearch", "scsearch")):
         target = f"ytsearch1:{target}"
-    opts = {**ydl_base(), "format": "bestaudio[ext=m4a]/bestaudio/best",
-            "outtmpl": f"{outdir}/%(id)s.%(ext)s"}
+    plain = {**ydl_base(), "format": "bestaudio[ext=m4a]/bestaudio/best",
+             "outtmpl": f"{outdir}/%(id)s.%(ext)s"}
+    fast = dict(plain)
+    if ARIA2:
+        fast["external_downloader"] = {"default": "aria2c"}
+        fast["external_downloader_args"] = {"aria2c": ["-x16", "-s16", "-k1M", "--file-allocation=none"]}
 
-    def run(t):
+    def run(t, opts):
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(t, download=True)
             if "entries" in info:
@@ -438,14 +496,28 @@ def download_audio(target: str, outdir: str, fallback=None):
                 info = info["entries"][0]
         return info
 
+    def attempt(t):
+        try:
+            return run(t, fast)
+        except Exception:
+            if fast is plain or not ARIA2:
+                raise
+            log.warning("aria2c download failed, retrying with the normal downloader")
+            for f in glob.glob(f"{outdir}/*"):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+            return run(t, plain)
+
     try:
-        info = run(target)
+        info = attempt(target)
     except Exception as e:
         if not fallback:
             raise
         log.warning("youtube failed (%s), trying soundcloud", str(e)[:80])
-        info = run(f"scsearch1:{fallback}")
-    files = [f for f in glob.glob(f"{outdir}/*") if not f.endswith((".part", ".ytdl", ".json"))]
+        info = run(f"scsearch1:{fallback}", plain)
+    files = [f for f in glob.glob(f"{outdir}/*") if not f.endswith((".part", ".ytdl", ".json", ".aria2"))]
     if not files:
         raise RuntimeError("فایل صوتی ساخته نشد")
     path = max(files, key=os.path.getmtime)
@@ -454,6 +526,7 @@ def download_audio(target: str, outdir: str, fallback=None):
     vid = info.get("id") if info.get("extractor_key") == "Youtube" else None
     dur = info.get("duration")
     return {"path": path, "title": info.get("title", "music"), "vid": vid,
+            "url": info.get("webpage_url"),
             "duration": int(dur) if dur else None}
 
 
@@ -474,7 +547,7 @@ def download_clip(url: str, outdir: str):
     artist = info.get("artist") or ", ".join(info.get("artists") or [])
     track = info.get("track")
     if artist and track:
-        meta = {"artist": artist.split(",")[0].strip(), "title": track}
+        meta = {"artist": artist.strip(), "title": track}  # all singers, not only the first
     return files[0], info.get("title") or "clip", meta
 
 
@@ -502,21 +575,50 @@ def cut_sample(src: str, out: str, start: float, dur: int) -> bool:
     return False
 
 
+def loud_offsets(src: str, win: int, n: int = 2) -> list:
+    """Start times of the n loudest, non-overlapping windows (usually the chorus / the singing)."""
+    try:
+        sr = 2000
+        out = subprocess.run(
+            ["ffmpeg", "-v", "error", "-t", "600", "-i", src, "-vn", "-ac", "1", "-ar", str(sr),
+             "-f", "s16le", "-"], capture_output=True, timeout=90).stdout
+        pcm = array.array("h")
+        pcm.frombytes(out[:len(out) // 2 * 2])
+        secs = len(pcm) // sr
+        if secs <= win + 2:
+            return []
+        energy = [sum(x * x for x in pcm[i * sr:(i + 1) * sr]) / sr for i in range(secs)]
+        pref = [0.0]
+        for v in energy:
+            pref.append(pref[-1] + v)
+        scores = sorted(((pref[i + win] - pref[i], i) for i in range(0, secs - win + 1)), reverse=True)
+        picks = []
+        for _, i in scores:
+            if all(abs(i - j) >= win for j in picks):
+                picks.append(i)
+            if len(picks) >= n:
+                break
+        return picks
+    except Exception as e:
+        log.warning("loud_offsets failed: %s", e)
+        return []
+
+
 def make_samples(src: str, sid: str) -> list:
     d = probe_duration(src)
     win = 15
     if d and d > win + 3:
-        offs = [d * 0.4 - win / 2, d * 0.05, d * 0.75 - win / 2, d * 0.2 - win / 2, d * 0.6 - win / 2]
-        offs = [max(0, min(o, d - win)) for o in offs]
+        loud = loud_offsets(src, win, 2)
+        cand = ([loud[0]] if loud else []) + [d * 0.4 - win / 2] + loud[1:2] + [d * 0.05, d * 0.75 - win / 2]
+        offs = []
+        for o in cand:
+            o = round(max(0, min(o, d - win)))
+            if all(abs(o - x) >= 5 for x in offs):  # no near-duplicate pieces
+                offs.append(o)
+        offs = offs[:MAX_SAMPLES]
     else:
         offs = [0]
-    jobs, seen = [], set()
-    for i, o in enumerate(offs):
-        o = round(o)
-        if o in seen:
-            continue
-        seen.add(o)
-        jobs.append((os.path.join(SAMPLES_DIR, f"{sid}_{i}.mp3"), o))
+    jobs = [(os.path.join(SAMPLES_DIR, f"{sid}_{i}.mp3"), o) for i, o in enumerate(offs)]
     # cut all samples at the same time instead of one by one
     with ThreadPoolExecutor(max_workers=3) as ex:
         res = list(ex.map(lambda j: j[0] if cut_sample(src, j[0], j[1], win) else None, jobs))
@@ -601,7 +703,7 @@ def get_lyrics(artist: str, title: str):
     if r:
         return r[0]
     t = clean_title(title) or title
-    a = (artist or "").split("/")[0].split(",")[0].strip()
+    a = first_artist(artist)  # "A & B" -> "A"
     text = None
     try:
         tries = []
@@ -645,21 +747,28 @@ def split_text(t: str, n: int = 4000) -> list:
 
 
 # ---------- SQLite ----------
+_DB_READY = False
+
+
 def db():
-    c = sqlite3.connect(DB_PATH)
+    global _DB_READY
+    c = sqlite3.connect(DB_PATH, timeout=30)
     c.row_factory = sqlite3.Row
-    c.execute("""CREATE TABLE IF NOT EXISTS accounts(
-        id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, host TEXT, key TEXT, secret TEXT,
-        enabled INTEGER DEFAULT 1, uses INTEGER DEFAULT 0, errors INTEGER DEFAULT 0)""")
-    c.execute("CREATE TABLE IF NOT EXISTS songs(key TEXT PRIMARY KEY, file_id TEXT, title TEXT, info TEXT)")
-    c.execute("CREATE TABLE IF NOT EXISTS usage(uid INTEGER, day TEXT, n INTEGER, PRIMARY KEY(uid, day))")
-    c.execute("CREATE TABLE IF NOT EXISTS users(uid INTEGER PRIMARY KEY, first_seen TEXT, lang TEXT)")
-    c.execute("CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT)")
-    c.execute("""CREATE TABLE IF NOT EXISTS samples(
-        id TEXT PRIMARY KEY, path TEXT, tried TEXT DEFAULT '', last TEXT, created INTEGER, src TEXT)""")
-    c.execute("CREATE TABLE IF NOT EXISTS clips(url TEXT PRIMARY KEY, file_id TEXT, song TEXT)")
-    c.execute("CREATE TABLE IF NOT EXISTS tracks(id TEXT PRIMARY KEY, title TEXT, artist TEXT)")
-    c.execute("CREATE TABLE IF NOT EXISTS lyrics(key TEXT PRIMARY KEY, text TEXT)")
+    if not _DB_READY:  # create the tables once, not on every single query
+        c.execute("""CREATE TABLE IF NOT EXISTS accounts(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, host TEXT, key TEXT, secret TEXT,
+            enabled INTEGER DEFAULT 1, uses INTEGER DEFAULT 0, errors INTEGER DEFAULT 0)""")
+        c.execute("CREATE TABLE IF NOT EXISTS songs(key TEXT PRIMARY KEY, file_id TEXT, title TEXT, info TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS usage(uid INTEGER, day TEXT, n INTEGER, PRIMARY KEY(uid, day))")
+        c.execute("CREATE TABLE IF NOT EXISTS users(uid INTEGER PRIMARY KEY, first_seen TEXT, lang TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT)")
+        c.execute("""CREATE TABLE IF NOT EXISTS samples(
+            id TEXT PRIMARY KEY, path TEXT, tried TEXT DEFAULT '', last TEXT, created INTEGER, src TEXT)""")
+        c.execute("CREATE TABLE IF NOT EXISTS clips(url TEXT PRIMARY KEY, file_id TEXT, song TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS tracks(id TEXT PRIMARY KEY, title TEXT, artist TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS lyrics(key TEXT PRIMARY KEY, text TEXT)")
+        c.commit()
+        _DB_READY = True
     return c
 
 
@@ -772,6 +881,18 @@ def add_sample(sid: str, path: str, src=None):
         c.execute("INSERT INTO samples(id,path,src,created) VALUES(?,?,?,?)", (sid, path, src, int(time.time())))
 
 
+def set_last(sid: str, song: dict):
+    """Remember which engine + which song was shown last (the 'wrong song' button needs both)."""
+    val = f"{song.get('engine') or ''}||{title_key(song.get('title'))}"
+    with db() as c:
+        c.execute("UPDATE samples SET last=? WHERE id=?", (val, sid))
+
+
+def remember_alts(sid: str, song: dict):
+    """Keep the runner-up answers in memory so 'wrong song' can show the next one instantly."""
+    CANDS[sid] = {"alts": song.pop("alts", None) or [], "created": time.time()}
+
+
 def cleanup_samples():
     cutoff = int(time.time()) - 86400
     with db() as c:
@@ -811,6 +932,8 @@ def cleanup_prep():
         drop_entry(sid)
     for sid in [s for s, e in SEARCH.items() if now - e["created"] > 3 * 3600]:
         SEARCH.pop(sid, None)
+    for sid in [s for s, e in CANDS.items() if now - e["created"] > 24 * 3600]:
+        CANDS.pop(sid, None)
 
 
 # ---------- Recognition ----------
@@ -832,40 +955,85 @@ def shazam_identify(path: str):
     return {"title": t.get("title", ""), "artist": t.get("subtitle", ""), "link": None}
 
 
-def _chain(path: str, skip=()):
+ENGINE_W = {"acr": 1.0, "shazam": 1.0, "audd": 0.9, "lyrics": 1.2}
+
+
+def _base(tag: str) -> str:
+    return (tag or "").split("#")[0]
+
+
+def _active_engines(skip) -> list:
     with db() as c:
-        rows = c.execute("SELECT * FROM accounts WHERE enabled=1").fetchall()
+        rows = c.execute("SELECT * FROM accounts WHERE enabled=1 ORDER BY id").fetchall()
+    jobs = []
     for name in [n.strip() for n in ENGINE_ORDER]:
         if name == "shazam":
-            if "shazam#0" in skip:
-                continue
-            try:
-                res = shazam_identify(path)
-                if res:
-                    res["engine"] = "shazam#0"
-                    return res
-            except Exception as e:
-                log.warning("shazam failed: %s", e)
-            continue
-        if name not in ENGINE_FN:
-            continue
-        for r in sorted((x for x in rows if x["type"] == name), key=lambda x: x["id"]):
-            tag = f'{name}#{r["id"]}'
-            if tag in skip:
-                continue
-            try:
-                res = ENGINE_FN[name](path, r)
-                with db() as c:
-                    c.execute("UPDATE accounts SET uses=uses+1 WHERE id=?", (r["id"],))
-                if res:
-                    res["engine"] = tag
-                    return res
-                break
-            except Exception as e:
-                log.warning("account %s failed: %s", r["id"], e)
-                with db() as c:
-                    c.execute("UPDATE accounts SET errors=errors+1 WHERE id=?", (r["id"],))
+            if "shazam#0" not in skip:
+                jobs.append(("shazam", []))
+        elif name in ENGINE_FN:
+            accs = [r for r in rows if r["type"] == name and f'{name}#{r["id"]}' not in skip]
+            if accs:
+                jobs.append((name, accs))
+    return jobs
+
+
+def call_engine(name: str, accs, path: str):
+    """Ask ONE engine about ONE piece of audio. Returns a song dict or None."""
+    if name == "shazam":
+        try:
+            res = shazam_identify(path)
+        except Exception as e:
+            log.warning("shazam failed: %s", e)
+            return None
+        if res and res.get("title"):
+            res["engine"] = "shazam#0"
+            return res
+        return None
+    for r in accs:
+        tag = f'{name}#{r["id"]}'
+        try:
+            res = ENGINE_FN[name](path, r)
+            with db() as c:
+                c.execute("UPDATE accounts SET uses=uses+1 WHERE id=?", (r["id"],))
+            if res and res.get("title"):
+                res["engine"] = tag
+                return res
+            return None  # answered "no match": don't burn the other accounts on the same audio
+        except Exception as e:
+            log.warning("account %s failed: %s", r["id"], e)
+            with db() as c:
+                c.execute("UPDATE accounts SET errors=errors+1 WHERE id=?", (r["id"],))
     return None
+
+
+def _group(hits: list) -> list:
+    """Votes -> ranked answers. The same song found by different engines / pieces of audio
+    (even with a different spelling or a different number of singers) counts together."""
+    clusters = []
+    for h in hits:
+        for cl in clusters:
+            if same_song(cl[0]["song"], h["song"]):
+                cl.append(h)
+                break
+        else:
+            clusters.append([h])
+    ranked = []
+    for hs in clusters:
+        best = max(hs, key=lambda h: h["w"])
+        song = dict(best["song"])
+        # the answer with the most singers wins (one engine may know only the first singer)
+        song["artist"] = max((h["song"].get("artist") or "" for h in hs),
+                             key=lambda a: (len(artist_set(a)), len(a)))
+        for k in ("link", "yt"):
+            song[k] = next((h["song"].get(k) for h in hs if h["song"].get(k)), None)
+        per = {}
+        for h in hs:
+            per.setdefault(_base(h["engine"]), []).append(h["w"])
+        score = sum(max(v) + 0.5 * (len(v) - 1) for v in per.values())
+        solid = len(per) >= 2 or len({h["sample"] for h in hs}) >= 2
+        ranked.append({"song": song, "score": score, "solid": solid})
+    ranked.sort(key=lambda r: (r["solid"], r["score"]), reverse=True)
+    return ranked
 
 
 # ---------- Last resort: what the singer says (speech -> words -> lyrics search) ----------
@@ -901,12 +1069,17 @@ def audd_find_lyrics(words, acc):
     r = requests.get("https://api.audd.io/findLyrics/", params={"q": q, "api_token": acc["key"]},
                      timeout=30).json()
     for it in (r.get("result") or [])[:3]:
+        if not (it.get("title") and it.get("artist")):
+            continue
         lyrics = it.get("lyrics")
-        # if AudD sends the lyrics, make sure the match is real; otherwise we can't verify
+        if not lyrics:  # check the candidate's real lyrics ourselves
+            try:
+                lyrics = get_lyrics(it["artist"], it["title"])
+            except Exception:
+                lyrics = None
         if lyrics and lyric_overlap(words, lyrics) < 0.35:
             continue
-        if it.get("title") and it.get("artist"):
-            return {"title": it["title"], "artist": it["artist"], "link": it.get("song_link")}
+        return {"title": it["title"], "artist": it["artist"], "link": it.get("song_link")}
     return None
 
 
@@ -936,22 +1109,66 @@ def lyrics_identify(paths):
 
 
 def recognize(paths, skip=()):
-    """1) melody fingerprint on each sample (ACRCloud, AudD, Shazam)  2) what the singer says."""
+    """Listens like a human would, with all the 'ears' at once:
+    1) every engine (ACRCloud, AudD, Shazam) listens at the same time, on several pieces of the audio
+    2) answers are voted: the same song from 2+ engines / pieces wins, with ALL its singers merged
+    3) if nobody agrees, the singing is transcribed and matched with real lyrics
+    The result has an "alts" list with the runner-up answers."""
     if isinstance(paths, str):
         paths = [paths]
-    for p in paths:
-        res = _chain(p, skip)
-        if res:
-            return res
-    if LYRICS_ENGINE and "lyrics#0" not in skip:
+    skip = tuple(skip)
+    rejected = {t[2:] for t in skip if t.startswith("k:")}  # songs the user said are wrong
+    jobs = _active_engines(skip)
+    order = {n: i for i, (n, _a) in enumerate(jobs)}
+    hits = []
+
+    def run_batch(batch):
+        tasks = [(name, accs, idx, p) for idx, p in batch for name, accs in jobs]
+        if not tasks:
+            return
+        with ThreadPoolExecutor(max_workers=min(len(tasks), 8)) as ex:
+            futs = [ex.submit(call_engine, name, accs, p) for name, accs, _i, p in tasks]
+            for f, (name, _accs, idx, _p) in zip(futs, tasks):
+                try:
+                    res = f.result(timeout=100)
+                except Exception as e:
+                    log.warning("engine %s crashed: %s", name, e)
+                    continue
+                if not res or title_key(res.get("title")) in rejected:
+                    continue
+                w = ENGINE_W.get(name, 0.8) - 0.01 * order.get(name, 0)
+                hits.append({"song": res, "engine": res["engine"], "sample": idx, "w": w})
+
+    pieces = list(enumerate(paths[:MAX_SAMPLES]))
+    pos = 0
+    for size in (1, 2, 2, 2):  # best piece first; only listen to more if the engines don't agree yet
+        batch = pieces[pos:pos + size]
+        pos += size
+        if not batch:
+            break
+        run_batch(batch)
+        ranked = _group(hits)
+        if ranked and ranked[0]["solid"]:
+            break
+    ranked = _group(hits)
+
+    if LYRICS_ENGINE and "lyrics#0" not in skip and not (ranked and ranked[0]["solid"]):
         try:
-            res = lyrics_identify(paths)
-            if res:
-                res["engine"] = "lyrics#0"
-                return res
+            ly = lyrics_identify(paths)
+            if ly and title_key(ly.get("title")) not in rejected:
+                ly["engine"] = "lyrics#0"
+                hits.append({"song": ly, "engine": "lyrics#0", "sample": 99, "w": ENGINE_W["lyrics"]})
+                ranked = _group(hits)
         except Exception as e:
             log.warning("lyrics stage failed: %s", e)
-    return None
+
+    if not ranked:
+        return None
+    log.info("recognize: %s", [(r["song"].get("title"), r["song"].get("artist"), round(r["score"], 2), r["solid"])
+                               for r in ranked[:3]])
+    top = ranked[0]["song"]
+    top["alts"] = [r["song"] for r in ranked[1:4]]
+    return top
 
 
 # ---------- Captions & keyboards ----------
@@ -988,7 +1205,7 @@ def result_keyboard(sid: str, song: dict, lang: str = "fa"):
         [Btn("Google", url=f"https://www.google.com/search?q={q}"),
          Btn("YouTube Music", url=f"https://music.youtube.com/search?q={q}"),
          Btn("Spotify", url=sp)],
-        [Btn(f"🔍 {tr(lang, 'btn_artist')}", switch_inline_query_current_chat=song["artist"])],
+        [Btn(f"🔍 {tr(lang, 'btn_artist')}", switch_inline_query_current_chat=first_artist(song["artist"]))],
         [Btn(f"❌ {tr(lang, 'btn_wrong')} ❌", callback_data=f"bad:{sid}")],
     ])
 
@@ -1002,13 +1219,30 @@ def audio_keyboard(tid: str, song: dict, lang: str = "fa"):
 
 
 # ---------- Sending audio ----------
-def song_key(song: dict) -> str:
-    return "s:" + f"{song['artist']}|{song['title']}".lower()
+def song_keys(song: dict) -> list:
+    """Cache keys for a song. Engines spell titles/singers differently, so one key per singer."""
+    tk = title_key(song.get("title"))
+    arts = sorted(artist_set(song.get("artist"), song.get("title")))[:4] or [""]
+    keys = [f"s2:{tk}|{a}" for a in arts]
+    keys.append("s:" + f"{song.get('artist', '')}|{song.get('title', '')}".lower())  # old format
+    return keys
+
+
+def info_link(a: dict, song=None) -> str:
+    """The 'info' link under every audio: song.link for YouTube, the page itself for others."""
+    if a.get("info"):
+        return a["info"]
+    if a.get("vid"):
+        return f"https://song.link/y/{a['vid']}"
+    if a.get("url"):
+        return a["url"]
+    q = quote(f"{(song or {}).get('artist', '')} {(song or {}).get('title') or a.get('title', '')}".strip())
+    return f"https://music.youtube.com/search?q={q}"
 
 
 async def fetch_audio(target: str, song=None) -> dict:
     """Download step. On a cache hit returns the file_id right away."""
-    keys = [target] + ([song_key(song)] if song else [])
+    keys = [target] + (song_keys(song) if song else [])
     for k in keys:
         hit = cache_get(k)
         if hit:
@@ -1039,11 +1273,11 @@ async def deliver_audio(msg, a: dict, song=None, lang: str = "fa"):
     performer = (song or {}).get("artist") or None
     tsong = {"title": title, "artist": performer or ""}
     kb = audio_keyboard(track_put(tsong), tsong, lang)
+    info = info_link(a, tsong)
     if "file_id" in a:
         return await msg.reply_audio(a["file_id"], title=title, performer=performer,
-                                     caption=audio_caption(a.get("info")), parse_mode="HTML",
+                                     caption=audio_caption(info), parse_mode="HTML",
                                      reply_markup=kb)
-    info = f"https://song.link/y/{a['vid']}" if a.get("vid") else None
     try:
         with open(a["path"], "rb") as f:
             sent = await msg.reply_audio(f, title=title, performer=performer, duration=a.get("duration"),
@@ -1098,8 +1332,8 @@ async def prep_clip(uid: int, sid: str, meta, src: str, samples_task) -> dict:
         song, blocked = await identify_clip(uid, sid, meta, src, samples_task)
         res["song"], res["blocked"] = song, blocked
         if song:
-            with db() as c:
-                c.execute("UPDATE samples SET last=? WHERE id=?", (song.get("engine"), sid))
+            remember_alts(sid, song)
+            set_last(sid, song)
             clip_set_song(src, song)
             try:
                 res["audio"] = await prepare_song_audio(song)
@@ -1122,8 +1356,7 @@ async def clip_from_cache(msg, src: str, hit, lang: str):
     song = json.loads(hit["song"])
     sid = uuid.uuid4().hex[:10]
     add_sample(sid, "", src)
-    with db() as c:
-        c.execute("UPDATE samples SET last=? WHERE id=?", ("cache#0", sid))
+    set_last(sid, {**song, "engine": "cache#0"})
 
     async def prep():
         res = {"song": song, "audio": None, "blocked": False}
@@ -1237,8 +1470,8 @@ async def handle_media(msg, media, lang: str):
     song = await asyncio.to_thread(recognize, outs)
     if not song:
         return await msg.reply_text(tr(lang, "not_found"))
-    with db() as c:
-        c.execute("UPDATE samples SET last=? WHERE id=?", (song["engine"], sid))
+    remember_alts(sid, song)
+    set_last(sid, song)
     audio_task = asyncio.create_task(prepare_song_audio(song))
     await msg.reply_text(result_caption(song), parse_mode="HTML",
                          reply_markup=result_keyboard(sid, song, lang), **NO_PREVIEW)
@@ -1302,15 +1535,27 @@ async def on_rec(q, data: str):
         clip_delete(row["src"])  # wrong result must not stay in the clip cache
     paths = sorted(glob.glob(os.path.join(SAMPLES_DIR, f"{sid}_*")))
     mpath = os.path.join(SAMPLES_DIR, f"{sid}.json")
-    if not row or not (paths or os.path.exists(mpath)):
+    if not row or not (paths or os.path.exists(mpath) or CANDS.get(sid)):
         return await q.answer(tr(lang, "expired"), show_alert=True)
     tried = [t for t in (row["tried"] or "").split(",") if t]
     if action == "bad" and row["last"]:
-        tried.append(row["last"])
+        eng, _, key = row["last"].partition("||")
+        if key:
+            tried.append("k:" + key)  # this song is wrong, whoever suggested it
+        if eng and (not key or eng in ("meta#0", "lyrics#0", "cache#0")):
+            tried.append(eng)
         with db() as c:
             c.execute("UPDATE samples SET tried=? WHERE id=?", (",".join(tried), sid))
+    rejected = {t[2:] for t in tried if t.startswith("k:")}
     song = None
-    if "meta#0" not in tried and os.path.exists(mpath):
+    if action == "bad":  # next best answer we already have: instant, costs no quota
+        alts = (CANDS.get(sid) or {}).get("alts") or []
+        while alts:
+            c_ = alts.pop(0)
+            if title_key(c_.get("title")) not in rejected:
+                song = c_
+                break
+    if not song and "meta#0" not in tried and os.path.exists(mpath):
         try:
             with open(mpath, encoding="utf-8") as f:
                 m = json.load(f)
@@ -1326,11 +1571,12 @@ async def on_rec(q, data: str):
             return await q.answer(tr(lang, "quota_short"), show_alert=True)
         await q.answer(tr(lang, "identifying"))
         song = await asyncio.to_thread(recognize, paths, tuple(tried))
+        if song:
+            remember_alts(sid, song)
     if not song:
         txt = tr(lang, "not_found") if not tried else tr(lang, "no_more")
         return await q.message.reply_text(txt)
-    with db() as c:
-        c.execute("UPDATE samples SET last=? WHERE id=?", (song["engine"], sid))
+    set_last(sid, song)
     src = row["src"]
     kb = result_keyboard(sid, song, lang)
     cap = result_caption(song, src)
