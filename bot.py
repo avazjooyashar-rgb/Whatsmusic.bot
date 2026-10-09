@@ -88,7 +88,7 @@ STR = {
             "🌐 زبان بات رو از دکمه‌های پایین عوض کن"),
         "lang_set": "✅ زبان بات شد فارسی",
         "working": "⏳ در حال پردازش...",
-        "err": "❌ خطا: {e}",
+        "err": "❌ این فایل در دسترس نیست. یه لینک یا آهنگ دیگه امتحان کن یا چند دقیقه بعد دوباره بفرست.",
         "clip_missing": "⚠️ کلیپ پیدا نشد یا بزرگ‌تر از ۵۰ مگابایته.",
         "quota": "⛔ سقف تشخیص امروزت پر شده، فردا دوباره امتحان کن.",
         "quota_short": "⛔ سقف تشخیص امروزت پر شده.",
@@ -105,6 +105,7 @@ STR = {
         "btn_artist": "جستجو بر اساس هنرمند",
         "btn_wrong": "آهنگ اشتباه",
         "btn_lyrics": "متن ترانه",
+        "btn_more": "آهنگ‌های بیشتر",
     },
     "en": {
         "welcome": (
@@ -118,7 +119,7 @@ STR = {
             "🌐 Change the bot language with the buttons below"),
         "lang_set": "✅ Language set to English",
         "working": "⏳ Working on it...",
-        "err": "❌ Error: {e}",
+        "err": "❌ This file isn't available right now. Try another link or song, or try again in a few minutes.",
         "clip_missing": "⚠️ Clip not found or larger than 50 MB.",
         "quota": "⛔ You've reached today's recognition limit. Try again tomorrow.",
         "quota_short": "⛔ You've reached today's recognition limit.",
@@ -135,6 +136,7 @@ STR = {
         "btn_artist": "Search by artist",
         "btn_wrong": "Wrong song",
         "btn_lyrics": "Lyrics",
+        "btn_more": "More songs",
     },
     "tr": {
         "welcome": (
@@ -148,7 +150,7 @@ STR = {
             "🌐 Bot dilini aşağıdaki düğmelerle değiştirebilirsin"),
         "lang_set": "✅ Dil Türkçe olarak ayarlandı",
         "working": "⏳ İşleniyor...",
-        "err": "❌ Hata: {e}",
+        "err": "❌ Bu dosya şu an kullanılamıyor. Başka bir bağlantı veya şarkı dene ya da birkaç dakika sonra tekrar dene.",
         "clip_missing": "⚠️ Klip bulunamadı veya 50 MB'dan büyük.",
         "quota": "⛔ Bugünkü tanıma hakkın doldu, yarın tekrar dene.",
         "quota_short": "⛔ Bugünkü tanıma hakkın doldu.",
@@ -165,6 +167,7 @@ STR = {
         "btn_artist": "Sanatçıya göre ara",
         "btn_wrong": "Yanlış şarkı",
         "btn_lyrics": "Şarkı sözü",
+        "btn_more": "Daha fazla şarkı",
     },
     "ar": {
         "welcome": (
@@ -178,7 +181,7 @@ STR = {
             "🌐 غيّر لغة البوت من الأزرار أدناه"),
         "lang_set": "✅ تم ضبط اللغة على العربية",
         "working": "⏳ جارٍ المعالجة...",
-        "err": "❌ خطأ: {e}",
+        "err": "❌ هذا الملف غير متاح حالياً. جرّب رابطاً أو أغنية أخرى، أو حاول مرة أخرى بعد قليل.",
         "clip_missing": "⚠️ لم يتم العثور على المقطع أو أنه أكبر من 50 ميغابايت.",
         "quota": "⛔ وصلت إلى حد التعرّف اليومي، حاول غداً.",
         "quota_short": "⛔ وصلت إلى حد التعرّف اليومي.",
@@ -195,6 +198,7 @@ STR = {
         "btn_artist": "البحث عن الفنان",
         "btn_wrong": "أغنية خاطئة",
         "btn_lyrics": "كلمات الأغنية",
+        "btn_more": "المزيد من الأغاني",
     },
     "ru": {
         "welcome": (
@@ -208,7 +212,7 @@ STR = {
             "🌐 Язык бота можно сменить кнопками ниже"),
         "lang_set": "✅ Язык бота: русский",
         "working": "⏳ Обрабатываю...",
-        "err": "❌ Ошибка: {e}",
+        "err": "❌ Этот файл сейчас недоступен. Попробуй другую ссылку или песню или повтори через несколько минут.",
         "clip_missing": "⚠️ Клип не найден или больше 50 МБ.",
         "quota": "⛔ Дневной лимит распознавания исчерпан, попробуй завтра.",
         "quota_short": "⛔ Дневной лимит распознавания исчерпан.",
@@ -225,6 +229,7 @@ STR = {
         "btn_artist": "Поиск по исполнителю",
         "btn_wrong": "Не та песня",
         "btn_lyrics": "Текст песни",
+        "btn_more": "Ещё песни",
     },
 }
 
@@ -516,6 +521,52 @@ def yt_search(query: str, n: int = 10):
     return info.get("entries") or []
 
 
+SEARCH = {}  # sid -> {"items": [...], "created": ts}
+PAGE = 8
+
+
+def search_tracks(query: str, n: int = 30):
+    """Song-like results only: no podcasts / long compilations, no duplicates."""
+    out, seen = [], set()
+    for it in yt_search(query, n):
+        vid, title, dur = it.get("id"), it.get("title"), it.get("duration")
+        if not vid or not title:
+            continue
+        if dur and not (60 <= dur <= 720):
+            continue
+        k = re.sub(r"\W+", "", title.lower())
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append({"id": vid, "title": title, "dur": int(dur) if dur else None})
+    return out
+
+
+def results_keyboard(sid: str, page: int, lang: str):
+    items = SEARCH[sid]["items"]
+    rows = []
+    for it in items[page * PAGE:(page + 1) * PAGE]:
+        d = f"{it['dur'] // 60}:{it['dur'] % 60:02d} · " if it["dur"] else ""
+        rows.append([Btn((d + it["title"])[:60], callback_data=f"pick:{it['id']}")])
+    nav = []
+    if page > 0:
+        nav.append(Btn("⬅️", callback_data=f"more:{sid}:{page - 1}"))
+    if (page + 1) * PAGE < len(items):
+        nav.append(Btn(f"➕ {tr(lang, 'btn_more')}", callback_data=f"more:{sid}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    return Markup(rows)
+
+
+async def send_results(msg, query: str, lang: str):
+    items = await asyncio.to_thread(search_tracks, query)
+    if not items:
+        return await msg.reply_text(tr(lang, "no_result"))
+    sid = uuid.uuid4().hex[:8]
+    SEARCH[sid] = {"items": items, "created": time.time()}
+    await msg.reply_text(f"🔍 {query}", reply_markup=results_keyboard(sid, 0, lang))
+
+
 def resolve(text: str):
     m = URL_RE.search(text)
     if m:
@@ -749,6 +800,8 @@ def cleanup_prep():
     now = time.time()
     for sid in [s for s, e in PREP.items() if now - e["created"] > 3 * 3600]:
         drop_entry(sid)
+    for sid in [s for s, e in SEARCH.items() if now - e["created"] > 3 * 3600]:
+        SEARCH.pop(sid, None)
 
 
 # ---------- Recognition ----------
@@ -1137,9 +1190,11 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await send_mp3(msg, text[len(MP3_PREFIX):].strip(), lang=lang)
             elif is_clip:
                 await do_clip(msg, m.group(0))
-            else:
+            elif URL_RE.search(text):  # other links (Spotify, ...)
                 target, _ = await asyncio.to_thread(resolve, text)
                 await send_mp3(msg, target, lang=lang)
+            else:  # artist or song name -> list of tracks to choose from
+                await send_results(msg, text, lang)
     except Exception as e:
         log.exception("handle failed")
         await msg.reply_text(tr(lang, "err", e=str(e)[:200]))
@@ -1233,6 +1288,30 @@ async def on_lyrics(q, data: str):
         await q.message.reply_text(chunk)
 
 
+async def on_pick(q, ctx, data: str):
+    lang = get_lang(q.from_user.id)
+    vid = data.split(":", 1)[1]
+    await q.answer(tr(lang, "wait_toast"))
+    try:
+        async with chat_action(ctx.bot, q.message.chat_id, ChatAction.RECORD_VOICE):
+            await send_mp3(q.message, f"https://www.youtube.com/watch?v={vid}", lang=lang)
+    except Exception as e:
+        log.exception("pick failed")
+        await q.message.reply_text(tr(lang, "err", e=str(e)[:200]))
+
+
+async def on_more(q, data: str):
+    lang = get_lang(q.from_user.id)
+    _, sid, page = data.split(":")
+    if sid not in SEARCH:
+        return await q.answer(tr(lang, "expired"), show_alert=True)
+    await q.answer()
+    try:
+        await q.edit_message_reply_markup(reply_markup=results_keyboard(sid, int(page), lang))
+    except Exception:
+        pass
+
+
 async def on_lang_button(q, data: str):
     code = data.split(":", 1)[1]
     if code not in LANGS:
@@ -1254,6 +1333,10 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     touch_user(q.from_user)
     if data.startswith(("rec:", "bad:")):
         return await on_rec(q, data)
+    if data.startswith("pick:"):
+        return await on_pick(q, ctx, data)
+    if data.startswith("more:"):
+        return await on_more(q, data)
     if data.startswith("lyr:"):
         return await on_lyrics(q, data)
     if data.startswith("lang:"):
