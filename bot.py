@@ -41,6 +41,208 @@ MP3_PREFIX = "🎵 "
 
 esc = html.escape
 
+# clips whose recognition + audio download are being prepared in the background
+# sid -> {"task": Task, "src": url, "created": ts, "used": bool}
+PREP = {}
+
+
+# ---------- Languages ----------
+LANGS = {
+    "fa": "🇮🇷 فارسی",
+    "en": "🇬🇧 English",
+    "tr": "🇹🇷 Türkçe",
+    "ar": "🇸🇦 العربية",
+    "ru": "🇷🇺 Русский",
+}
+
+LANG_PROMPT = "🌐 Language · زبان · Dil · اللغة · Язык"
+
+STR = {
+    "fa": {
+        "welcome": (
+            "🎧 <b>سلام! به بات تشخیص موسیقی خوش اومدی</b>\n\n"
+            "آهنگی تو ذهنته ولی اسمش رو نمی‌دونی؟ من پیداش می‌کنم 👇\n\n"
+            "🔗 <b>لینک اینستاگرام یا یوتیوب</b> بفرست؛ کلیپ رو می‌گیری و با یه دکمه آهنگش رو می‌شناسی\n"
+            "🎙 <b>ویس یا فایل صوتی</b> بفرست؛ اسم آهنگ و خواننده رو می‌گم\n"
+            "✍️ <b>اسم آهنگ</b> رو بنویس؛ فایلش رو برات می‌فرستم\n"
+            "🔍 با دکمه‌ی جستجو، آهنگ‌های هر خواننده رو پیدا کن\n\n"
+            "بعد از شناسایی، لینک Spotify و YouTube Music و متن ترانه هم همین‌جاست ✨\n\n"
+            "🌐 زبان بات رو از دکمه‌های پایین عوض کن"),
+        "lang_set": "✅ زبان بات شد فارسی",
+        "working": "⏳ در حال پردازش...",
+        "err": "❌ خطا: {e}",
+        "clip_missing": "⚠️ کلیپ پیدا نشد یا بزرگ‌تر از ۵۰ مگابایته.",
+        "quota": "⛔ سقف تشخیص امروزت پر شده، فردا دوباره امتحان کن.",
+        "quota_short": "⛔ سقف تشخیص امروزت پر شده.",
+        "not_found": "😕 آهنگ رو نشناختم.",
+        "no_more": "😕 موتور دیگه‌ای برای امتحان نمونده.",
+        "expired": "نمونه منقضی شده، لینک یا فایل رو دوباره بفرست.",
+        "no_result": "نتیجه‌ی دیگه‌ای نیست.",
+        "identifying": "⏳ در حال شناسایی...",
+        "wait_toast": "⏳ چند ثانیه صبر کن...",
+        "lyrics_wait": "⏳ در حال پیدا کردن متن ترانه...",
+        "lyrics_none": "😕 متن این آهنگ پیدا نشد.",
+        "track_missing": "اطلاعات آهنگ پیدا نشد.",
+        "btn_rec": "شناسایی موسیقی",
+        "btn_artist": "جستجو بر اساس هنرمند",
+        "btn_wrong": "آهنگ اشتباه",
+        "btn_lyrics": "متن ترانه",
+    },
+    "en": {
+        "welcome": (
+            "🎧 <b>Hi! Welcome to the music finder bot</b>\n\n"
+            "Got a song stuck in your head but don't know its name? I'll find it 👇\n\n"
+            "🔗 Send an <b>Instagram or YouTube link</b> — you get the clip, then identify its music with one tap\n"
+            "🎙 Send a <b>voice message or audio file</b> — I'll tell you the song and the artist\n"
+            "✍️ Type a <b>song name</b> — I'll send you the track\n"
+            "🔍 Use the search button to browse any artist's songs\n\n"
+            "After identifying, you also get Spotify and YouTube Music links and the lyrics ✨\n\n"
+            "🌐 Change the bot language with the buttons below"),
+        "lang_set": "✅ Language set to English",
+        "working": "⏳ Working on it...",
+        "err": "❌ Error: {e}",
+        "clip_missing": "⚠️ Clip not found or larger than 50 MB.",
+        "quota": "⛔ You've reached today's recognition limit. Try again tomorrow.",
+        "quota_short": "⛔ You've reached today's recognition limit.",
+        "not_found": "😕 I couldn't identify the song.",
+        "no_more": "😕 No other engine left to try.",
+        "expired": "This sample has expired. Please send the link or file again.",
+        "no_result": "No other result.",
+        "identifying": "⏳ Identifying...",
+        "wait_toast": "⏳ Just a few seconds...",
+        "lyrics_wait": "⏳ Looking for the lyrics...",
+        "lyrics_none": "😕 Couldn't find lyrics for this song.",
+        "track_missing": "Song info not found.",
+        "btn_rec": "Identify music",
+        "btn_artist": "Search by artist",
+        "btn_wrong": "Wrong song",
+        "btn_lyrics": "Lyrics",
+    },
+    "tr": {
+        "welcome": (
+            "🎧 <b>Merhaba! Müzik tanıma botuna hoş geldin</b>\n\n"
+            "Aklında bir şarkı var ama adını bilmiyor musun? Ben bulurum 👇\n\n"
+            "🔗 <b>Instagram veya YouTube linki</b> gönder — klibi al, tek dokunuşla müziğini tanı\n"
+            "🎙 <b>Sesli mesaj veya ses dosyası</b> gönder — şarkıyı ve sanatçıyı söyleyeyim\n"
+            "✍️ <b>Şarkı adını</b> yaz — parçayı sana göndereyim\n"
+            "🔍 Arama düğmesiyle bir sanatçının şarkılarına göz at\n\n"
+            "Tanıdıktan sonra Spotify, YouTube Music bağlantıları ve şarkı sözleri de burada ✨\n\n"
+            "🌐 Bot dilini aşağıdaki düğmelerle değiştirebilirsin"),
+        "lang_set": "✅ Dil Türkçe olarak ayarlandı",
+        "working": "⏳ İşleniyor...",
+        "err": "❌ Hata: {e}",
+        "clip_missing": "⚠️ Klip bulunamadı veya 50 MB'dan büyük.",
+        "quota": "⛔ Bugünkü tanıma hakkın doldu, yarın tekrar dene.",
+        "quota_short": "⛔ Bugünkü tanıma hakkın doldu.",
+        "not_found": "😕 Şarkıyı tanıyamadım.",
+        "no_more": "😕 Denenecek başka motor kalmadı.",
+        "expired": "Örnek süresi doldu, bağlantıyı veya dosyayı tekrar gönder.",
+        "no_result": "Başka sonuç yok.",
+        "identifying": "⏳ Tanınıyor...",
+        "wait_toast": "⏳ Birkaç saniye...",
+        "lyrics_wait": "⏳ Şarkı sözleri aranıyor...",
+        "lyrics_none": "😕 Bu şarkının sözleri bulunamadı.",
+        "track_missing": "Şarkı bilgisi bulunamadı.",
+        "btn_rec": "Müziği tanı",
+        "btn_artist": "Sanatçıya göre ara",
+        "btn_wrong": "Yanlış şarkı",
+        "btn_lyrics": "Şarkı sözü",
+    },
+    "ar": {
+        "welcome": (
+            "🎧 <b>مرحباً! أهلاً بك في بوت التعرّف على الموسيقى</b>\n\n"
+            "لديك أغنية في بالك ولا تعرف اسمها؟ سأجدها لك 👇\n\n"
+            "🔗 أرسل <b>رابط إنستغرام أو يوتيوب</b> — تحصل على المقطع وتتعرّف على موسيقاه بضغطة واحدة\n"
+            "🎙 أرسل <b>رسالة صوتية أو ملفاً صوتياً</b> — سأخبرك باسم الأغنية والفنان\n"
+            "✍️ اكتب <b>اسم الأغنية</b> — وسأرسل لك الملف\n"
+            "🔍 استخدم زر البحث لتصفّح أغاني أي فنان\n\n"
+            "بعد التعرّف تجد روابط Spotify وYouTube Music وكلمات الأغنية هنا ✨\n\n"
+            "🌐 غيّر لغة البوت من الأزرار أدناه"),
+        "lang_set": "✅ تم ضبط اللغة على العربية",
+        "working": "⏳ جارٍ المعالجة...",
+        "err": "❌ خطأ: {e}",
+        "clip_missing": "⚠️ لم يتم العثور على المقطع أو أنه أكبر من 50 ميغابايت.",
+        "quota": "⛔ وصلت إلى حد التعرّف اليومي، حاول غداً.",
+        "quota_short": "⛔ وصلت إلى حد التعرّف اليومي.",
+        "not_found": "😕 لم أستطع التعرّف على الأغنية.",
+        "no_more": "😕 لا توجد محركات أخرى لتجربتها.",
+        "expired": "انتهت صلاحية العيّنة، أعد إرسال الرابط أو الملف.",
+        "no_result": "لا توجد نتيجة أخرى.",
+        "identifying": "⏳ جارٍ التعرّف...",
+        "wait_toast": "⏳ بضع ثوانٍ...",
+        "lyrics_wait": "⏳ جارٍ البحث عن الكلمات...",
+        "lyrics_none": "😕 لم أجد كلمات هذه الأغنية.",
+        "track_missing": "معلومات الأغنية غير موجودة.",
+        "btn_rec": "التعرّف على الموسيقى",
+        "btn_artist": "البحث عن الفنان",
+        "btn_wrong": "أغنية خاطئة",
+        "btn_lyrics": "كلمات الأغنية",
+    },
+    "ru": {
+        "welcome": (
+            "🎧 <b>Привет! Добро пожаловать в бот для распознавания музыки</b>\n\n"
+            "Песня крутится в голове, а названия не знаешь? Я найду её 👇\n\n"
+            "🔗 Отправь <b>ссылку на Instagram или YouTube</b> — получишь клип и узнаешь его музыку одним нажатием\n"
+            "🎙 Отправь <b>голосовое или аудиофайл</b> — назову песню и исполнителя\n"
+            "✍️ Напиши <b>название песни</b> — пришлю трек\n"
+            "🔍 Кнопка поиска поможет найти песни любого исполнителя\n\n"
+            "После распознавания здесь же ссылки на Spotify и YouTube Music и текст песни ✨\n\n"
+            "🌐 Язык бота можно сменить кнопками ниже"),
+        "lang_set": "✅ Язык бота: русский",
+        "working": "⏳ Обрабатываю...",
+        "err": "❌ Ошибка: {e}",
+        "clip_missing": "⚠️ Клип не найден или больше 50 МБ.",
+        "quota": "⛔ Дневной лимит распознавания исчерпан, попробуй завтра.",
+        "quota_short": "⛔ Дневной лимит распознавания исчерпан.",
+        "not_found": "😕 Не удалось распознать песню.",
+        "no_more": "😕 Других движков для проверки не осталось.",
+        "expired": "Образец устарел, отправь ссылку или файл заново.",
+        "no_result": "Других результатов нет.",
+        "identifying": "⏳ Распознаю...",
+        "wait_toast": "⏳ Ещё несколько секунд...",
+        "lyrics_wait": "⏳ Ищу текст песни...",
+        "lyrics_none": "😕 Текст этой песни не найден.",
+        "track_missing": "Информация о песне не найдена.",
+        "btn_rec": "Узнать музыку",
+        "btn_artist": "Поиск по исполнителю",
+        "btn_wrong": "Не та песня",
+        "btn_lyrics": "Текст песни",
+    },
+}
+
+LANG_CACHE = {}
+
+
+def detect_lang(code) -> str:
+    c = (code or "").split("-")[0].lower()
+    return c if c in LANGS else "en"
+
+
+def get_lang(uid: int) -> str:
+    if uid in LANG_CACHE:
+        return LANG_CACHE[uid]
+    with db() as c:
+        r = c.execute("SELECT lang FROM users WHERE uid=?", (uid,)).fetchone()
+    lang = r["lang"] if r and r["lang"] else "fa"  # old users keep Persian
+    LANG_CACHE[uid] = lang
+    return lang
+
+
+def set_lang(uid: int, lang: str):
+    with db() as c:
+        c.execute("UPDATE users SET lang=? WHERE uid=?", (lang, uid))
+    LANG_CACHE[uid] = lang
+
+
+def tr(lang: str, key: str, **kw) -> str:
+    s = STR.get(lang, STR["en"]).get(key) or STR["en"][key]
+    return s.format(**kw) if kw else s
+
+
+def lang_keyboard():
+    btns = [Btn(label, callback_data=f"lang:{code}") for code, label in LANGS.items()]
+    return Markup([btns[:2], btns[2:4], btns[4:]])
+
 
 # ---------- URL helpers ----------
 def norm_url(url: str) -> str:
@@ -354,7 +556,7 @@ def db():
         enabled INTEGER DEFAULT 1, uses INTEGER DEFAULT 0, errors INTEGER DEFAULT 0)""")
     c.execute("CREATE TABLE IF NOT EXISTS songs(key TEXT PRIMARY KEY, file_id TEXT, title TEXT, info TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS usage(uid INTEGER, day TEXT, n INTEGER, PRIMARY KEY(uid, day))")
-    c.execute("CREATE TABLE IF NOT EXISTS users(uid INTEGER PRIMARY KEY, first_seen TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS users(uid INTEGER PRIMARY KEY, first_seen TEXT, lang TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT)")
     c.execute("""CREATE TABLE IF NOT EXISTS samples(
         id TEXT PRIMARY KEY, path TEXT, tried TEXT DEFAULT '', last TEXT, created INTEGER, src TEXT)""")
@@ -367,7 +569,7 @@ def db():
 def migrate():
     """Add new columns to an old bot.db (safe to run every start)."""
     with db() as c:
-        for table, col in (("songs", "info"), ("samples", "src")):
+        for table, col in (("songs", "info"), ("samples", "src"), ("users", "lang")):
             cols = [r[1] for r in c.execute(f"PRAGMA table_info({table})")]
             if col not in cols:
                 c.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
@@ -398,9 +600,11 @@ def daily_limit() -> int:
     return int(get_setting("daily_limit", DAILY_LIMIT))
 
 
-def touch_user(uid: int):
+def touch_user(u):
+    """u is a telegram User. New users get the language of their Telegram app."""
     with db() as c:
-        c.execute("INSERT OR IGNORE INTO users VALUES(?,?)", (uid, datetime.date.today().isoformat()))
+        c.execute("INSERT OR IGNORE INTO users(uid, first_seen, lang) VALUES(?,?,?)",
+                  (u.id, datetime.date.today().isoformat(), detect_lang(u.language_code)))
 
 
 # audio cache
@@ -418,14 +622,24 @@ def cache_put(key, file_id, title, info=None):
 # clip cache (video file_id + recognized song)
 def clip_get(url):
     with db() as c:
-        return c.execute("SELECT file_id, song FROM clips WHERE url=?", (url,)).fetchone()
+        return c.execute("SELECT file_id, song FROM clips WHERE url=? AND file_id IS NOT NULL AND song IS NOT NULL",
+                         (url,)).fetchone()
 
 
-def clip_put(url, file_id, song: dict):
-    data = {k: song.get(k) for k in ("title", "artist", "link", "yt")}
+def clip_put(url, file_id, song=None):
+    """Upsert: a missing file_id or song never erases the one already stored."""
+    data = None
+    if song:
+        data = json.dumps({k: song.get(k) for k in ("title", "artist", "link", "yt")}, ensure_ascii=False)
     with db() as c:
-        c.execute("INSERT OR REPLACE INTO clips VALUES(?,?,?)",
-                  (url, file_id, json.dumps(data, ensure_ascii=False)))
+        c.execute("""INSERT INTO clips(url,file_id,song) VALUES(?,?,?)
+                     ON CONFLICT(url) DO UPDATE SET
+                       file_id=COALESCE(excluded.file_id, clips.file_id),
+                       song=COALESCE(excluded.song, clips.song)""", (url, file_id, data))
+
+
+def clip_set_song(url, song):
+    clip_put(url, None, song)
 
 
 def clip_delete(url):
@@ -472,6 +686,32 @@ def cleanup_samples():
                 except OSError:
                     pass
         c.execute("DELETE FROM samples WHERE created<?", (cutoff,))
+
+
+# ---------- Background preparation bookkeeping ----------
+def drop_entry(sid: str):
+    """Forget a prepared clip and delete its downloaded audio."""
+    e = PREP.pop(sid, None)
+    if not e:
+        return
+    t = e["task"]
+    if not t.done():
+        t.cancel()
+        return
+    if t.cancelled():
+        return
+    try:
+        a = (t.result() or {}).get("audio")
+        if a and a.get("dir"):
+            shutil.rmtree(a["dir"], ignore_errors=True)
+    except Exception:
+        pass
+
+
+def cleanup_prep():
+    now = time.time()
+    for sid in [s for s, e in PREP.items() if now - e["created"] > 3 * 3600]:
+        drop_entry(sid)
 
 
 # ---------- Recognition ----------
@@ -551,20 +791,21 @@ def result_caption(song: dict, src=None) -> str:
     return f"<code>{esc(song['title'])} — {esc(song['artist'])}</code>\n\n{footer(src)}"
 
 
-def plain_caption(title: str, src=None, note: str = "") -> str:
-    cap = f"<code>{esc((title or 'clip')[:150])}</code>"
-    if note:
-        cap += f"\n{esc(note)}"
-    return f"{cap}\n\n{footer(src)}"
-
-
 def audio_caption(info=None) -> str:
     if info:
         return f'@{esc(BOT_USERNAME)} | <a href="{esc(info, quote=True)}">info</a>'
     return f"@{esc(BOT_USERNAME)}"
 
 
-def result_keyboard(sid: str, song: dict):
+def clip_keyboard(sid: str, lang: str):
+    """What the user sees under a fresh clip: identify button + manual search."""
+    return Markup([
+        [Btn(f"🎵 {tr(lang, 'btn_rec')} 🎵", callback_data=f"rec:{sid}")],
+        [Btn("🔍", switch_inline_query_current_chat="")],
+    ])
+
+
+def result_keyboard(sid: str, song: dict, lang: str = "fa"):
     q = quote(f"{song['artist']} - {song['title']}")
     link = song.get("link") or ""
     sp = link if link.startswith("https://open.spotify.com") else f"https://open.spotify.com/search/{q}"
@@ -572,15 +813,15 @@ def result_keyboard(sid: str, song: dict):
         [Btn("Google", url=f"https://www.google.com/search?q={q}"),
          Btn("YouTube Music", url=f"https://music.youtube.com/search?q={q}"),
          Btn("Spotify", url=sp)],
-        [Btn("🔍 جستجو بر اساس هنرمند", switch_inline_query_current_chat=song["artist"])],
-        [Btn("❌ آهنگ اشتباه ❌", callback_data=f"bad:{sid}")],
+        [Btn(f"🔍 {tr(lang, 'btn_artist')}", switch_inline_query_current_chat=song["artist"])],
+        [Btn(f"❌ {tr(lang, 'btn_wrong')} ❌", callback_data=f"bad:{sid}")],
     ])
 
 
-def audio_keyboard(tid: str, song: dict):
+def audio_keyboard(tid: str, song: dict, lang: str = "fa"):
     q = f"{song.get('artist', '')} {song.get('title', '')}".strip()[:200]
     return Markup([[
-        Btn("متن ترانه 🔤", callback_data=f"lyr:{tid}"),
+        Btn(f"{tr(lang, 'btn_lyrics')} 🔤", callback_data=f"lyr:{tid}"),
         Btn("🔍", switch_inline_query_current_chat=q),
     ]])
 
@@ -618,11 +859,11 @@ async def prepare_song_audio(song: dict) -> dict:
     return await fetch_audio(target, song)
 
 
-async def deliver_audio(msg, a: dict, song=None):
+async def deliver_audio(msg, a: dict, song=None, lang: str = "fa"):
     title = (song or {}).get("title") or a["title"]
     performer = (song or {}).get("artist") or None
     tsong = {"title": title, "artist": performer or ""}
-    kb = audio_keyboard(track_put(tsong), tsong)
+    kb = audio_keyboard(track_put(tsong), tsong, lang)
     if "file_id" in a:
         return await msg.reply_audio(a["file_id"], title=title, performer=performer,
                                      caption=audio_caption(a.get("info")), parse_mode="HTML",
@@ -640,17 +881,17 @@ async def deliver_audio(msg, a: dict, song=None):
             cache_put(k, sent.audio.file_id, title, info)
 
 
-async def send_mp3(msg, target: str, title=None, performer=None):
+async def send_mp3(msg, target: str, title=None, performer=None, lang: str = "fa"):
     song = {"title": title, "artist": performer or ""} if title else None
     a = await fetch_audio(target, song)
-    await deliver_audio(msg, a, song)
+    await deliver_audio(msg, a, song, lang)
 
 
 # ---------- Clips ----------
-async def upload_video(msg, path: str, caption: str):
+async def upload_video(msg, path: str, caption: str, kb=None):
     with open(path, "rb") as f:
-        return await msg.reply_video(f, caption=caption, parse_mode="HTML", supports_streaming=True,
-                                     read_timeout=300, write_timeout=300)
+        return await msg.reply_video(f, caption=caption, parse_mode="HTML", reply_markup=kb,
+                                     supports_streaming=True, read_timeout=300, write_timeout=300)
 
 
 async def identify_clip(uid: int, sid: str, meta, src: str, samples_task):
@@ -674,6 +915,26 @@ async def identify_clip(uid: int, sid: str, meta, src: str, samples_task):
         return None, False
 
 
+async def prep_clip(uid: int, sid: str, meta, src: str, samples_task) -> dict:
+    """Background job: recognize the music and download its audio, so the
+    'identify' button can answer instantly."""
+    res = {"song": None, "audio": None, "blocked": False}
+    try:
+        song, blocked = await identify_clip(uid, sid, meta, src, samples_task)
+        res["song"], res["blocked"] = song, blocked
+        if song:
+            with db() as c:
+                c.execute("UPDATE samples SET last=? WHERE id=?", (song.get("engine"), sid))
+            clip_set_song(src, song)
+            try:
+                res["audio"] = await prepare_song_audio(song)
+            except Exception:
+                log.exception("prepare audio failed")
+    except Exception:
+        log.exception("prep_clip failed")
+    return res
+
+
 def _msg_video_id(sent):
     for attr in ("video", "animation", "document"):
         obj = getattr(sent, attr, None)
@@ -682,36 +943,41 @@ def _msg_video_id(sent):
     return None
 
 
-async def clip_from_cache(msg, src: str, hit):
+async def clip_from_cache(msg, src: str, hit, lang: str):
     song = json.loads(hit["song"])
     sid = uuid.uuid4().hex[:10]
     add_sample(sid, "", src)
     with db() as c:
         c.execute("UPDATE samples SET last=? WHERE id=?", ("cache#0", sid))
-    audio_task = asyncio.create_task(prepare_song_audio(song))
+
+    async def prep():
+        res = {"song": song, "audio": None, "blocked": False}
+        try:
+            res["audio"] = await prepare_song_audio(song)
+        except Exception:
+            log.exception("cached clip audio prepare failed")
+        return res
+
+    PREP[sid] = {"task": asyncio.create_task(prep()), "src": src, "created": time.time(), "used": False}
     try:
-        await msg.reply_video(hit["file_id"], caption=result_caption(song, src), parse_mode="HTML",
-                              reply_markup=result_keyboard(sid, song), supports_streaming=True)
+        await msg.reply_video(hit["file_id"], caption=footer(src), parse_mode="HTML",
+                              reply_markup=clip_keyboard(sid, lang), supports_streaming=True)
     except Exception:
-        audio_task.cancel()
+        drop_entry(sid)
         raise
-    try:
-        a = await audio_task
-        await deliver_audio(msg, a, song)
-    except Exception as e:
-        log.exception("cached clip audio failed")
-        await msg.reply_text(f"❌ خطا: {str(e)[:200]}")
 
 
 async def do_clip(msg, url: str):
     uid = msg.from_user.id
+    lang = get_lang(uid)
     src = norm_url(url)
     cleanup_samples()
+    cleanup_prep()
 
     hit = clip_get(src)
-    if hit and hit["song"]:
+    if hit:
         try:
-            return await clip_from_cache(msg, src, hit)
+            return await clip_from_cache(msg, src, hit, lang)
         except Exception:
             log.exception("clip cache send failed, re-downloading")
             clip_delete(src)
@@ -719,57 +985,68 @@ async def do_clip(msg, url: str):
     with tempfile.TemporaryDirectory() as tmp:
         path, title, meta = await asyncio.to_thread(download_clip, src, tmp)
         if not path:
-            return await msg.reply_text("⚠️ کلیپ پیدا نشد یا بزرگ‌تر از ۵۰ مگابایته.")
+            return await msg.reply_text(tr(lang, "clip_missing"))
         sid = uuid.uuid4().hex[:10]
         add_sample(sid, "", src)
 
-        # everything below runs at the same time:
+        # background: cut samples -> recognize -> download audio (not awaited)
         samples_task = asyncio.create_task(asyncio.to_thread(make_samples, path, sid))
-        song_task = asyncio.create_task(identify_clip(uid, sid, meta, src, samples_task))
-        upload_task = asyncio.create_task(
-            upload_video(msg, path, f"⏳ در حال شناسایی موسیقی...\n\n{footer(src)}"))
-        audio_task = None
+        prep_task = asyncio.create_task(prep_clip(uid, sid, meta, src, samples_task))
+        PREP[sid] = {"task": prep_task, "src": src, "created": time.time(), "used": False}
         try:
-            song, blocked = await song_task
-            if song:
-                with db() as c:
-                    c.execute("UPDATE samples SET last=? WHERE id=?", (song.get("engine"), sid))
-                # start downloading the mp3 while the video is still uploading
-                audio_task = asyncio.create_task(prepare_song_audio(song))
-            sent = await upload_task
-
-            if song:
-                cap, kb = result_caption(song, src), result_keyboard(sid, song)
-                fid = _msg_video_id(sent)
-                if fid:
-                    clip_put(src, fid, song)
-            else:
-                note = "⛔ سقف تشخیص امروزت پر شده" if blocked else ""
-                cap = plain_caption(title, src, note)
-                kb = None if blocked else Markup([[Btn("🎵 شناسایی موسیقی", callback_data=f"rec:{sid}")]])
-            try:
-                await sent.edit_caption(caption=cap, parse_mode="HTML", reply_markup=kb)
-            except Exception:
-                log.warning("edit caption failed", exc_info=True)
-
-            if audio_task:
-                try:
-                    a = await audio_task
-                    await deliver_audio(msg, a, song)
-                except Exception as e:
-                    log.exception("clip audio failed")
-                    await msg.reply_text(f"❌ خطا: {str(e)[:200]}")
+            # the clip goes out right away with the identify + search buttons
+            sent = await upload_video(msg, path, footer(src), clip_keyboard(sid, lang))
+            fid = _msg_video_id(sent)
+            if fid:
+                clip_put(src, fid)
+        except Exception:
+            drop_entry(sid)
+            raise
         finally:
-            for t in (audio_task, upload_task):
-                if t and not t.done():
-                    t.cancel()
+            # the clip file lives in tmp, so the sample cutting must finish before we leave
             await asyncio.gather(samples_task, return_exceptions=True)
 
 
+async def show_prepared(q, sid: str, entry: dict, lang: str):
+    """The user tapped 'identify': reveal what the background job already prepared."""
+    if entry.get("used"):
+        return await q.answer()
+    task = entry["task"]
+    if task.done():
+        await q.answer()
+    else:
+        await q.answer(tr(lang, "wait_toast"))
+    try:
+        res = await asyncio.wait_for(asyncio.shield(task), timeout=240)
+    except Exception:
+        log.exception("waiting for prepared result failed")
+        return await q.message.reply_text(tr(lang, "not_found"))
+    song = res.get("song")
+    if not song:
+        key = "quota_short" if res.get("blocked") else "not_found"
+        return await q.message.reply_text(tr(lang, key))
+    if entry.get("used"):  # double tap while waiting
+        return
+    entry["used"] = True
+    src = entry["src"]
+    try:
+        await q.edit_message_caption(caption=result_caption(song, src), parse_mode="HTML",
+                                     reply_markup=result_keyboard(sid, song, lang))
+    except Exception:
+        log.warning("edit caption failed", exc_info=True)
+    try:
+        a = res.get("audio") or await prepare_song_audio(song)
+        await deliver_audio(q.message, a, song, lang)
+    except Exception as e:
+        log.exception("mp3 failed")
+        await q.message.reply_text(tr(lang, "err", e=str(e)[:200]))
+    PREP.pop(sid, None)
+
+
 # ---------- Voice / audio from user ----------
-async def handle_media(msg, media, status):
+async def handle_media(msg, media, status, lang: str):
     if not use_quota(msg.from_user.id):
-        return await status.edit_text("⛔ سقف تشخیص امروزت پر شده، فردا دوباره امتحان کن.")
+        return await status.edit_text(tr(lang, "quota"))
     cleanup_samples()
     sid = uuid.uuid4().hex[:10]
     raw = os.path.join(SAMPLES_DIR, sid + ".raw")
@@ -784,18 +1061,18 @@ async def handle_media(msg, media, status):
     add_sample(sid, outs[0])
     song = await asyncio.to_thread(recognize, outs)
     if not song:
-        return await status.edit_text("😕 آهنگ رو نشناختم.")
+        return await status.edit_text(tr(lang, "not_found"))
     with db() as c:
         c.execute("UPDATE samples SET last=? WHERE id=?", (song["engine"], sid))
     audio_task = asyncio.create_task(prepare_song_audio(song))
     await status.edit_text(result_caption(song), parse_mode="HTML",
-                           reply_markup=result_keyboard(sid, song), **NO_PREVIEW)
+                           reply_markup=result_keyboard(sid, song, lang), **NO_PREVIEW)
     try:
         a = await audio_task
-        await deliver_audio(msg, a, song)
+        await deliver_audio(msg, a, song, lang)
     except Exception as e:
         log.exception("mp3 failed")
-        await msg.reply_text(f"❌ خطا: {str(e)[:200]}")
+        await msg.reply_text(tr(lang, "err", e=str(e)[:200]))
 
 
 async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -803,36 +1080,48 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not msg or not msg.from_user:
         return
     uid = msg.from_user.id
-    touch_user(uid)
+    touch_user(msg.from_user)
+    lang = get_lang(uid)
+    cleanup_prep()
     st = ctx.user_data.get("await")
     if st and uid in ADMIN_IDS and msg.text:
         return await admin_input(update, ctx, st)
-    status = await msg.reply_text("⏳ در حال پردازش...")
+    status = await msg.reply_text(tr(lang, "working"))
     try:
         media = msg.voice or msg.audio or msg.video_note
         if media:
-            await handle_media(msg, media, status)
+            await handle_media(msg, media, status, lang)
             return
         text = (msg.text or "").strip()
         if text.startswith(MP3_PREFIX):
-            await send_mp3(msg, text[len(MP3_PREFIX):].strip())
+            await send_mp3(msg, text[len(MP3_PREFIX):].strip(), lang=lang)
         else:
             m = URL_RE.search(text)
             if m and any(h in m.group(0) for h in CLIP_HOSTS):
                 await do_clip(msg, m.group(0))
             else:
                 target, _ = await asyncio.to_thread(resolve, text)
-                await send_mp3(msg, target)
+                await send_mp3(msg, target, lang=lang)
         await status.delete()
     except Exception as e:
         log.exception("handle failed")
-        await status.edit_text(f"❌ خطا: {str(e)[:200]}")
+        await status.edit_text(tr(lang, "err", e=str(e)[:200]))
 
 
 # ---------- Buttons ----------
 async def on_rec(q, data: str):
     action, sid = data.split(":", 1)
     uid = q.from_user.id
+    lang = get_lang(uid)
+
+    if action == "rec":
+        entry = PREP.get(sid)
+        if entry:
+            return await show_prepared(q, sid, entry, lang)
+        # no prepared result (bot restarted / expired): recognize now, below
+    else:
+        drop_entry(sid)  # "wrong song": the prepared result is wrong, throw it away
+
     with db() as c:
         row = c.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
     if row and action == "bad" and row["src"]:
@@ -840,7 +1129,7 @@ async def on_rec(q, data: str):
     paths = sorted(glob.glob(os.path.join(SAMPLES_DIR, f"{sid}_*")))
     mpath = os.path.join(SAMPLES_DIR, f"{sid}.json")
     if not row or not (paths or os.path.exists(mpath)):
-        return await q.answer("نمونه منقضی شده، لینک یا فایل رو دوباره بفرست.", show_alert=True)
+        return await q.answer(tr(lang, "expired"), show_alert=True)
     tried = [t for t in (row["tried"] or "").split(",") if t]
     if action == "bad" and row["last"]:
         tried.append(row["last"])
@@ -858,18 +1147,18 @@ async def on_rec(q, data: str):
         await q.answer()
     else:
         if not paths:
-            return await q.answer("نتیجه‌ی دیگه‌ای نیست.", show_alert=True)
+            return await q.answer(tr(lang, "no_result"), show_alert=True)
         if not use_quota(uid):
-            return await q.answer("⛔ سقف تشخیص امروزت پر شده.", show_alert=True)
-        await q.answer("⏳ در حال شناسایی...")
+            return await q.answer(tr(lang, "quota_short"), show_alert=True)
+        await q.answer(tr(lang, "identifying"))
         song = await asyncio.to_thread(recognize, paths, tuple(tried))
     if not song:
-        txt = "😕 آهنگ رو نشناختم." if not tried else "😕 موتور دیگه‌ای برای امتحان نمونده."
+        txt = tr(lang, "not_found") if not tried else tr(lang, "no_more")
         return await q.message.reply_text(txt)
     with db() as c:
         c.execute("UPDATE samples SET last=? WHERE id=?", (song["engine"], sid))
     src = row["src"]
-    kb = result_keyboard(sid, song)
+    kb = result_keyboard(sid, song, lang)
     cap = result_caption(song, src)
     audio_task = asyncio.create_task(prepare_song_audio(song))
     try:
@@ -879,38 +1168,57 @@ async def on_rec(q, data: str):
             await q.edit_message_caption(caption=cap, parse_mode="HTML", reply_markup=kb)
     except Exception:
         await q.message.reply_text(cap, parse_mode="HTML", reply_markup=kb, **NO_PREVIEW)
-    if src and getattr(q.message, "video", None):
-        clip_put(src, q.message.video.file_id, song)
+    if src:
+        clip_set_song(src, song)
+        vid = getattr(q.message, "video", None)
+        if vid:
+            clip_put(src, vid.file_id, song)
     try:
         a = await audio_task
-        await deliver_audio(q.message, a, song)
+        await deliver_audio(q.message, a, song, lang)
     except Exception as e:
         log.exception("mp3 failed")
-        await q.message.reply_text(f"❌ خطا: {str(e)[:200]}")
+        await q.message.reply_text(tr(lang, "err", e=str(e)[:200]))
 
 
 async def on_lyrics(q, data: str):
+    lang = get_lang(q.from_user.id)
     tid = data.split(":", 1)[1]
     with db() as c:
         row = c.execute("SELECT * FROM tracks WHERE id=?", (tid,)).fetchone()
     if not row:
-        return await q.answer("اطلاعات آهنگ پیدا نشد.", show_alert=True)
-    await q.answer("⏳ در حال پیدا کردن متن ترانه...")
+        return await q.answer(tr(lang, "track_missing"), show_alert=True)
+    await q.answer(tr(lang, "lyrics_wait"))
     text = await asyncio.to_thread(get_lyrics, row["artist"], row["title"])
     if not text:
-        return await q.message.reply_text("😕 متن این آهنگ پیدا نشد.")
+        return await q.message.reply_text(tr(lang, "lyrics_none"))
     for chunk in split_text(f"🎤 {row['title']}\n\n{text}"):
         await q.message.reply_text(chunk)
+
+
+async def on_lang_button(q, data: str):
+    code = data.split(":", 1)[1]
+    if code not in LANGS:
+        return await q.answer()
+    set_lang(q.from_user.id, code)
+    await q.answer(tr(code, "lang_set"))
+    try:
+        await q.edit_message_text(tr(code, "welcome"), parse_mode="HTML",
+                                  reply_markup=lang_keyboard(), **NO_PREVIEW)
+    except Exception:
+        pass  # same language tapped again: message not modified
 
 
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     data = q.data or ""
-    touch_user(q.from_user.id)
+    touch_user(q.from_user)
     if data.startswith(("rec:", "bad:")):
         return await on_rec(q, data)
     if data.startswith("lyr:"):
         return await on_lyrics(q, data)
+    if data.startswith("lang:"):
+        return await on_lang_button(q, data)
     if data.startswith(("adm:", "acc:")):
         if q.from_user.id not in ADMIN_IDS:
             return await q.answer("⛔", show_alert=True)
@@ -1062,10 +1370,16 @@ async def admin_input(update: Update, ctx, st: str):
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    touch_user(update.effective_user.id)
-    await update.message.reply_text(
-        "سلام 👋\nلینک یوتیوب یا اینستاگرام بفرست تا کلیپش رو بگیری و بتونی موسیقی‌اش رو شناسایی کنی.\n"
-        "ویس هم می‌تونی بفرستی، یا اسم آهنگ رو تایپ کن.")
+    u = update.effective_user
+    touch_user(u)
+    lang = get_lang(u.id)
+    await update.message.reply_text(tr(lang, "welcome"), parse_mode="HTML",
+                                    reply_markup=lang_keyboard(), **NO_PREVIEW)
+
+
+async def cmd_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    touch_user(update.effective_user)
+    await update.message.reply_text(LANG_PROMPT, reply_markup=lang_keyboard())
 
 
 @admin_only
@@ -1153,7 +1467,7 @@ def main():
     migrate()
     seed_from_env()
     app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
-    for name, fn in [("start", cmd_start), ("admin", cmd_admin), ("addacr", cmd_addacr),
+    for name, fn in [("start", cmd_start), ("lang", cmd_lang), ("admin", cmd_admin), ("addacr", cmd_addacr),
                      ("addaudd", cmd_addaudd), ("accounts", cmd_accounts),
                      ("remove", cmd_remove), ("toggle", cmd_toggle)]:
         app.add_handler(CommandHandler(name, fn))
