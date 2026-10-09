@@ -1,4 +1,4 @@
-import json, asyncio, sqlite3, datetime, os, re, tempfile, glob, time, hmac, hashlib, base64, uuid, subprocess, logging, html, shutil
+import json, asyncio, sqlite3, datetime, os, re, tempfile, glob, time, hmac, hashlib, base64, uuid, subprocess, logging, html, shutil, sys, threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from urllib.parse import quote, urlparse, parse_qs
@@ -27,7 +27,10 @@ ACR_KEY = os.environ.get("ACR_KEY")
 ACR_SECRET = os.environ.get("ACR_SECRET")
 AUDD_TOKEN = os.environ.get("AUDD_TOKEN")
 ODESLI_KEY = os.environ.get("ODESLI_KEY")  # optional
-ENGINE_ORDER = os.environ.get("ENGINES", "acr,audd").split(",")
+ENGINE_ORDER = os.environ.get("ENGINES", "acr,audd,shazam").split(",")
+# last resort when the melody is not recognized: transcribe the singing and search the words
+LYRICS_ENGINE = os.environ.get("LYRICS_ENGINE", "1") == "1"
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")  # tiny = lighter, small = more accurate
 DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "20"))
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
@@ -497,7 +500,7 @@ def make_samples(src: str, sid: str) -> list:
     d = probe_duration(src)
     win = 15
     if d and d > win + 3:
-        offs = [d * 0.4 - win / 2, d * 0.05, d * 0.75 - win / 2]
+        offs = [d * 0.4 - win / 2, d * 0.05, d * 0.75 - win / 2, d * 0.2 - win / 2, d * 0.6 - win / 2]
         offs = [max(0, min(o, d - win)) for o in offs]
     else:
         offs = [0]
@@ -859,13 +862,89 @@ def _chain(path: str, skip=()):
     return None
 
 
+# ---------- Last resort: what the singer says (speech -> words -> lyrics search) ----------
+_WHISPER = {"model": None}
+_WHISPER_LOCK = threading.Lock()  # one transcription at a time keeps RAM/CPU under control
+
+
+def transcribe(path: str) -> str:
+    """Speech-to-text with faster-whisper (optional: returns '' if it is not installed)."""
+    try:
+        from faster_whisper import WhisperModel
+    except Exception:
+        return ""
+    with _WHISPER_LOCK:
+        if _WHISPER["model"] is None:
+            _WHISPER["model"] = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+        segs, _info = _WHISPER["model"].transcribe(path, vad_filter=True, beam_size=1,
+                                                   condition_on_previous_text=False)
+        return " ".join(sg.text.strip() for sg in segs).strip()
+
+
+def lyric_overlap(words, lyrics: str) -> float:
+    """How many of the transcribed words really appear in the candidate song's lyrics."""
+    ws = {w for w in words if len(w) > 2}
+    if not ws:
+        return 0.0
+    lw = set(re.findall(r"\w+", (lyrics or "").lower()))
+    return len(ws & lw) / len(ws)
+
+
+def audd_find_lyrics(words, acc):
+    q = " ".join(words[:40])
+    r = requests.get("https://api.audd.io/findLyrics/", params={"q": q, "api_token": acc["key"]},
+                     timeout=30).json()
+    for it in (r.get("result") or [])[:3]:
+        lyrics = it.get("lyrics")
+        # if AudD sends the lyrics, make sure the match is real; otherwise we can't verify
+        if lyrics and lyric_overlap(words, lyrics) < 0.35:
+            continue
+        if it.get("title") and it.get("artist"):
+            return {"title": it["title"], "artist": it["artist"], "link": it.get("song_link")}
+    return None
+
+
+def lyrics_identify(paths):
+    with db() as c:
+        accs = c.execute("SELECT * FROM accounts WHERE enabled=1 AND type='audd' ORDER BY id").fetchall()
+    if not accs:
+        return None
+    for p in paths[:2]:
+        text = transcribe(p)
+        words = re.findall(r"\w+", text.lower())
+        if len(words) < 6:  # instrumental, humming or too little singing
+            continue
+        for acc in accs:
+            try:
+                res = audd_find_lyrics(words, acc)
+                with db() as c:
+                    c.execute("UPDATE accounts SET uses=uses+1 WHERE id=?", (acc["id"],))
+                if res:
+                    return res
+                break  # no match: don't spend the other accounts on the same words
+            except Exception as e:
+                log.warning("lyrics search failed: %s", e)
+                with db() as c:
+                    c.execute("UPDATE accounts SET errors=errors+1 WHERE id=?", (acc["id"],))
+    return None
+
+
 def recognize(paths, skip=()):
+    """1) melody fingerprint on each sample (ACRCloud, AudD, Shazam)  2) what the singer says."""
     if isinstance(paths, str):
         paths = [paths]
     for p in paths:
         res = _chain(p, skip)
         if res:
             return res
+    if LYRICS_ENGINE and "lyrics#0" not in skip:
+        try:
+            res = lyrics_identify(paths)
+            if res:
+                res["engine"] = "lyrics#0"
+                return res
+        except Exception as e:
+            log.warning("lyrics stage failed: %s", e)
     return None
 
 
@@ -1173,9 +1252,6 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     touch_user(msg.from_user)
     lang = get_lang(uid)
     cleanup_prep()
-    st = ctx.user_data.get("await")
-    if st and uid in ADMIN_IDS and msg.text:
-        return await admin_input(update, ctx, st)
     media = msg.voice or msg.audio or msg.video_note
     text = (msg.text or "").strip()
     m = URL_RE.search(text)
@@ -1341,10 +1417,6 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await on_lyrics(q, data)
     if data.startswith("lang:"):
         return await on_lang_button(q, data)
-    if data.startswith(("adm:", "acc:")):
-        if q.from_user.id not in ADMIN_IDS:
-            return await q.answer("⛔", show_alert=True)
-        return await admin_cb(q, ctx, data)
     await q.answer()
 
 
@@ -1377,120 +1449,6 @@ async def on_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer(results, cache_time=60)
 
 
-# ---------- Super admin panel ----------
-def admin_only(fn):
-    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if not update.effective_user or update.effective_user.id not in ADMIN_IDS:
-            return
-        return await fn(update, ctx)
-    return wrapper
-
-
-BACK = Markup([[Btn("⬅️ بازگشت", callback_data="adm:menu")]])
-
-
-def admin_menu():
-    return Markup([
-        [Btn("➕ ACRCloud", callback_data="adm:addacr"), Btn("➕ AudD", callback_data="adm:addaudd")],
-        [Btn("📋 اکانت‌ها", callback_data="adm:list")],
-        [Btn("⚙️ سقف روزانه", callback_data="adm:limit"), Btn("📊 آمار", callback_data="adm:stats")],
-    ])
-
-
-def stats_text() -> str:
-    day = datetime.date.today().isoformat()
-    with db() as c:
-        users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        new = c.execute("SELECT COUNT(*) FROM users WHERE first_seen=?", (day,)).fetchone()[0]
-        act, rec = c.execute("SELECT COUNT(*), COALESCE(SUM(n),0) FROM usage WHERE day=?", (day,)).fetchone()
-        songs = c.execute("SELECT COUNT(*) FROM songs").fetchone()[0]
-        clips = c.execute("SELECT COUNT(*) FROM clips").fetchone()[0]
-        accs = c.execute("SELECT COUNT(*) FROM accounts WHERE enabled=1").fetchone()[0]
-    lim = daily_limit()
-    return (f"📊 آمار\n👥 کل کاربران: {users}\n🆕 جدید امروز: {new}\n"
-            f"🎧 شناسایی امروز: {rec} (از {act} نفر)\n💾 آهنگ‌های کش‌شده: {songs}\n"
-            f"🎬 کلیپ‌های کش‌شده: {clips}\n"
-            f"🟢 اکانت فعال: {accs}\n⚙️ سقف روزانه: {'نامحدود' if lim <= 0 else lim}")
-
-
-async def show_accounts(q):
-    with db() as c:
-        rows = c.execute("SELECT * FROM accounts ORDER BY id").fetchall()
-    if not rows:
-        text = "هیچ اکانتی نیست. از منو اضافه کن."
-    else:
-        text = "\n".join(
-            f'{"🟢" if r["enabled"] else "⚪️"} #{r["id"]} {r["type"]} …{(r["key"] or "")[-4:]} | استفاده {r["uses"]} | خطا {r["errors"]}'
-            for r in rows)
-    kb = [[Btn(f'{"⏸" if r["enabled"] else "▶️"} #{r["id"]}', callback_data=f'acc:t:{r["id"]}'),
-           Btn(f'🗑 #{r["id"]}', callback_data=f'acc:d:{r["id"]}')] for r in rows]
-    kb.append([Btn("⬅️ بازگشت", callback_data="adm:menu")])
-    try:
-        await q.edit_message_text(text, reply_markup=Markup(kb))
-    except Exception:
-        pass
-
-
-async def admin_cb(q, ctx, data: str):
-    await q.answer()
-    parts = data.split(":")
-    if parts[0] == "adm":
-        act = parts[1]
-        if act == "menu":
-            ctx.user_data.pop("await", None)
-            await q.edit_message_text("🛠 پنل مدیریت", reply_markup=admin_menu())
-        elif act == "addacr":
-            ctx.user_data["await"] = "acr"
-            await q.edit_message_text("اطلاعات ACRCloud رو توی یه پیام بفرست:\nHOST ACCESS_KEY ACCESS_SECRET\n(بعد از ذخیره، پیامت پاک میشه)", reply_markup=BACK)
-        elif act == "addaudd":
-            ctx.user_data["await"] = "audd"
-            await q.edit_message_text("توکن AudD رو بفرست:\n(بعد از ذخیره، پیامت پاک میشه)", reply_markup=BACK)
-        elif act == "limit":
-            ctx.user_data["await"] = "limit"
-            await q.edit_message_text(f"سقف روزانه‌ی هر کاربر الان {daily_limit()} هست. عدد جدید رو بفرست (۰ = نامحدود):", reply_markup=BACK)
-        elif act == "list":
-            await show_accounts(q)
-        elif act == "stats":
-            await q.edit_message_text(stats_text(), reply_markup=BACK)
-    elif parts[0] == "acc":
-        _, op, aid = parts
-        with db() as c:
-            if op == "t":
-                c.execute("UPDATE accounts SET enabled=1-enabled WHERE id=?", (int(aid),))
-            elif op == "d":
-                c.execute("DELETE FROM accounts WHERE id=?", (int(aid),))
-        await show_accounts(q)
-
-
-async def _hide_secret(update: Update):
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
-
-
-async def admin_input(update: Update, ctx, st: str):
-    msg = update.message
-    parts = msg.text.split()
-    ctx.user_data.pop("await", None)
-    chat = update.effective_chat.id
-    if st == "acr" and len(parts) == 3:
-        with db() as c:
-            cur = c.execute("INSERT INTO accounts(type,host,key,secret) VALUES('acr',?,?,?)", tuple(parts))
-        reply = f"✅ ACRCloud اضافه شد (id={cur.lastrowid})"
-    elif st == "audd" and len(parts) == 1:
-        with db() as c:
-            cur = c.execute("INSERT INTO accounts(type,key) VALUES('audd',?)", (parts[0],))
-        reply = f"✅ AudD اضافه شد (id={cur.lastrowid})"
-    elif st == "limit" and len(parts) == 1 and parts[0].isdigit():
-        set_setting("daily_limit", int(parts[0]))
-        reply = f"✅ سقف روزانه شد {parts[0]}"
-    else:
-        return await msg.reply_text("❌ فرمت اشتباه بود، دوباره از پنل شروع کن.", reply_markup=admin_menu())
-    await _hide_secret(update)
-    await ctx.bot.send_message(chat, reply, reply_markup=admin_menu())
-
-
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     touch_user(update.effective_user)
     # only the language list is shown first; after a choice it turns into the welcome text
@@ -1502,83 +1460,6 @@ async def cmd_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(LANG_PROMPT, reply_markup=lang_keyboard())
 
 
-@admin_only
-async def cmd_admin(update, ctx):
-    await update.message.reply_text("🛠 پنل مدیریت", reply_markup=admin_menu())
-
-
-@admin_only
-async def cmd_addacr(update, ctx):
-    if len(ctx.args) != 3:
-        return await update.message.reply_text("/addacr HOST ACCESS_KEY ACCESS_SECRET")
-    with db() as c:
-        cur = c.execute("INSERT INTO accounts(type,host,key,secret) VALUES('acr',?,?,?)", tuple(ctx.args))
-    await _hide_secret(update)
-    await ctx.bot.send_message(update.effective_chat.id, f"✅ ACRCloud اضافه شد (id={cur.lastrowid})")
-
-
-@admin_only
-async def cmd_addaudd(update, ctx):
-    if len(ctx.args) != 1:
-        return await update.message.reply_text("/addaudd API_TOKEN")
-    with db() as c:
-        cur = c.execute("INSERT INTO accounts(type,key) VALUES('audd',?)", (ctx.args[0],))
-    await _hide_secret(update)
-    await ctx.bot.send_message(update.effective_chat.id, f"✅ AudD اضافه شد (id={cur.lastrowid})")
-
-
-@admin_only
-async def cmd_accounts(update, ctx):
-    with db() as c:
-        rows = c.execute("SELECT * FROM accounts ORDER BY id").fetchall()
-    if not rows:
-        return await update.message.reply_text("هیچ اکانتی نیست. با /admin اضافه کن.")
-    lines = [f'{"🟢" if r["enabled"] else "⚪️"} #{r["id"]} {r["type"]} …{(r["key"] or "")[-4:]} | استفاده {r["uses"]} | خطا {r["errors"]}' for r in rows]
-    await update.message.reply_text("\n".join(lines))
-
-
-@admin_only
-async def cmd_remove(update, ctx):
-    if not ctx.args or not ctx.args[0].isdigit():
-        return await update.message.reply_text("/remove ID")
-    with db() as c:
-        n = c.execute("DELETE FROM accounts WHERE id=?", (int(ctx.args[0]),)).rowcount
-    await update.message.reply_text("🗑 حذف شد" if n else "پیدا نشد")
-
-
-@admin_only
-async def cmd_toggle(update, ctx):
-    if not ctx.args or not ctx.args[0].isdigit():
-        return await update.message.reply_text("/toggle ID")
-    with db() as c:
-        n = c.execute("UPDATE accounts SET enabled=1-enabled WHERE id=?", (int(ctx.args[0]),)).rowcount
-    await update.message.reply_text("✅ تغییر کرد" if n else "پیدا نشد")
-
-
-async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not msg or not msg.from_user or msg.from_user.id not in ADMIN_IDS:
-        return
-    doc = msg.document
-    if not doc or not (doc.file_name or "").lower().endswith(".txt"):
-        return
-    if (doc.file_size or 0) > 3 * 1024 * 1024:
-        return await msg.reply_text("❌ فایل خیلی بزرگه.")
-    tmp = COOKIES + ".tmp"
-    await (await doc.get_file()).download_to_drive(tmp)
-    with open(tmp, encoding="utf-8", errors="ignore") as f:
-        content = f.read()
-    if "youtube.com" not in content and "instagram.com" not in content:
-        os.remove(tmp)
-        return await msg.reply_text("❌ این فایل کوکی یوتیوب یا اینستاگرام نیست.")
-    os.replace(tmp, COOKIES)
-    await msg.reply_text("✅ کوکی ذخیره شد، لینک رو دوباره امتحان کن.")
-    try:
-        await msg.delete()
-    except Exception:
-        pass
-
-
 async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
     log.error("update error", exc_info=ctx.error)
 
@@ -1587,9 +1468,7 @@ def main():
     migrate()
     seed_from_env()
     app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
-    for name, fn in [("start", cmd_start), ("lang", cmd_lang), ("admin", cmd_admin), ("addacr", cmd_addacr),
-                     ("addaudd", cmd_addaudd), ("accounts", cmd_accounts),
-                     ("remove", cmd_remove), ("toggle", cmd_toggle)]:
+    for name, fn in [("start", cmd_start), ("lang", cmd_lang)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(InlineQueryHandler(on_inline))
@@ -1597,8 +1476,14 @@ def main():
         filters.TEXT & ~filters.COMMAND | filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE,
         handle,
     ))
-    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_error_handler(on_error)
+    # Admin features live in ./admin and are optional: if that folder is missing or broken,
+    # the bot still starts and recognition works as usual.
+    try:
+        from admin import register as register_admin
+        register_admin(app, sys.modules[__name__])
+    except Exception:
+        log.exception("admin module not loaded - the bot continues without it")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
