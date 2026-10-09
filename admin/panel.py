@@ -3,8 +3,10 @@ import os
 import datetime
 import logging
 from telegram import InlineKeyboardButton as Btn, InlineKeyboardMarkup as Markup
-import shared as S
-import join, broadcast
+from telegram.ext import (ApplicationHandlerStop, CallbackQueryHandler,
+                          CommandHandler, MessageHandler, filters)
+from . import shared as S
+from . import join, broadcast
 
 log = logging.getLogger("admin.panel")
 
@@ -219,3 +221,46 @@ async def on_document(update, ctx):
         await msg.delete()
     except Exception:
         pass
+
+
+# ----- wiring -----
+async def on_admin_text(update, ctx):
+    """Admin message while the panel waits for input (or a broadcast message/button)."""
+    msg = update.message
+    if not msg or not msg.from_user or not S.is_admin(msg.from_user.id):
+        return
+    st = ctx.user_data.get("await")
+    if not st:
+        return
+    if await broadcast.on_message(msg, ctx, st):
+        raise ApplicationHandlerStop
+    if msg.text:
+        await admin_input(update, ctx, st)
+        raise ApplicationHandlerStop
+
+
+async def on_admin_callback(update, ctx):
+    q = update.callback_query
+    if not S.is_admin(q.from_user.id):
+        return
+    await admin_cb(q, ctx, q.data)
+    raise ApplicationHandlerStop
+
+
+def register(app, core):
+    S.setup(core)
+    # gates first: ban + forced channel membership
+    app.add_handler(MessageHandler(filters.ALL, join.message_gate), group=-3)
+    app.add_handler(CallbackQueryHandler(join.callback_gate), group=-3)
+    app.add_handler(CallbackQueryHandler(join.on_join_check, pattern=r"^chk:1$"), group=-2)
+    # admin panel buttons and admin input
+    app.add_handler(CallbackQueryHandler(on_admin_callback, pattern=r"^(adm|acc):"), group=-2)
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_admin_text), group=-2)
+    app.add_handler(MessageHandler(filters.Document.ALL, on_document), group=-2)
+    # commands
+    app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("addacr", cmd_addacr))
+    app.add_handler(CommandHandler("addaudd", cmd_addaudd))
+    app.add_handler(CommandHandler("accounts", cmd_accounts))
+    app.add_handler(CommandHandler("remove", cmd_remove))
+    app.add_handler(CommandHandler("toggle", cmd_toggle))
