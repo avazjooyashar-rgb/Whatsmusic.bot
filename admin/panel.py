@@ -3,7 +3,7 @@ import os
 import datetime
 import logging
 from telegram import InlineKeyboardButton as Btn, InlineKeyboardMarkup as Markup
-from . import shared as S
+import shared as S
 from . import join, broadcast
 
 log = logging.getLogger("admin.panel")
