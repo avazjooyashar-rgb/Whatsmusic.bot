@@ -331,7 +331,12 @@ def acr_identify(path: str, acc):
     ).json()
     if r.get("status", {}).get("code") != 0:
         return None
-    m = r["metadata"]["music"][0]
+    md = r.get("metadata") or {}
+    music = md.get("music") or []
+    if not music:  # e.g. only a humming / custom-file match: not a song we can name
+        log.info("acr: no music match (metadata keys: %s)", list(md.keys()))
+        return None
+    m = music[0]
     ext = m.get("external_metadata", {})
     link = None
     yt = None
@@ -340,7 +345,8 @@ def acr_identify(path: str, acc):
     if ext.get("youtube", {}).get("vid"):
         yt = "https://www.youtube.com/watch?v=" + ext["youtube"]["vid"]
         link = link or yt
-    return {"title": m["title"], "artist": m["artists"][0]["name"], "link": link, "yt": yt}
+    artist = ((m.get("artists") or [{}])[0]).get("name", "")
+    return {"title": m["title"], "artist": artist, "link": link, "yt": yt}
 
 
 # ---------- Engine 2: AudD ----------
