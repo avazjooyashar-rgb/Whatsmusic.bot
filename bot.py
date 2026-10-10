@@ -323,6 +323,16 @@ def norm_url(url: str) -> str:
 _SPLIT_RE = re.compile(r"\s+(?:feat\.?|featuring|ft\.?|with|x|and|و)\s+|\s*[,&;/+،]\s*", re.I)
 _FEAT_RE = re.compile(r"[\(\[]\s*(?:feat\.?|ft\.?|featuring)\s+([^\)\]]+)", re.I)
 
+# titles of versions that are NOT the original studio song (a mashup contains many songs, so an
+# answer like this is usually a wrong / vague match). They lose against a normal answer.
+_BAD_TITLE_RE = re.compile(
+    r"mash\s?-?up|remix|medley|megamix|nightcore|slowed|sped\s?up|speed\s?up|reverb|"
+    r"\bcover\b|\blive\b|ریمیکس|ریمیک|مشاپ|مدلی|بازخوانی|کاور", re.I)
+
+
+def title_penalty(song: dict) -> float:
+    return 0.5 if _BAD_TITLE_RE.search(song.get("title") or "") else 1.0
+
 
 def _fold(s: str) -> str:
     s = (s or "").lower().replace("ي", "ی").replace("ك", "ک")
@@ -956,6 +966,9 @@ def shazam_identify(path: str):
 
 
 ENGINE_W = {"acr": 1.0, "shazam": 1.0, "audd": 0.9, "lyrics": 1.2}
+# Instagram's own "original audio" label is chosen by the uploader and is often wrong
+# (e.g. a mashup name), so it is only a weak vote next to the real engines.
+META_W = 0.6
 
 
 def _base(tag: str) -> str:
@@ -1008,7 +1021,8 @@ def call_engine(name: str, accs, path: str):
 
 def _group(hits: list) -> list:
     """Votes -> ranked answers. The same song found by different engines / pieces of audio
-    (even with a different spelling or a different number of singers) counts together."""
+    (even with a different spelling or a different number of singers) counts together.
+    Mashup / remix / live / cover titles are pushed down: they lose against a normal answer."""
     clusters = []
     for h in hits:
         for cl in clusters:
@@ -1030,10 +1044,17 @@ def _group(hits: list) -> list:
         for h in hs:
             per.setdefault(_base(h["engine"]), []).append(h["w"])
         score = sum(max(v) + 0.5 * (len(v) - 1) for v in per.values())
+        mult = title_penalty(song)
+        score *= mult
         solid = len(per) >= 2 or len({h["sample"] for h in hs}) >= 2
-        ranked.append({"song": song, "score": score, "solid": solid})
-    ranked.sort(key=lambda r: (r["solid"], r["score"]), reverse=True)
+        ranked.append({"song": song, "score": score, "solid": solid, "bad": mult < 1})
+    ranked.sort(key=lambda r: r["score"] + (1.0 if r["solid"] else 0.0), reverse=True)
     return ranked
+
+
+def _confident(ranked: list) -> bool:
+    """Good enough to stop listening: several votes agree and it is not a mashup/remix-like title."""
+    return bool(ranked) and ranked[0]["solid"] and not ranked[0]["bad"]
 
 
 # ---------- Last resort: what the singer says (speech -> words -> lyrics search) ----------
@@ -1108,11 +1129,13 @@ def lyrics_identify(paths):
     return None
 
 
-def recognize(paths, skip=()):
+def recognize(paths, skip=(), extra=None):
     """Listens like a human would, with all the 'ears' at once:
     1) every engine (ACRCloud, AudD, Shazam) listens at the same time, on several pieces of the audio
     2) answers are voted: the same song from 2+ engines / pieces wins, with ALL its singers merged
+       (mashup / remix / live / cover titles are pushed down)
     3) if nobody agrees, the singing is transcribed and matched with real lyrics
+    `extra` is a weak hint (e.g. the audio name written on an Instagram reel): it only counts as one vote.
     The result has an "alts" list with the runner-up answers."""
     if isinstance(paths, str):
         paths = [paths]
@@ -1121,6 +1144,8 @@ def recognize(paths, skip=()):
     jobs = _active_engines(skip)
     order = {n: i for i, (n, _a) in enumerate(jobs)}
     hits = []
+    if extra and extra.get("title") and "meta#0" not in skip and title_key(extra["title"]) not in rejected:
+        hits.append({"song": dict(extra, engine="meta#0"), "engine": "meta#0", "sample": 98, "w": META_W})
 
     def run_batch(batch):
         tasks = [(name, accs, idx, p) for idx, p in batch for name, accs in jobs]
@@ -1141,6 +1166,7 @@ def recognize(paths, skip=()):
 
     pieces = list(enumerate(paths[:MAX_SAMPLES]))
     pos = 0
+    ranked = _group(hits)
     for size in (1, 2, 2, 2):  # best piece first; only listen to more if the engines don't agree yet
         batch = pieces[pos:pos + size]
         pos += size
@@ -1148,11 +1174,11 @@ def recognize(paths, skip=()):
             break
         run_batch(batch)
         ranked = _group(hits)
-        if ranked and ranked[0]["solid"]:
+        if _confident(ranked):
             break
     ranked = _group(hits)
 
-    if LYRICS_ENGINE and "lyrics#0" not in skip and not (ranked and ranked[0]["solid"]):
+    if LYRICS_ENGINE and "lyrics#0" not in skip and not _confident(ranked):
         try:
             ly = lyrics_identify(paths)
             if ly and title_key(ly.get("title")) not in rejected:
@@ -1304,21 +1330,28 @@ async def upload_video(msg, path: str, caption: str, kb=None):
 
 
 async def identify_clip(uid: int, sid: str, meta, src: str, samples_task):
-    """Returns (song or None, quota_blocked)."""
+    """Returns (song or None, quota_blocked).
+    YouTube's own music metadata (official tracks) is trusted. Anything else (Instagram's
+    'original audio' label is whatever the uploader picked) is only a weak hint that must be
+    confirmed by listening to the real audio."""
     try:
+        meta_song = None
         if meta:
+            meta_song = {"title": meta["title"], "artist": meta["artist"],
+                         "link": src if "youtu" in src else None, "engine": "meta#0"}
             if "youtu" in src:
                 meta["link"] = src
-            with open(os.path.join(SAMPLES_DIR, sid + ".json"), "w", encoding="utf-8") as f:
-                json.dump(meta, f, ensure_ascii=False)
-            return {"title": meta["title"], "artist": meta["artist"],
-                    "link": meta.get("link"), "engine": "meta#0"}, False
+                with open(os.path.join(SAMPLES_DIR, sid + ".json"), "w", encoding="utf-8") as f:
+                    json.dump(meta, f, ensure_ascii=False)
+                return meta_song, False
         if not use_quota(uid):
+            if meta_song:  # no quota left: the hint is better than nothing
+                return meta_song, False
             return None, True
         outs = await samples_task
         if not outs:
-            return None, False
-        return await asyncio.to_thread(recognize, outs), False
+            return meta_song, False
+        return await asyncio.to_thread(recognize, outs, (), meta_song), False
     except Exception:
         log.exception("identify_clip failed")
         return None, False
