@@ -115,6 +115,7 @@ STR = {
         "btn_wrong": "آهنگ اشتباه",
         "btn_lyrics": "متن ترانه",
         "btn_more": "آهنگ‌های بیشتر",
+        "no_music": "⚠️ آهنگ این پست پیدا نشد.",
     },
     "en": {
         "welcome": (
@@ -146,6 +147,7 @@ STR = {
         "btn_wrong": "Wrong song",
         "btn_lyrics": "Lyrics",
         "btn_more": "More songs",
+        "no_music": "⚠️ Couldn't find this post's music.",
     },
     "tr": {
         "welcome": (
@@ -561,6 +563,67 @@ def download_clip(url: str, outdir: str):
     return files[0], info.get("title") or "clip", meta
 
 
+IG_APP_ID = "936619743392459"
+_IG_ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+_IG_CODE_RE = re.compile(r"instagram\.com/(?:[^/?#]+/)?(?:p|reel|reels|tv)/([\w-]+)")
+
+
+def ig_media_id(code: str) -> int:
+    n = 0
+    for ch in code[:11]:
+        n = n * 64 + _IG_ALPHA.index(ch)
+    return n
+
+
+def ig_post_audio(url: str, outdir: str):
+    """Photo / carousel posts have no video, so yt-dlp refuses them. Their music is still in the
+    post's data: ask Instagram for it (needs a logged-in instagram.com cookie in cookies.txt).
+    Returns {"path": audio file, "meta": {"title", "artist"} or None} or None."""
+    m = _IG_CODE_RE.search(url)
+    if not m or not os.path.exists(COOKIES):
+        return None
+    try:
+        import http.cookiejar
+        jar = http.cookiejar.MozillaCookieJar(COOKIES)
+        jar.load(ignore_discard=True, ignore_expires=True)
+        s = requests.Session()
+        s.cookies = jar
+        s.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "X-IG-App-ID": IG_APP_ID, "X-Requested-With": "XMLHttpRequest", "Referer": url})
+        r = s.get(f"https://www.instagram.com/api/v1/media/{ig_media_id(m.group(1))}/info/", timeout=20)
+        if not r.ok:
+            log.warning("instagram post info failed: HTTP %s", r.status_code)
+            return None
+        items = r.json().get("items") or []
+        if not items:
+            return None
+        it = items[0]
+        cm = it.get("clips_metadata") or {}
+        asset = (((it.get("music_metadata") or {}).get("music_info") or {}).get("music_asset_info")
+                 or (cm.get("music_info") or {}).get("music_asset_info") or {})
+        audio_url = asset.get("progressive_download_url") or asset.get("fast_start_progressive_download_url")
+        meta = None
+        if asset.get("title") and asset.get("display_artist"):
+            meta = {"title": asset["title"], "artist": asset["display_artist"], "link": None,
+                    "engine": "meta#0"}
+        if not audio_url:  # uploader's own sound
+            audio_url = (cm.get("original_sound_info") or {}).get("progressive_download_url")
+        if not audio_url:
+            return None
+        a = s.get(audio_url, timeout=60)
+        if not a.ok or not a.content:
+            return None
+        path = os.path.join(outdir, "post_audio.m4a")
+        with open(path, "wb") as f:
+            f.write(a.content)
+        return {"path": path, "meta": meta}
+    except Exception as e:
+        log.warning("instagram post audio failed: %s", e)
+        return None
+
+
 def probe_duration(path: str) -> float:
     try:
         out = subprocess.run(
@@ -706,20 +769,75 @@ def clean_title(t: str) -> str:
     return re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", t or "").strip()
 
 
+def _shazam_lyrics_text(track: dict) -> str:
+    """Lyrics block inside a Shazam track (they come from Musixmatch, good for Persian too)."""
+    for sec in (track or {}).get("sections") or []:
+        if sec.get("type") == "LYRICS" and sec.get("text"):
+            return "\n".join(sec["text"])
+    return ""
+
+
+def _lyr_keys(artist: str, title: str) -> list:
+    """Cache keys that do not depend on how an engine spells the title / singers."""
+    tk = title_key(title)
+    return [f"tk:{tk}|{a}" for a in sorted(artist_set(artist, title))[:4]]
+
+
+def _store_lyrics(artist: str, title: str, text: str):
+    with db() as c:
+        for k in _lyr_keys(artist, title):
+            c.execute("INSERT OR REPLACE INTO lyrics VALUES(?,?)", (k, text))
+
+
+def shazam_lyrics(artist: str, title: str):
+    """Ask Shazam for the lyrics of a song it may not have heard in this audio."""
+    try:
+        from shazamio import Shazam
+    except Exception:
+        return None
+    tk = title_key(title)
+
+    async def go():
+        sh = Shazam()
+        res = await sh.search_track(query=f"{title} {first_artist(artist)}".strip(), limit=5)
+        for h in (((res or {}).get("tracks") or {}).get("hits") or []):
+            t = h.get("track") or {}
+            if title_key(t.get("title")) != tk or not t.get("key"):
+                continue
+            about = await sh.track_about(track_id=int(t["key"]))
+            about = (about or {}).get("track", about) or {}
+            lyr = _shazam_lyrics_text(about)
+            if lyr:
+                return lyr
+        return None
+
+    try:
+        return asyncio.run(go())
+    except Exception as e:
+        log.warning("shazam lyrics failed: %s", e)
+        return None
+
+
 def get_lyrics(artist: str, title: str):
     key = f"{artist}|{title}".lower()
     with db() as c:
         r = c.execute("SELECT text FROM lyrics WHERE key=?", (key,)).fetchone()
+        if not r:
+            for k in _lyr_keys(artist, title):
+                r = c.execute("SELECT text FROM lyrics WHERE key=?", (k,)).fetchone()
+                if r:
+                    break
     if r:
         return r[0]
     t = clean_title(title) or title
     a = first_artist(artist)  # "A & B" -> "A"
-    text = None
+    text = shazam_lyrics(artist, title)
     try:
         tries = []
-        if a:
-            tries.append({"track_name": t, "artist_name": a})
-        tries.append({"q": f"{a} {t}".strip()})
+        if not text:  # Shazam had no lyrics: try the weaker sources
+            if a:
+                tries.append({"track_name": t, "artist_name": a})
+            tries.append({"q": f"{a} {t}".strip()})
         for params in tries:
             r = requests.get("https://lrclib.net/api/search", params=params, timeout=10)
             if r.ok:
@@ -962,6 +1080,12 @@ def shazam_identify(path: str):
     t = (out or {}).get("track")
     if not t:
         return None
+    try:  # Shazam (Musixmatch) already sends the lyrics with the answer: keep them for the lyrics button
+        lyr = _shazam_lyrics_text(t)
+        if lyr:
+            _store_lyrics(t.get("subtitle", ""), t.get("title", ""), lyr)
+    except Exception as e:
+        log.warning("saving shazam lyrics failed: %s", e)
     return {"title": t.get("title", ""), "artist": t.get("subtitle", ""), "link": None}
 
 
@@ -1329,6 +1453,35 @@ async def upload_video(msg, path: str, caption: str, kb=None):
                                      supports_streaming=True, read_timeout=300, write_timeout=300)
 
 
+async def do_ig_post(msg, src: str, tmp: str, lang: str):
+    """Instagram photo / carousel post: no video to send, so we just identify its music."""
+    got = await asyncio.to_thread(ig_post_audio, src, tmp)
+    if not got:
+        return await msg.reply_text(tr(lang, "no_music"))
+    if not use_quota(msg.from_user.id):
+        return await msg.reply_text(tr(lang, "quota"))
+    sid = uuid.uuid4().hex[:10]
+    outs = await asyncio.to_thread(make_samples, got["path"], sid)
+    if not outs:
+        return await msg.reply_text(tr(lang, "no_music"))
+    add_sample(sid, outs[0], src)
+    song = await asyncio.to_thread(recognize, outs, (), got.get("meta"))
+    if not song:
+        return await msg.reply_text(tr(lang, "not_found"))
+    remember_alts(sid, song)
+    set_last(sid, song)
+    clip_set_song(src, song)
+    audio_task = asyncio.create_task(prepare_song_audio(song))
+    await msg.reply_text(result_caption(song, src), parse_mode="HTML",
+                         reply_markup=result_keyboard(sid, song, lang), **NO_PREVIEW)
+    try:
+        a = await audio_task
+        await deliver_audio(msg, a, song, lang)
+    except Exception as e:
+        log.exception("mp3 failed")
+        await msg.reply_text(tr(lang, "err", e=str(e)[:200]))
+
+
 async def identify_clip(uid: int, sid: str, meta, src: str, samples_task):
     """Returns (song or None, quota_blocked).
     YouTube's own music metadata (official tracks) is trusted. Anything else (Instagram's
@@ -1424,7 +1577,13 @@ async def do_clip(msg, url: str):
             clip_delete(src)
 
     with tempfile.TemporaryDirectory() as tmp:
-        path, title, meta = await asyncio.to_thread(download_clip, src, tmp)
+        try:
+            path, title, meta = await asyncio.to_thread(download_clip, src, tmp)
+        except Exception as e:
+            if "instagram.com" not in src:
+                raise
+            log.warning("instagram clip download failed (%s): trying it as a photo post", str(e)[:100])
+            return await do_ig_post(msg, src, tmp, lang)
         if not path:
             return await msg.reply_text(tr(lang, "clip_missing"))
         sid = uuid.uuid4().hex[:10]
