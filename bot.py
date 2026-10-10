@@ -31,6 +31,7 @@ ENGINE_ORDER = os.environ.get("ENGINES", "acr,audd,shazam").split(",")
 # last resort when the melody is not recognized: transcribe the singing and search the words
 LYRICS_ENGINE = os.environ.get("LYRICS_ENGINE", "1") == "1"
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")  # tiny = lighter, small = more accurate
+HUM_MIN_SCORE = int(os.environ.get("HUM_MIN_SCORE", "30"))  # ACRCloud melody (humming) matches below this are ignored
 MAX_SAMPLES = int(os.environ.get("MAX_SAMPLES", "5"))  # how many pieces of the audio may be tried
 DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "20"))
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
@@ -115,6 +116,7 @@ STR = {
         "btn_wrong": "آهنگ اشتباه",
         "btn_lyrics": "متن ترانه",
         "btn_more": "آهنگ‌های بیشتر",
+        "no_music": "⚠️ آهنگ این پست پیدا نشد.",
     },
     "en": {
         "welcome": (
@@ -146,6 +148,7 @@ STR = {
         "btn_wrong": "Wrong song",
         "btn_lyrics": "Lyrics",
         "btn_more": "More songs",
+        "no_music": "⚠️ Couldn't find this post's music.",
     },
     "tr": {
         "welcome": (
@@ -395,7 +398,18 @@ def acr_identify(path: str, acc):
         return None
     md = r.get("metadata") or {}
     music = md.get("music") or []
-    if not music:  # e.g. only a humming / custom-file match: not a song we can name
+    if not music:
+        # melody match (covers, piano / instrumental versions): needs the humming bucket in the ACRCloud project
+        hum = [h for h in (md.get("humming") or []) if h.get("title")]
+        if hum:
+            hum.sort(key=lambda x: x.get("score") or 0, reverse=True)
+            log.info("acr humming: %s", [(h.get("title"), h.get("score")) for h in hum[:3]])
+            h = hum[0]
+            score = h.get("score") or 0
+            if score >= HUM_MIN_SCORE:
+                artist = ", ".join(a["name"] for a in (h.get("artists") or []) if a.get("name"))
+                return {"title": h["title"], "artist": artist, "link": None, "yt": None,
+                        "wmul": min(0.9, 0.4 + score / 150)}
         log.info("acr: no music match (metadata keys: %s)", list(md.keys()))
         return None
     m = music[0]
@@ -561,6 +575,88 @@ def download_clip(url: str, outdir: str):
     return files[0], info.get("title") or "clip", meta
 
 
+IG_APP_ID = "936619743392459"
+IG_MOBILE_UA = ("Instagram 275.0.0.27.98 Android (33/13; 420dpi; 1080x2400; samsung; SM-S908B; "
+                "b0q; qcom; en_US; 458229237)")
+_IG_ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+_IG_CODE_RE = re.compile(r"instagram\.com/(?:[^/?#]+/)?(?:p|reel|reels|tv)/([\w-]+)")
+
+
+def ig_media_id(code: str) -> int:
+    n = 0
+    for ch in code[:11]:
+        n = n * 64 + _IG_ALPHA.index(ch)
+    return n
+
+
+def ig_post_audio(url: str, outdir: str, want_audio: bool = True):
+    """Photo / carousel posts have no video, so yt-dlp refuses them. Their music is still in the
+    post's data: ask Instagram for it (needs a logged-in instagram.com cookie in cookies.txt).
+    Returns {"path": audio file, "meta": {"title", "artist"} or None} or None."""
+    m = _IG_CODE_RE.search(url)
+    if not m or not os.path.exists(COOKIES):
+        return None
+    try:
+        import http.cookiejar
+        jar = http.cookiejar.MozillaCookieJar(COOKIES)
+        jar.load(ignore_discard=True, ignore_expires=True)
+        s = requests.Session()
+        s.cookies = jar
+        s.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "X-IG-App-ID": IG_APP_ID, "X-Requested-With": "XMLHttpRequest", "Referer": url})
+        if not any(c.name == "sessionid" and "instagram" in c.domain for c in jar):
+            log.warning("instagram: cookies.txt has no instagram.com sessionid cookie (login cookie needed)")
+            return None
+        csrf = next((c.value for c in jar if c.name == "csrftoken" and "instagram" in c.domain), "")
+        mid = ig_media_id(m.group(1))
+        tries = [
+            (f"https://www.instagram.com/api/v1/media/{mid}/info/", {"X-CSRFToken": csrf}),
+            (f"https://i.instagram.com/api/v1/media/{mid}/info/", {"User-Agent": IG_MOBILE_UA}),
+        ]
+        data = None
+        for u, hdr in tries:
+            r = s.get(u, headers=hdr, timeout=20)
+            try:
+                data = r.json()
+                break
+            except ValueError:  # an HTML login / challenge page instead of data
+                log.warning("instagram info is not JSON: HTTP %s %s | %s", r.status_code, r.url[:90],
+                            r.text[:80].replace("\n", " "))
+        items = (data or {}).get("items") or []
+        if not items:
+            log.warning("instagram info has no items: %s", str(data)[:120])
+            return None
+        it = items[0]
+        cm = it.get("clips_metadata") or {}
+        asset = (((it.get("music_metadata") or {}).get("music_info") or {}).get("music_asset_info")
+                 or (cm.get("music_info") or {}).get("music_asset_info") or {})
+        audio_url = asset.get("progressive_download_url") or asset.get("fast_start_progressive_download_url")
+        meta = None
+        if not asset:
+            log.info("instagram: this post has no music-library track (original sound or no music)")
+        if asset.get("title") and asset.get("display_artist"):
+            meta = {"title": asset["title"], "artist": asset["display_artist"], "link": None,
+                    "engine": "meta#0", "w": 0.8}  # Instagram's music library name: fairly reliable
+        if not want_audio:  # only the music name was needed
+            return {"path": None, "meta": meta}
+        if not audio_url:  # uploader's own sound
+            audio_url = (cm.get("original_sound_info") or {}).get("progressive_download_url")
+        if not audio_url:
+            return None
+        a = s.get(audio_url, timeout=60)
+        if not a.ok or not a.content:
+            return None
+        path = os.path.join(outdir, "post_audio.m4a")
+        with open(path, "wb") as f:
+            f.write(a.content)
+        return {"path": path, "meta": meta}
+    except Exception as e:
+        log.warning("instagram post audio failed: %s", e)
+        return None
+
+
 def probe_duration(path: str) -> float:
     try:
         out = subprocess.run(
@@ -572,10 +668,12 @@ def probe_duration(path: str) -> float:
         return 0.0
 
 
-def cut_sample(src: str, out: str, start: float, dur: int) -> bool:
+def cut_sample(src: str, out: str, start: float, dur: int, raw: bool = False) -> bool:
+    """raw=True: no filters at all (the filters sometimes hurt the fingerprint of quiet / piano music)."""
     base = ["ffmpeg", "-y", "-ss", str(max(0, start)), "-i", src, "-t", str(dur),
             "-vn", "-ac", "1", "-ar", "44100"]
-    for af in (["-af", "highpass=f=80,dynaudnorm=f=200:g=15"], []):
+    filters = [[]] if raw else [["-af", "highpass=f=80,dynaudnorm=f=200:g=15"], []]
+    for af in filters:
         try:
             subprocess.run(base + af + ["-b:a", "128k", out],
                            check=True, capture_output=True, timeout=120)
@@ -625,13 +723,15 @@ def make_samples(src: str, sid: str) -> list:
             o = round(max(0, min(o, d - win)))
             if all(abs(o - x) >= 5 for x in offs):  # no near-duplicate pieces
                 offs.append(o)
-        offs = offs[:MAX_SAMPLES]
+        offs = offs[:max(1, MAX_SAMPLES - 1)]  # one slot is kept for the unfiltered piece
     else:
         offs = [0]
-    jobs = [(os.path.join(SAMPLES_DIR, f"{sid}_{i}.mp3"), o) for i, o in enumerate(offs)]
+    jobs = [(os.path.join(SAMPLES_DIR, f"{sid}_{i}.mp3"), o, False) for i, o in enumerate(offs)]
+    # last piece: 20 s of the best part with NO filters (only used if the filtered ones fail)
+    jobs.append((os.path.join(SAMPLES_DIR, f"{sid}_r.mp3"), offs[0], True))
     # cut all samples at the same time instead of one by one
     with ThreadPoolExecutor(max_workers=3) as ex:
-        res = list(ex.map(lambda j: j[0] if cut_sample(src, j[0], j[1], win) else None, jobs))
+        res = list(ex.map(lambda j: j[0] if cut_sample(src, j[0], j[1], 20 if j[2] else win, j[2]) else None, jobs))
     return [r for r in res if r]
 
 
@@ -706,20 +806,75 @@ def clean_title(t: str) -> str:
     return re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", t or "").strip()
 
 
+def _shazam_lyrics_text(track: dict) -> str:
+    """Lyrics block inside a Shazam track (they come from Musixmatch, good for Persian too)."""
+    for sec in (track or {}).get("sections") or []:
+        if sec.get("type") == "LYRICS" and sec.get("text"):
+            return "\n".join(sec["text"])
+    return ""
+
+
+def _lyr_keys(artist: str, title: str) -> list:
+    """Cache keys that do not depend on how an engine spells the title / singers."""
+    tk = title_key(title)
+    return [f"tk:{tk}|{a}" for a in sorted(artist_set(artist, title))[:4]]
+
+
+def _store_lyrics(artist: str, title: str, text: str):
+    with db() as c:
+        for k in _lyr_keys(artist, title):
+            c.execute("INSERT OR REPLACE INTO lyrics VALUES(?,?)", (k, text))
+
+
+def shazam_lyrics(artist: str, title: str):
+    """Ask Shazam for the lyrics of a song it may not have heard in this audio."""
+    try:
+        from shazamio import Shazam
+    except Exception:
+        return None
+    tk = title_key(title)
+
+    async def go():
+        sh = Shazam()
+        res = await sh.search_track(query=f"{title} {first_artist(artist)}".strip(), limit=5)
+        for h in (((res or {}).get("tracks") or {}).get("hits") or []):
+            t = h.get("track") or {}
+            if title_key(t.get("title")) != tk or not t.get("key"):
+                continue
+            about = await sh.track_about(track_id=int(t["key"]))
+            about = (about or {}).get("track", about) or {}
+            lyr = _shazam_lyrics_text(about)
+            if lyr:
+                return lyr
+        return None
+
+    try:
+        return asyncio.run(go())
+    except Exception as e:
+        log.warning("shazam lyrics failed: %s", e)
+        return None
+
+
 def get_lyrics(artist: str, title: str):
     key = f"{artist}|{title}".lower()
     with db() as c:
         r = c.execute("SELECT text FROM lyrics WHERE key=?", (key,)).fetchone()
+        if not r:
+            for k in _lyr_keys(artist, title):
+                r = c.execute("SELECT text FROM lyrics WHERE key=?", (k,)).fetchone()
+                if r:
+                    break
     if r:
         return r[0]
     t = clean_title(title) or title
     a = first_artist(artist)  # "A & B" -> "A"
-    text = None
+    text = shazam_lyrics(artist, title)
     try:
         tries = []
-        if a:
-            tries.append({"track_name": t, "artist_name": a})
-        tries.append({"q": f"{a} {t}".strip()})
+        if not text:  # Shazam had no lyrics: try the weaker sources
+            if a:
+                tries.append({"track_name": t, "artist_name": a})
+            tries.append({"q": f"{a} {t}".strip()})
         for params in tries:
             r = requests.get("https://lrclib.net/api/search", params=params, timeout=10)
             if r.ok:
@@ -962,6 +1117,12 @@ def shazam_identify(path: str):
     t = (out or {}).get("track")
     if not t:
         return None
+    try:  # Shazam (Musixmatch) already sends the lyrics with the answer: keep them for the lyrics button
+        lyr = _shazam_lyrics_text(t)
+        if lyr:
+            _store_lyrics(t.get("subtitle", ""), t.get("title", ""), lyr)
+    except Exception as e:
+        log.warning("saving shazam lyrics failed: %s", e)
     return {"title": t.get("title", ""), "artist": t.get("subtitle", ""), "link": None}
 
 
@@ -1145,7 +1306,8 @@ def recognize(paths, skip=(), extra=None):
     order = {n: i for i, (n, _a) in enumerate(jobs)}
     hits = []
     if extra and extra.get("title") and "meta#0" not in skip and title_key(extra["title"]) not in rejected:
-        hits.append({"song": dict(extra, engine="meta#0"), "engine": "meta#0", "sample": 98, "w": META_W})
+        hits.append({"song": dict(extra, engine="meta#0"), "engine": "meta#0", "sample": 98,
+                     "w": extra.get("w", META_W)})
 
     def run_batch(batch):
         tasks = [(name, accs, idx, p) for idx, p in batch for name, accs in jobs]
@@ -1161,7 +1323,7 @@ def recognize(paths, skip=(), extra=None):
                     continue
                 if not res or title_key(res.get("title")) in rejected:
                     continue
-                w = ENGINE_W.get(name, 0.8) - 0.01 * order.get(name, 0)
+                w = (ENGINE_W.get(name, 0.8) - 0.01 * order.get(name, 0)) * res.get("wmul", 1.0)
                 hits.append({"song": res, "engine": res["engine"], "sample": idx, "w": w})
 
     pieces = list(enumerate(paths[:MAX_SAMPLES]))
@@ -1329,6 +1491,35 @@ async def upload_video(msg, path: str, caption: str, kb=None):
                                      supports_streaming=True, read_timeout=300, write_timeout=300)
 
 
+async def do_ig_post(msg, src: str, tmp: str, lang: str):
+    """Instagram photo / carousel post: no video to send, so we just identify its music."""
+    got = await asyncio.to_thread(ig_post_audio, src, tmp)
+    if not got:
+        return await msg.reply_text(tr(lang, "no_music"))
+    if not use_quota(msg.from_user.id):
+        return await msg.reply_text(tr(lang, "quota"))
+    sid = uuid.uuid4().hex[:10]
+    outs = await asyncio.to_thread(make_samples, got["path"], sid)
+    if not outs:
+        return await msg.reply_text(tr(lang, "no_music"))
+    add_sample(sid, outs[0], src)
+    song = await asyncio.to_thread(recognize, outs, (), got.get("meta"))
+    if not song:
+        return await msg.reply_text(tr(lang, "not_found"))
+    remember_alts(sid, song)
+    set_last(sid, song)
+    clip_set_song(src, song)
+    audio_task = asyncio.create_task(prepare_song_audio(song))
+    await msg.reply_text(result_caption(song, src), parse_mode="HTML",
+                         reply_markup=result_keyboard(sid, song, lang), **NO_PREVIEW)
+    try:
+        a = await audio_task
+        await deliver_audio(msg, a, song, lang)
+    except Exception as e:
+        log.exception("mp3 failed")
+        await msg.reply_text(tr(lang, "err", e=str(e)[:200]))
+
+
 async def identify_clip(uid: int, sid: str, meta, src: str, samples_task):
     """Returns (song or None, quota_blocked).
     YouTube's own music metadata (official tracks) is trusted. Anything else (Instagram's
@@ -1338,7 +1529,8 @@ async def identify_clip(uid: int, sid: str, meta, src: str, samples_task):
         meta_song = None
         if meta:
             meta_song = {"title": meta["title"], "artist": meta["artist"],
-                         "link": src if "youtu" in src else None, "engine": "meta#0"}
+                         "link": src if "youtu" in src else None, "engine": "meta#0",
+                         "w": meta.get("w", META_W)}
             if "youtu" in src:
                 meta["link"] = src
                 with open(os.path.join(SAMPLES_DIR, sid + ".json"), "w", encoding="utf-8") as f:
@@ -1424,9 +1616,21 @@ async def do_clip(msg, url: str):
             clip_delete(src)
 
     with tempfile.TemporaryDirectory() as tmp:
-        path, title, meta = await asyncio.to_thread(download_clip, src, tmp)
+        try:
+            path, title, meta = await asyncio.to_thread(download_clip, src, tmp)
+        except Exception as e:
+            if "instagram.com" not in src:
+                raise
+            log.warning("instagram clip download failed (%s): trying it as a photo post", str(e)[:100])
+            return await do_ig_post(msg, src, tmp, lang)
         if not path:
             return await msg.reply_text(tr(lang, "clip_missing"))
+        if not meta and "instagram.com" in src:  # yt-dlp often misses the music name: ask Instagram itself
+            try:
+                got = await asyncio.to_thread(ig_post_audio, src, tmp, False)
+                meta = (got or {}).get("meta")
+            except Exception:
+                log.exception("instagram music name failed")
         sid = uuid.uuid4().hex[:10]
         add_sample(sid, "", src)
 
