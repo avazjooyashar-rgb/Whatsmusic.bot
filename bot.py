@@ -330,7 +330,9 @@ _FEAT_RE = re.compile(r"[\(\[]\s*(?:feat\.?|ft\.?|featuring)\s+([^\)\]]+)", re.I
 # answer like this is usually a wrong / vague match). They lose against a normal answer.
 _BAD_TITLE_RE = re.compile(
     r"mash\s?-?up|remix|medley|megamix|nightcore|slowed|sped\s?up|speed\s?up|reverb|"
-    r"\bcover\b|\blive\b|ریمیکس|ریمیک|مشاپ|مدلی|بازخوانی|کاور", re.I)
+    r"karaoke|8d\s?audio|bass\s?boosted|ringtone|"
+    r"\bcover\b|[\(\[\-–]\s*live\b|\blive\s+(?:at|from|in|on|session|version)\b|"
+    r"ریمیکس|ریمیک|مشاپ|مدلی|بازخوانی|کاور", re.I)
 
 
 def title_penalty(song: dict) -> float:
@@ -520,7 +522,7 @@ def download_audio(target: str, outdir: str, fallback=None):
     """Download audio as-is (m4a) without re-encoding. Only converts odd formats to mp3."""
     if not URL_RE.match(target) and not target.startswith(("ytsearch", "scsearch")):
         target = f"ytsearch1:{target}"
-    plain = {**ydl_base(), "format": "bestaudio[ext=m4a]/bestaudio/best",
+    plain = {**ydl_base(), "format": "bestaudio[ext=m4a][abr<=130]/bestaudio[ext=m4a]/bestaudio/best",
              "outtmpl": f"{outdir}/%(id)s.%(ext)s"}
     fast = dict(plain)
     if ARIA2:
@@ -886,6 +888,30 @@ def shazam_lyrics(artist: str, title: str):
         return None
 
 
+def _lrclib_lyrics(artist: str, title: str):
+    """lrclib: one fast request. A result is accepted ONLY if its title/artist match the song."""
+    t = clean_title(title) or title
+    a = first_artist(artist)
+    want = {"title": title, "artist": artist}
+    tries = []
+    if a:
+        tries.append({"track_name": t, "artist_name": a})
+    tries.append({"q": f"{a} {t}".strip()})
+    for params in tries:
+        try:
+            r = requests.get("https://lrclib.net/api/search", params=params, timeout=10)
+        except Exception as e:
+            log.warning("lrclib failed: %s", e)
+            continue
+        if not r.ok:
+            continue
+        for it in r.json():
+            got = {"title": it.get("trackName") or "", "artist": it.get("artistName") or ""}
+            if it.get("plainLyrics") and same_song(got, want):
+                return it["plainLyrics"]
+    return None
+
+
 def get_lyrics(artist: str, title: str):
     key = f"{artist}|{title}".lower()
     with db() as c:
@@ -897,33 +923,18 @@ def get_lyrics(artist: str, title: str):
                     break
     if r:
         return r[0]
-    t = clean_title(title) or title
-    a = first_artist(artist)  # "A & B" -> "A"
-    text = shazam_lyrics(artist, title)
-    try:
-        tries = []
-        if not text:  # Shazam had no lyrics: try the weaker sources
-            if a:
-                tries.append({"track_name": t, "artist_name": a})
-            tries.append({"q": f"{a} {t}".strip()})
-        for params in tries:
-            r = requests.get("https://lrclib.net/api/search", params=params, timeout=10)
-            if r.ok:
-                for it in r.json():
-                    if it.get("plainLyrics"):
-                        text = it["plainLyrics"]
-                        break
-            if text:
-                break
-    except Exception as e:
-        log.warning("lrclib failed: %s", e)
-    if not text and a:
-        try:
-            r = requests.get(f"https://api.lyrics.ovh/v1/{quote(a, safe='')}/{quote(t, safe='')}", timeout=10)
-            if r.ok:
-                text = r.json().get("lyrics")
-        except Exception as e:
-            log.warning("lyrics.ovh failed: %s", e)
+    text = _lrclib_lyrics(artist, title) or shazam_lyrics(artist, title)
+    if not text:
+        a = first_artist(artist)
+        t = clean_title(title) or title
+        if a:
+            try:
+                r = requests.get(
+                    f"https://api.lyrics.ovh/v1/{quote(a, safe='')}/{quote(t, safe='')}", timeout=10)
+                if r.ok:
+                    text = r.json().get("lyrics")
+            except Exception as e:
+                log.warning("lyrics.ovh failed: %s", e)
     if text:
         with db() as c:
             c.execute("INSERT OR REPLACE INTO lyrics VALUES(?,?)", (key, text))
@@ -1047,6 +1058,32 @@ def clip_set_song(url, song):
 def clip_delete(url):
     with db() as c:
         c.execute("DELETE FROM clips WHERE url=?", (url,))
+
+
+# same voice / audio file -> same answer (keyed by Telegram's file_unique_id)
+def _media_table(c):
+    c.execute("CREATE TABLE IF NOT EXISTS media_songs(uid TEXT PRIMARY KEY, song TEXT, sid TEXT)")
+
+
+def media_cache_get(uid: str):
+    with db() as c:
+        _media_table(c)
+        r = c.execute("SELECT song FROM media_songs WHERE uid=?", (uid,)).fetchone()
+    return json.loads(r[0]) if r else None
+
+
+def media_cache_put(uid: str, song: dict, sid: str):
+    data = json.dumps({k: song.get(k) for k in ("title", "artist", "link", "yt")}, ensure_ascii=False)
+    with db() as c:
+        _media_table(c)
+        c.execute("INSERT OR REPLACE INTO media_songs VALUES(?,?,?)", (uid, data, sid))
+
+
+def media_cache_drop(sid: str):
+    """'Wrong song' pressed: forget the cached answer for that file."""
+    with db() as c:
+        _media_table(c)
+        c.execute("DELETE FROM media_songs WHERE sid=?", (sid,))
 
 
 # tracks (short id for callback buttons)
@@ -1183,31 +1220,34 @@ def _active_engines(skip) -> list:
 
 
 def call_engine(name: str, accs, path: str):
-    """Ask ONE engine about ONE piece of audio. Returns a song dict or None."""
+    """Ask ONE engine about ONE piece of audio. Every call is retried once on a network error."""
     if name == "shazam":
-        try:
-            res = shazam_identify(path)
-        except Exception as e:
-            log.warning("shazam failed: %s", e)
-            return None
-        if res and res.get("title"):
-            res["engine"] = "shazam#0"
-            return res
+        for attempt in (1, 2):
+            try:
+                res = shazam_identify(path)
+                if res and res.get("title"):
+                    res["engine"] = "shazam#0"
+                    return res
+                return None
+            except Exception as e:
+                log.warning("shazam failed (try %s): %s", attempt, e)
         return None
     for r in accs:
         tag = f'{name}#{r["id"]}'
-        try:
-            res = ENGINE_FN[name](path, r)
-            with db() as c:
-                c.execute("UPDATE accounts SET uses=uses+1 WHERE id=?", (r["id"],))
-            if res and res.get("title"):
-                res["engine"] = tag
-                return res
-            return None  # answered "no match": don't burn the other accounts on the same audio
-        except Exception as e:
-            log.warning("account %s failed: %s", r["id"], e)
-            with db() as c:
-                c.execute("UPDATE accounts SET errors=errors+1 WHERE id=?", (r["id"],))
+        for attempt in (1, 2):
+            try:
+                res = ENGINE_FN[name](path, r)
+                with db() as c:
+                    c.execute("UPDATE accounts SET uses=uses+1 WHERE id=?", (r["id"],))
+                if res and res.get("title"):
+                    res["engine"] = tag
+                    return res
+                return None  # real "no match": don't burn the other accounts on the same audio
+            except Exception as e:
+                log.warning("account %s failed (try %s): %s", r["id"], attempt, e)
+                if attempt == 2:
+                    with db() as c:
+                        c.execute("UPDATE accounts SET errors=errors+1 WHERE id=?", (r["id"],))
     return None
 
 
@@ -1256,7 +1296,8 @@ _WHISPER_LOCK = threading.Lock()  # one transcription at a time keeps RAM/CPU un
 
 def transcribe(path: str) -> str:
     """Speech-to-text of the SINGING with faster-whisper (optional: returns '' if not installed).
-    No VAD filter: it throws away vocals that are mixed with music."""
+    No VAD filter (it throws away vocals mixed with music). Segments that whisper itself doesn't
+    believe are speech are dropped: over piano / instrumentals it invents words."""
     try:
         from faster_whisper import WhisperModel
     except Exception:
@@ -1265,24 +1306,27 @@ def transcribe(path: str) -> str:
         if _WHISPER["model"] is None:
             _WHISPER["model"] = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
         segs, _info = _WHISPER["model"].transcribe(
-            path, vad_filter=False, beam_size=5, temperature=0.0,
+            path, vad_filter=False, beam_size=3, temperature=0.0,
             condition_on_previous_text=False, no_speech_threshold=0.4,
             compression_ratio_threshold=2.2)
         out, last = [], None
         for sg in segs:
             t = sg.text.strip()
-            if t and t != last:  # drop looping hallucinations
+            if not t or sg.no_speech_prob > 0.6 or sg.avg_logprob < -1.0:
+                continue  # hallucination over music, not singing
+            if t != last:  # drop looping hallucinations
                 out.append(t)
             last = t
         return " ".join(out).strip()
 
 
 def lyric_overlap(words, lyrics: str) -> float:
-    """How many of the transcribed words really appear in the candidate song's lyrics."""
-    ws = {w for w in words if len(w) > 2}
+    """How many of the transcribed words really appear in the candidate song's lyrics.
+    Both sides are normalized (Arabic ي/ك vs Persian ی/ک, accents...)."""
+    ws = {_fold(w) for w in words if len(w) > 2}
     if not ws:
         return 0.0
-    lw = set(re.findall(r"\w+", (lyrics or "").lower()))
+    lw = set(re.findall(r"\w+", _fold(lyrics)))
     return len(ws & lw) / len(ws)
 
 
@@ -1318,35 +1362,47 @@ def _parse_yt_title(title: str, channel: str):
 
 
 def yt_lyrics_search(words):
-    """Search the heard words on YouTube, then CHECK each candidate's real lyrics against them."""
-    q = " ".join(words[:14]) + " lyrics"
-    try:
-        items = yt_search(q, 6)
-    except Exception as e:
-        log.warning("yt lyrics search failed: %s", e)
-        return None
-    for it in items[:5]:
-        a, t = _parse_yt_title(it.get("title"), it.get("channel") or it.get("uploader") or "")
-        for artist, name in ((a, t), (t, a)):  # titles come as "Artist - Song" or "Song - Artist"
-            if not artist or not name:
+    """Search the heard words on YouTube (two different slices of the words), then CHECK each
+    candidate's real lyrics against them."""
+    slices = [words[:12]]
+    if len(words) >= 20:
+        slices.append(words[10:22])
+    seen = set()
+    for sl in slices:
+        try:
+            items = yt_search(" ".join(sl) + " lyrics", 6)
+        except Exception as e:
+            log.warning("yt lyrics search failed: %s", e)
+            continue
+        for it in items[:5]:
+            if it.get("id") in seen:
                 continue
-            try:
-                ly = get_lyrics(artist, name)
-            except Exception:
-                ly = None
-            if ly and lyric_overlap(words, ly) >= 0.35:
-                return {"title": name, "artist": artist, "link": None}
-            if ly:
-                break  # lyrics found but they don't match: don't try the swapped order
+            seen.add(it.get("id"))
+            a, t = _parse_yt_title(it.get("title"), it.get("channel") or it.get("uploader") or "")
+            for artist, name in ((a, t), (t, a)):  # titles come as "Artist - Song" or "Song - Artist"
+                if not artist or not name:
+                    continue
+                try:
+                    ly = get_lyrics(artist, name)
+                except Exception:
+                    ly = None
+                if ly and lyric_overlap(words, ly) >= 0.35:
+                    return {"title": name, "artist": artist, "link": None}
+                if ly:
+                    break  # lyrics found but they don't match: don't try the swapped order
     return None
 
 
 def lyrics_identify(paths):
-    texts = []
+    texts, empty = [], 0
     for p in paths[:3]:  # several pieces -> more words -> a much better match
         t = transcribe(p)
         if t:
             texts.append(t)
+        else:
+            empty += 1
+            if empty >= 2 and not texts:
+                return None  # no singing in the first two pieces: instrumental / piano, skip the slow part
     if not texts:
         return None
     words = re.findall(r"\w+", " ".join(texts).lower())
@@ -1368,6 +1424,21 @@ def lyrics_identify(paths):
                 c.execute("UPDATE accounts SET errors=errors+1 WHERE id=?", (acc["id"],))
     best = max(texts, key=len)  # the longest transcript makes the best search query
     return yt_lyrics_search(re.findall(r"\w+", best.lower()) or words)
+
+
+def find_song_by_words(words):
+    """Typed lyrics -> song. YouTube search verified against real lyrics (free), then AudD."""
+    res = yt_lyrics_search(words)
+    if res:
+        return res
+    with db() as c:
+        accs = c.execute("SELECT * FROM accounts WHERE enabled=1 AND type='audd' ORDER BY id").fetchall()
+    for acc in accs[:1]:
+        try:
+            return audd_find_lyrics(words, acc)
+        except Exception as e:
+            log.warning("audd findLyrics failed: %s", e)
+    return None
 
 
 def recognize(paths, skip=(), extra=None):
@@ -1788,25 +1859,32 @@ async def show_prepared(q, sid: str, entry: dict, lang: str):
 
 # ---------- Voice / audio from user ----------
 async def handle_media(msg, media, lang: str):
-    if not use_quota(msg.from_user.id):
-        return await msg.reply_text(tr(lang, "quota"))
-    cleanup_samples()
+    fid = media.file_unique_id
     sid = uuid.uuid4().hex[:10]
-    raw = os.path.join(SAMPLES_DIR, sid + ".raw")
-    await (await media.get_file()).download_to_drive(raw)
-    outs = await asyncio.to_thread(make_samples, raw, sid)
-    if outs:
-        os.remove(raw)
+    song = media_cache_get(fid)  # same file sent before -> same answer, no quota used
+    if song:
+        add_sample(sid, "")
+        set_last(sid, {**song, "engine": "cache#0"})
     else:
-        fallback = os.path.join(SAMPLES_DIR, f"{sid}_0.ogg")
-        os.replace(raw, fallback)
-        outs = [fallback]
-    add_sample(sid, outs[0])
-    song = await asyncio.to_thread(recognize, outs)
-    if not song:
-        return await msg.reply_text(tr(lang, "not_found"))
-    remember_alts(sid, song)
-    set_last(sid, song)
+        if not use_quota(msg.from_user.id):
+            return await msg.reply_text(tr(lang, "quota"))
+        cleanup_samples()
+        raw = os.path.join(SAMPLES_DIR, sid + ".raw")
+        await (await media.get_file()).download_to_drive(raw)
+        outs = await asyncio.to_thread(make_samples, raw, sid)
+        if outs:
+            os.remove(raw)
+        else:
+            fallback = os.path.join(SAMPLES_DIR, f"{sid}_0.ogg")
+            os.replace(raw, fallback)
+            outs = [fallback]
+        add_sample(sid, outs[0])
+        song = await asyncio.to_thread(recognize, outs)
+        if not song:
+            return await msg.reply_text(tr(lang, "not_found"))
+        remember_alts(sid, song)
+        set_last(sid, song)
+    media_cache_put(fid, song, sid)
     audio_task = asyncio.create_task(prepare_song_audio(song))
     await msg.reply_text(result_caption(song), parse_mode="HTML",
                          reply_markup=result_keyboard(sid, song, lang), **NO_PREVIEW)
@@ -1816,6 +1894,24 @@ async def handle_media(msg, media, lang: str):
     except Exception as e:
         log.exception("mp3 failed")
         await msg.reply_text(tr(lang, "err", e=str(e)[:200]))
+
+
+async def try_lyrics_search(msg, text: str, lang: str) -> bool:
+    """Typed lyrics (5+ words) -> find the song, send it with its mp3. False = nothing found."""
+    words = re.findall(r"\w+", _fold(text))
+    song = await asyncio.to_thread(find_song_by_words, words)
+    if not song:
+        return False
+    audio_task = asyncio.create_task(prepare_song_audio(song))
+    kb = Markup(result_keyboard("x", song, lang).inline_keyboard[:-1])  # no "wrong song": no audio sample
+    await msg.reply_text(result_caption(song), parse_mode="HTML", reply_markup=kb, **NO_PREVIEW)
+    try:
+        a = await audio_task
+        await deliver_audio(msg, a, song, lang)
+    except Exception as e:
+        log.exception("mp3 failed")
+        await msg.reply_text(tr(lang, "err", e=str(e)[:200]))
+    return True
 
 
 async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1843,7 +1939,9 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             elif URL_RE.search(text):  # other links (Spotify, ...)
                 target, _ = await asyncio.to_thread(resolve, text)
                 await send_mp3(msg, target, lang=lang)
-            else:  # artist or song name -> list of tracks to choose from
+            else:  # lyrics (5+ words) -> the song; otherwise artist or song name -> list of tracks
+                if len(re.findall(r"\w+", text)) >= 5 and await try_lyrics_search(msg, text, lang):
+                    return
                 await send_results(msg, text, lang)
     except Exception as e:
         log.exception("handle failed")
@@ -1863,6 +1961,7 @@ async def on_rec(q, data: str):
         # no prepared result (bot restarted / expired): recognize now, below
     else:
         drop_entry(sid)  # "wrong song": the prepared result is wrong, throw it away
+        media_cache_drop(sid)  # ...and a cached answer for that voice/audio file too
 
     with db() as c:
         row = c.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
