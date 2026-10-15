@@ -2433,7 +2433,9 @@ def main():
     app.add_error_handler(on_error)
     # Admin features live in ./admin and are optional: if that folder is missing or broken,
     # the bot still starts an
-          register_admin(app, sys.modules[__name__])
+   try:
+        from admin import register as register_admin
+        register_admin(app, sys.modules[__name__])
     except Exception:
         log.exception("admin module not loaded - the bot continues without it")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
@@ -2441,3 +2443,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+  
