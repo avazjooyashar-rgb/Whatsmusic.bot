@@ -1,24 +1,13 @@
 """
-Music recognition Telegram bot  -  v3 (faster, safer, cleaner, duration-aware)
+Music recognition Telegram bot  -  v3 (all fixes merged)
 
-What changed compared to v2
-  CLIPS     sampling now adapts to the media length (short / medium / long): short clips are used
-            as a whole, longer ones are sampled at several spread-out places; the loudness scan of
-            very long media is centred on the middle. Tiny / empty sample files are rejected.
-  DOWNLOAD  clips that are too big for Telegram are retried at lower quality (480 -> 360 -> 240p);
-            clips that are too long or still too big are no longer skipped: only their audio is
-            downloaded (5 minutes from the middle for very long media) and the music is identified.
-  FIXES     the truncated end of main() (syntax error) is repaired.
-
-What changed in v2 (kept)
-  SPEED     engines run on a shared thread pool and the vote stops the moment two of them agree
-            (no more waiting for the slowest engine); Shazam keeps ONE event loop + client alive;
-            HTTP keep-alive session; numpy loudness scan; TTL cache for YouTube searches.
-  SAFETY    exact host matching (evil.com/?youtube.com no longer passes), download targets are
-            whitelisted (no SSRF through yt-dlp), atomic daily quota, per-user rate limit,
-            download concurrency cap.
-  RESOURCES SQLite connections are really closed (WAL mode), periodic background cleanup instead of
-            cleanup-on-message, Whisper waits with a timeout instead of piling up a queue.
+  * clips of ANY length: short ones are used whole, long ones are sampled over the whole file,
+    too long / too big for Telegram -> audio-only identification
+  * quota is refunded when nothing is recognized or something crashes
+  * DB calls on the hot paths run in threads (no event-loop blocking)
+  * audio download folders cannot leak (own folder + periodic cleanup)
+  * speed: shared thread pool, vote stops when two engines agree, one Shazam client
+  * safety: exact host matching, download whitelist, atomic quota, rate limit
 """
 import json, asyncio, sqlite3, datetime, os, re, tempfile, glob, time, hmac, hashlib, base64, uuid
 import subprocess, logging, html, shutil, sys, threading, array, unicodedata
@@ -55,6 +44,8 @@ log = logging.getLogger("bot")
 # Config
 # ======================================================================================
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+if "BOT_USERNAME" not in os.environ:
+    log.warning("BOT_USERNAME is not set in the environment, using the built-in default")
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "Whatsmuziccbot").lstrip("@")
 ACR_HOST = os.environ.get("ACR_HOST")
 ACR_KEY = os.environ.get("ACR_KEY")
@@ -66,21 +57,23 @@ LYRICS_ENGINE = os.environ.get("LYRICS_ENGINE", "1") == "1"  # last resort: tran
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")  # tiny = lighter, base = fast, small = accurate
 WHISPER_WAIT = int(os.environ.get("WHISPER_WAIT", "25"))  # seconds a request may wait for the Whisper lock
 HUM_MIN_SCORE = int(os.environ.get("HUM_MIN_SCORE", "30"))  # ACRCloud humming matches below this (0-100) are ignored
-MAX_SAMPLES = int(os.environ.get("MAX_SAMPLES", "5"))
+MAX_SAMPLES = max(int(os.environ.get("MAX_SAMPLES", "7")), 7)  # recognize() listens to at most 7 pieces
 DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "20"))
 RATE_LIMIT = int(os.environ.get("RATE_LIMIT", "10"))  # messages per user per minute (0 = off)
 DL_CONCURRENCY = int(os.environ.get("DL_CONCURRENCY", "4"))  # parallel yt-dlp downloads
 ENGINE_THREADS = int(os.environ.get("ENGINE_THREADS", "12"))
 ENGINE_TIMEOUT = int(os.environ.get("ENGINE_TIMEOUT", "45"))  # max wait for one batch of engine answers
-CLIP_MAX_SECONDS = int(os.environ.get("CLIP_MAX_SECONDS", "900"))  # longer videos: audio-only recognition
+CLIP_MAX_SEC = int(os.environ.get("CLIP_MAX_SEC", "900"))  # longer videos are not sent, only identified
+MAX_SRC_SEC = int(os.environ.get("MAX_SRC_SEC", str(3 * 3600)))  # longest source we are willing to scan
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
 SAMPLES_DIR = os.environ.get("SAMPLES_DIR", "samples")
+DL_DIR = os.path.join(SAMPLES_DIR, "dl")  # temp folders of audio downloads (cleaned periodically)
 COOKIES = os.environ.get("COOKIES_FILE", "cookies.txt")
 MAX_BYTES = 49 * 1024 * 1024
-CLIP_TIERS = (480, 360, 240)  # quality steps until the clip fits into Telegram's limit
 ARIA2 = bool(shutil.which("aria2c")) and os.environ.get("ARIA2", "1") == "1"
 os.makedirs(SAMPLES_DIR, exist_ok=True)
+os.makedirs(DL_DIR, exist_ok=True)
 
 URL_RE = re.compile(r"https?://\S+")
 # hosts are matched EXACTLY (host == d or host endswith .d), never by substring
@@ -241,6 +234,8 @@ STR = {
         "btn_wrong": "Yanlış şarkı",
         "btn_lyrics": "Şarkı sözü",
         "btn_more": "Daha fazla şarkı",
+        "no_music": "⚠️ Bu gönderinin müziği bulunamadı.",
+        "slow": "⏳ Biraz yavaş, birkaç saniye bekle.",
     },
     "ar": {
         "welcome": (
@@ -272,6 +267,8 @@ STR = {
         "btn_wrong": "أغنية خاطئة",
         "btn_lyrics": "كلمات الأغنية",
         "btn_more": "المزيد من الأغاني",
+        "no_music": "⚠️ لم يتم العثور على موسيقى هذا المنشور.",
+        "slow": "⏳ على مهل قليلاً، انتظر بضع ثوانٍ.",
     },
     "ru": {
         "welcome": (
@@ -303,6 +300,8 @@ STR = {
         "btn_wrong": "Не та песня",
         "btn_lyrics": "Текст песни",
         "btn_more": "Ещё песни",
+        "no_music": "⚠️ Не удалось найти музыку этого поста.",
+        "slow": "⏳ Помедленнее, подожди несколько секунд.",
     },
 }
 
@@ -618,10 +617,6 @@ def clip_delete(url):
 
 
 # same voice / audio file -> same answer (keyed by Telegram's file_unique_id)
-def _media_table(c):  # kept for compatibility: the table is created once in db()
-    return None
-
-
 def media_cache_get(uid: str):
     with db() as c:
         r = c.execute("SELECT song FROM media_songs WHERE uid=?", (uid,)).fetchone()
@@ -659,6 +654,15 @@ def use_quota(uid: int) -> bool:
         c.execute("INSERT OR IGNORE INTO usage VALUES(?,?,0)", (uid, day))
         cur = c.execute("UPDATE usage SET n=n+1 WHERE uid=? AND day=? AND n<?", (uid, day, limit))
         return cur.rowcount > 0
+
+
+def refund_quota(uid: int):
+    """Give back one recognition when it produced nothing (bad audio, crash...)."""
+    if uid in ADMIN_IDS or daily_limit() <= 0:
+        return
+    day = datetime.date.today().isoformat()
+    with db() as c:
+        c.execute("UPDATE usage SET n=n-1 WHERE uid=? AND day=? AND n>0", (uid, day))
 
 
 def add_sample(sid: str, path: str, src=None):
@@ -703,25 +707,38 @@ def cleanup_samples():
                 os.remove(p)
     except OSError:
         pass
+    # audio download folders nobody cleaned (cancelled / crashed jobs)
+    try:
+        for name in os.listdir(DL_DIR):
+            p = os.path.join(DL_DIR, name)
+            if now - os.path.getmtime(p) > 3 * 3600:
+                shutil.rmtree(p, ignore_errors=True)
+    except OSError:
+        pass
 
 
-def drop_entry(sid: str):
-    """Forget a prepared clip and delete its downloaded audio."""
-    e = PREP.pop(sid, None)
-    if not e:
-        return
-    t = e["task"]
-    if not t.done():
-        t.cancel()
-        return
-    if t.cancelled():
+def _rm_audio_of(task):
+    if task.cancelled():
         return
     try:
-        a = (t.result() or {}).get("audio")
+        a = (task.result() or {}).get("audio")
         if a and a.get("dir"):
             shutil.rmtree(a["dir"], ignore_errors=True)
     except Exception:
         pass
+
+
+def drop_entry(sid: str):
+    """Forget a prepared clip. A job that is still running is NOT cancelled half-way:
+    its audio folder is removed as soon as it finishes (no leaked files)."""
+    e = PREP.pop(sid, None)
+    if not e:
+        return
+    t = e["task"]
+    if t.done():
+        _rm_audio_of(t)
+    else:
+        t.add_done_callback(_rm_audio_of)
 
 
 def cleanup_prep():
@@ -1015,69 +1032,65 @@ def download_audio(target: str, outdir: str, fallback=None):
             "duration": int(dur) if dur else None}
 
 
-def _clean_files(outdir: str, pattern: str):
-    for f in glob.glob(os.path.join(outdir, pattern)):
-        try:
-            os.remove(f)
-        except OSError:
-            pass
-
-
-def download_clip(url: str, outdir: str):
-    """Returns (path or None, title, meta, duration).
-    path is None when the clip is too long or still too big for Telegram after every quality step:
-    the caller then falls back to audio-only recognition instead of skipping the clip."""
-    if not host_in(url, CLIP_HOSTS):
-        raise ValueError("unsupported link")
-    with yt_dlp.YoutubeDL({**ydl_base(), "skip_download": True}) as ydl:
-        info = ydl.extract_info(url, download=False)
-        if "entries" in info:
-            if not info["entries"]:
-                raise RuntimeError("no media found")
-            info = info["entries"][0]
-    dur = info.get("duration") or 0
-    title = info.get("title") or "clip"
-    meta = None
+def _meta_from_info(info):
+    """Official music metadata (artist + track) that YouTube / Instagram sometimes provide."""
+    if not info:
+        return None
     artist = info.get("artist") or ", ".join(info.get("artists") or [])
     track = info.get("track")
     if artist and track:
-        meta = {"artist": artist.strip(), "title": track}  # all singers, not only the first
-    if dur and dur > CLIP_MAX_SECONDS:
-        return None, title, meta, dur
-    for h in CLIP_TIERS:  # 480p -> 360p -> 240p until the file fits
-        _clean_files(outdir, "clip.*")
-        opts = {**ydl_base(),
-                "format": f"bv*[height<={h}][ext=mp4]+ba[ext=m4a]/b[height<={h}][ext=mp4]/b[height<={h}]/b",
-                "outtmpl": f"{outdir}/clip.%(ext)s",
-                "merge_output_format": "mp4",
-                "max_filesize": MAX_BYTES}
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.extract_info(url, download=True)
-        except Exception as e:
-            log.warning("clip download at %sp failed: %s", h, str(e)[:100])
-            continue
-        files = [f for f in glob.glob(f"{outdir}/clip.*") if not f.endswith((".part", ".ytdl"))]
-        if files and os.path.getsize(files[0]) <= MAX_BYTES:
-            return files[0], title, meta, dur
-    return None, title, meta, dur
+        return {"artist": artist.strip(), "title": track}  # all singers, not only the first
+    return None
 
 
-def download_clip_audio(url: str, outdir: str, dur: float = 0):
-    """Audio only, for clips that are too long / too big to send. Very long media: only
-    5 minutes from the middle are downloaded."""
+def _len_filter(max_sec: int):
+    # "<=?" lets videos pass whose duration is unknown; live streams are refused
+    return yt_dlp.utils.match_filter_func(f"duration <=? {int(max_sec)} & !is_live")
+
+
+def download_clip(url: str, outdir: str):
+    """Video for sending to Telegram. Returns (path, title, meta).
+    path is None when the video is too long / too big: the caller then identifies it audio-only."""
     if not host_in(url, CLIP_HOSTS):
         raise ValueError("unsupported link")
-    opts = {**ydl_base(), "format": "bestaudio/best", "outtmpl": f"{outdir}/a.%(ext)s",
-            "max_filesize": 120 * 1024 * 1024}
-    if dur and dur > 600:
-        start = max(0, dur / 2 - 150)
-        opts["download_ranges"] = yt_dlp.utils.download_range_func(None, [(start, start + 300)])
-        opts["force_keyframes_at_cuts"] = False
+    opts = {**ydl_base(),
+            "format": "bv*[height<=480][ext=mp4]+ba[ext=m4a]/b[height<=480][ext=mp4]/b[height<=480]/b",
+            "outtmpl": f"{outdir}/clip.%(ext)s",
+            "merge_output_format": "mp4",
+            "max_filesize": MAX_BYTES,
+            "match_filter": _len_filter(CLIP_MAX_SEC)}
     with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.extract_info(url, download=True)
-    files = [f for f in glob.glob(f"{outdir}/a.*") if not f.endswith((".part", ".ytdl", ".aria2"))]
-    return files[0] if files else None
+        info = ydl.extract_info(url, download=True)
+        if info and "entries" in info:
+            info = (info["entries"] or [None])[0]
+    files = [f for f in glob.glob(f"{outdir}/clip.*") if not f.endswith((".part", ".ytdl"))]
+    if not info or not files or os.path.getsize(files[0]) > MAX_BYTES:
+        for f in files:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        return None, (info or {}).get("title"), _meta_from_info(info)
+    return files[0], info.get("title") or "clip", _meta_from_info(info)
+
+
+def download_source_audio(url: str, outdir: str):
+    """Audio only (low bitrate, small download) of a video of ANY length. Returns (path, meta)."""
+    if not host_in(url, CLIP_HOSTS):
+        raise ValueError("unsupported link")
+    opts = {**ydl_base(),
+            "format": "bestaudio[abr<=70]/worstaudio/bestaudio/worst",
+            "outtmpl": f"{outdir}/src.%(ext)s",
+            "max_filesize": 250 * 1024 * 1024,
+            "match_filter": _len_filter(MAX_SRC_SEC)}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        if info and "entries" in info:
+            info = (info["entries"] or [None])[0]
+    files = [f for f in glob.glob(f"{outdir}/src.*") if not f.endswith((".part", ".ytdl", ".aria2"))]
+    if not info or not files:
+        raise RuntimeError("source audio was not downloaded (too long / too big / unavailable)")
+    return files[0], _meta_from_info(info)
 
 
 # ======================================================================================
@@ -1165,7 +1178,7 @@ def ig_post_audio(url: str, outdir: str, want_audio: bool = True):
 
 
 # ======================================================================================
-# Audio sampling (ffmpeg) - adapts to the media length
+# Audio sampling (ffmpeg): works for ANY duration
 # ======================================================================================
 def probe_duration(path: str) -> float:
     try:
@@ -1178,39 +1191,36 @@ def probe_duration(path: str) -> float:
         return 0.0
 
 
-def cut_sample(src: str, out: str, start: float, dur: float, raw: bool = False) -> bool:
-    """raw=True: no filters at all (filters sometimes hurt the fingerprint of quiet / piano music).
-    A tiny / empty output file counts as a failure."""
-    base = ["ffmpeg", "-y", "-ss", f"{max(0, start):.2f}", "-i", src, "-t", f"{dur:.2f}",
+def cut_sample(src: str, out: str, start: float, dur: int, raw: bool = False) -> bool:
+    """raw=True: no filters at all (filters sometimes hurt the fingerprint of quiet / piano music)."""
+    base = ["ffmpeg", "-y", "-ss", str(max(0, start)), "-i", src, "-t", str(dur),
             "-vn", "-ac", "1", "-ar", "44100"]
     filters = [[]] if raw else [["-af", "highpass=f=80,dynaudnorm=f=200:g=15"], []]
     for af in filters:
         try:
             subprocess.run(base + af + ["-b:a", "128k", out],
                            check=True, capture_output=True, timeout=120)
-            if os.path.exists(out) and os.path.getsize(out) > 2000:
-                return True
+            return True
         except Exception:
             continue
     return False
 
 
-def loud_offsets(src: str, win: int, n: int = 2, d: float = 0) -> list:
+def loud_offsets(src: str, win: int, n: int = 2, maxsec: int = 600) -> list:
     """Start times of the n loudest, non-overlapping windows (usually the chorus / the singing).
-    Scans at most 10 minutes; for media longer than ~12 minutes the scan is centred on the middle.
-    Uses numpy when available (about 50x faster than the pure Python fallback)."""
+    Scans up to `maxsec` seconds. Uses numpy when available (about 50x faster)."""
     try:
         sr = 2000
-        scan_start = int(max(0, d / 2 - 300)) if d > 700 else 0
         out = subprocess.run(
-            ["ffmpeg", "-v", "error", "-ss", str(scan_start), "-t", "600", "-i", src, "-vn", "-ac", "1",
-             "-ar", str(sr), "-f", "s16le", "-"], capture_output=True, timeout=90).stdout
+            ["ffmpeg", "-v", "error", "-t", str(int(maxsec)), "-i", src, "-vn", "-ac", "1", "-ar", str(sr),
+             "-f", "s16le", "-"], capture_output=True, timeout=60 + int(maxsec) // 30).stdout
         if np is not None:
             pcm = np.frombuffer(out[:len(out) // 2 * 2], dtype=np.int16).astype(np.float32)
             secs = len(pcm) // sr
             if secs <= win + 2:
                 return []
             energy = (pcm[:secs * sr].reshape(secs, sr) ** 2).mean(axis=1)
+            del pcm
             pref = np.concatenate(([0.0], np.cumsum(energy, dtype=np.float64)))
             window_sum = pref[win:] - pref[:len(pref) - win]  # index i = energy of [i, i+win)
             order = np.argsort(-window_sum)
@@ -1233,41 +1243,42 @@ def loud_offsets(src: str, win: int, n: int = 2, d: float = 0) -> list:
                 picks.append(i)
             if len(picks) >= n:
                 break
-        return [scan_start + i for i in picks]
+        return picks
     except Exception as e:
         log.warning("loud_offsets failed: %s", e)
         return []
 
 
+def pick_offsets(src: str, d: float, win: int = 15) -> list:
+    """Where to cut the pieces.
+    * unknown / very short (<= win+3 s): one piece from the start (= the whole clip)
+    * otherwise: the loudest parts (often the chorus) + pieces spread EVENLY over the whole length,
+      more pieces for longer files (3 up to 1 min, 4 up to 5 min, 6 beyond)."""
+    if not d or d <= win + 3:
+        return [0]
+    n = 3 if d <= 60 else 4 if d <= 300 else 6
+    loud = loud_offsets(src, win, 2, int(min(d, MAX_SRC_SEC)))
+    even = [d * (k + 0.5) / n - win / 2 for k in range(n)]
+    mid = even[n // 2]
+    rest = [e for i, e in enumerate(even) if i != n // 2]
+    cand = loud[:1] + [mid] + loud[1:2] + rest
+    offs = []
+    for o in cand:
+        o = round(max(0, min(o, d - win)))
+        if all(abs(o - x) >= 5 for x in offs):  # no near-duplicate pieces
+            offs.append(o)
+    return offs[:n]
+
+
 def make_samples(src: str, sid: str) -> list:
-    """Cuts the pieces that are sent to the engines. The plan depends on the media length:
-      unknown length : one 15 s piece from the start
-      up to 20 s     : the whole clip is the sample
-      20 - 45 s      : 12 s windows,  45 s and longer: 15 s windows, taken at the loudest places
-                       plus places spread over the whole media
-    The last piece is always an unfiltered one (used only if the filtered ones fail)."""
     d = probe_duration(src)
-    if d <= 0:
-        win, offs = 15, [0]
-    elif d <= 20:
-        win, offs = max(4, int(d + 0.99)), [0]
-    else:
-        win = 12 if d < 45 else 15
-        loud = loud_offsets(src, win, 2, d)
-        spread = [d * f - win / 2 for f in (0.5, 0.25, 0.75, 0.1, 0.9)]
-        cand = loud[:1] + spread[:2] + loud[1:2] + spread[2:]
-        offs = []
-        for o in cand:
-            o = round(max(0, min(o, d - win)))
-            if all(abs(o - x) >= 4 for x in offs):  # no near-duplicate pieces
-                offs.append(o)
-        offs = offs[:max(1, MAX_SAMPLES - 1)]  # one slot is kept for the unfiltered piece
-    raw_dur = 20 if d <= 0 else max(4, min(20, int(d + 0.99)))
-    raw_start = 0 if d <= 0 else max(0, min(offs[0], d - raw_dur))
-    jobs = [(os.path.join(SAMPLES_DIR, f"{sid}_{i}.mp3"), o, win, False) for i, o in enumerate(offs)]
-    jobs.append((os.path.join(SAMPLES_DIR, f"{sid}_r.mp3"), raw_start, raw_dur, True))
+    win = 15
+    offs = pick_offsets(src, d, win)
+    jobs = [(os.path.join(SAMPLES_DIR, f"{sid}_{i}.mp3"), o, False) for i, o in enumerate(offs)]
+    # last piece: 20 s of the best part with NO filters (only used if the filtered ones fail)
+    jobs.append((os.path.join(SAMPLES_DIR, f"{sid}_r.mp3"), offs[0], True))
     with ThreadPoolExecutor(max_workers=len(jobs)) as ex:  # all pieces are cut at the same time
-        res = list(ex.map(lambda j: j[0] if cut_sample(src, j[0], j[1], j[2], j[3]) else None, jobs))
+        res = list(ex.map(lambda j: j[0] if cut_sample(src, j[0], j[1], 20 if j[2] else win, j[2]) else None, jobs))
     return [r for r in res if r]
 
 
@@ -1899,13 +1910,14 @@ def info_link(a: dict, song=None) -> str:
 
 
 async def fetch_audio(target: str, song=None) -> dict:
-    """Download step. On a cache hit returns the file_id right away."""
+    """Download step. On a cache hit returns the file_id right away.
+    The temp folder lives in DL_DIR so a periodic cleanup can always remove leaked ones."""
     keys = [target] + (song_keys(song) if song else [])
     for k in keys:
         hit = await asyncio.to_thread(cache_get, k)
         if hit:
             return {"file_id": hit["file_id"], "title": hit["title"], "info": hit["info"]}
-    tmp = tempfile.mkdtemp()
+    tmp = tempfile.mkdtemp(dir=DL_DIR)
     fb = None
     if song:
         fb = f"{song['artist']} - {song['title']}"
@@ -1914,7 +1926,7 @@ async def fetch_audio(target: str, song=None) -> dict:
     try:
         async with dl_sem():  # at most DL_CONCURRENCY downloads at the same time
             a = await asyncio.to_thread(download_audio, target, tmp, fb)
-    except Exception:
+    except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
     a["dir"] = tmp
@@ -1964,19 +1976,37 @@ async def upload_video(msg, path: str, caption: str, kb=None):
                                      supports_streaming=True, read_timeout=300, write_timeout=300)
 
 
-async def identify_and_reply(msg, src: str, audio_path: str, meta, lang: str):
-    """Audio file -> samples -> recognition -> result message + mp3 (no video is sent).
-    Used for Instagram photo posts and for clips that are too long / too big for Telegram."""
-    if not use_quota(msg.from_user.id):
-        return await msg.reply_text(tr(lang, "quota"))
+async def identify_audio_and_reply(msg, src: str, audio_path: str, meta, lang: str):
+    """Identify an audio file and answer with the result + mp3.
+    Used by Instagram photo posts and by videos that are too long / too big to send."""
+    uid = msg.from_user.id
+    trusted = bool(meta) and host_in(src, ("youtube.com", "youtu.be"))  # YouTube's own music metadata
     sid = uuid.uuid4().hex[:10]
-    outs = await asyncio.to_thread(make_samples, audio_path, sid)
-    if not outs:
-        return await msg.reply_text(tr(lang, "no_music"))
-    add_sample(sid, outs[0], src)
-    song = await asyncio.to_thread(recognize, outs, (), meta)
-    if not song:
-        return await msg.reply_text(tr(lang, "not_found"))
+    charged = False
+    song = None
+    try:
+        if trusted:
+            song = {"title": meta["title"], "artist": meta["artist"], "link": src, "engine": "meta#0"}
+            with open(os.path.join(SAMPLES_DIR, sid + ".json"), "w", encoding="utf-8") as f:
+                json.dump(dict(song), f, ensure_ascii=False)
+            await asyncio.to_thread(add_sample, sid, "", src)
+        else:
+            if not await asyncio.to_thread(use_quota, uid):
+                return await msg.reply_text(tr(lang, "quota"))
+            charged = True
+            outs = await asyncio.to_thread(make_samples, audio_path, sid)
+            if not outs:
+                await asyncio.to_thread(refund_quota, uid)
+                return await msg.reply_text(tr(lang, "no_music"))
+            await asyncio.to_thread(add_sample, sid, outs[0], src)
+            song = await asyncio.to_thread(recognize, outs, (), meta)
+            if not song:
+                await asyncio.to_thread(refund_quota, uid)
+                return await msg.reply_text(tr(lang, "not_found"))
+    except Exception:
+        if charged and not song:
+            await asyncio.to_thread(refund_quota, uid)
+        raise
     remember_alts(sid, song)
     set_last(sid, song)
     clip_set_song(src, song)
@@ -1994,16 +2024,28 @@ async def identify_and_reply(msg, src: str, audio_path: str, meta, lang: str):
 async def do_ig_post(msg, src: str, tmp: str, lang: str):
     """Instagram photo / carousel post: no video to send, so we just identify its music."""
     got = await asyncio.to_thread(ig_post_audio, src, tmp)
-    if not got or not got.get("path"):
+    if not got:
         return await msg.reply_text(tr(lang, "no_music"))
-    return await identify_and_reply(msg, src, got["path"], got.get("meta"), lang)
+    await identify_audio_and_reply(msg, src, got["path"], got.get("meta"), lang)
+
+
+async def do_audio_only(msg, src: str, tmp: str, lang: str, meta=None):
+    """Video too long / too big to send: download only its audio and identify that."""
+    try:
+        async with dl_sem():
+            path, meta2 = await asyncio.to_thread(download_source_audio, src, tmp)
+    except Exception as e:
+        log.warning("audio-only download failed: %s", str(e)[:150])
+        return await msg.reply_text(tr(lang, "clip_missing"))
+    await identify_audio_and_reply(msg, src, path, meta or meta2, lang)
 
 
 async def identify_clip(uid: int, sid: str, meta, src: str, samples_task):
-    """Returns (song or None, quota_blocked).
+    """Returns (song or None, quota_blocked). The quota is refunded when nothing was found.
     YouTube's own music metadata (official tracks) is trusted. Anything else (Instagram's
     'original audio' label is whatever the uploader picked) is only a weak hint that must be
     confirmed by listening to the real audio."""
+    charged = False
     try:
         meta_song = None
         if meta:
@@ -2015,16 +2057,27 @@ async def identify_clip(uid: int, sid: str, meta, src: str, samples_task):
                 with open(os.path.join(SAMPLES_DIR, sid + ".json"), "w", encoding="utf-8") as f:
                     json.dump(meta, f, ensure_ascii=False)
                 return meta_song, False
-        if not use_quota(uid):
+        if not await asyncio.to_thread(use_quota, uid):
             if meta_song:  # no quota left: the hint is better than nothing
                 return meta_song, False
             return None, True
+        charged = True
         outs = await samples_task
         if not outs:
+            if not meta_song:
+                await asyncio.to_thread(refund_quota, uid)
             return meta_song, False
-        return await asyncio.to_thread(recognize, outs, (), meta_song), False
+        song = await asyncio.to_thread(recognize, outs, (), meta_song)
+        if not song:
+            await asyncio.to_thread(refund_quota, uid)
+        return song, False
     except Exception:
         log.exception("identify_clip failed")
+        if charged:
+            try:
+                await asyncio.to_thread(refund_quota, uid)
+            except Exception:
+                pass
         return None, False
 
 
@@ -2081,42 +2134,29 @@ async def clip_from_cache(msg, src: str, hit, lang: str):
 
 async def do_clip(msg, url: str):
     uid = msg.from_user.id
-    lang = get_lang(uid)
+    lang = await asyncio.to_thread(get_lang, uid)
     src = norm_url(url)
 
-    hit = clip_get(src)
+    hit = await asyncio.to_thread(clip_get, src)
     if hit:
         try:
             return await clip_from_cache(msg, src, hit, lang)
         except Exception:
             log.exception("clip cache send failed, re-downloading")
-            clip_delete(src)
+            await asyncio.to_thread(clip_delete, src)
 
     with tempfile.TemporaryDirectory() as tmp:
         try:
             async with dl_sem():
-                path, title, meta, dur = await asyncio.to_thread(download_clip, src, tmp)
+                path, title, meta = await asyncio.to_thread(download_clip, src, tmp)
         except Exception as e:
-            if "instagram.com" not in src:
-                raise
-            log.warning("instagram clip download failed (%s): trying it as a photo post", str(e)[:100])
-            return await do_ig_post(msg, src, tmp, lang)
-        if not path:  # too long / too big for Telegram: skip the video, still identify its music
-            if not meta and "instagram.com" in src:
-                try:
-                    got = await asyncio.to_thread(ig_post_audio, src, tmp, False)
-                    meta = (got or {}).get("meta")
-                except Exception:
-                    log.exception("instagram music name failed")
-            try:
-                async with dl_sem():
-                    apath = await asyncio.to_thread(download_clip_audio, src, tmp, dur)
-            except Exception:
-                log.exception("audio-only fallback failed")
-                apath = None
-            if not apath:
-                return await msg.reply_text(tr(lang, "clip_missing"))
-            return await identify_and_reply(msg, src, apath, meta, lang)
+            if "instagram.com" in src:
+                log.warning("instagram clip download failed (%s): trying it as a photo post", str(e)[:100])
+                return await do_ig_post(msg, src, tmp, lang)
+            log.warning("clip download failed (%s): trying audio only", str(e)[:100])
+            return await do_audio_only(msg, src, tmp, lang)
+        if not path:  # too long / too big for Telegram: identify from the audio alone
+            return await do_audio_only(msg, src, tmp, lang, meta)
         if not meta and "instagram.com" in src:  # yt-dlp often misses the music name: ask Instagram itself
             try:
                 got = await asyncio.to_thread(ig_post_audio, src, tmp, False)
@@ -2124,7 +2164,7 @@ async def do_clip(msg, url: str):
             except Exception:
                 log.exception("instagram music name failed")
         sid = uuid.uuid4().hex[:10]
-        add_sample(sid, "", src)
+        await asyncio.to_thread(add_sample, sid, "", src)
 
         # background: cut samples -> recognize -> download audio (not awaited)
         samples_task = asyncio.create_task(asyncio.to_thread(make_samples, path, sid))
@@ -2135,7 +2175,7 @@ async def do_clip(msg, url: str):
             sent = await upload_video(msg, path, footer(src), clip_keyboard(sid, lang))
             fid = _msg_video_id(sent)
             if fid:
-                clip_put(src, fid)
+                await asyncio.to_thread(clip_put, src, fid)
         except Exception:
             drop_entry(sid)
             raise
@@ -2184,31 +2224,45 @@ async def show_prepared(q, sid: str, entry: dict, lang: str):
 # Voice / audio / typed text from the user
 # ======================================================================================
 async def handle_media(msg, media, lang: str):
+    uid = msg.from_user.id
     fid = media.file_unique_id
     sid = uuid.uuid4().hex[:10]
-    song = media_cache_get(fid)  # same file sent before -> same answer, no quota used
-    if song:
-        add_sample(sid, "")
-        set_last(sid, {**song, "engine": "cache#0"})
-    else:
-        if not use_quota(msg.from_user.id):
-            return await msg.reply_text(tr(lang, "quota"))
-        raw = os.path.join(SAMPLES_DIR, sid + ".raw")
-        await (await media.get_file()).download_to_drive(raw)
-        outs = await asyncio.to_thread(make_samples, raw, sid)
-        if outs:
-            os.remove(raw)
+    song = await asyncio.to_thread(media_cache_get, fid)  # same file sent before -> same answer, no quota
+    charged = False
+    try:
+        if song:
+            await asyncio.to_thread(add_sample, sid, "")
+            set_last(sid, {**song, "engine": "cache#0"})
         else:
-            fallback = os.path.join(SAMPLES_DIR, f"{sid}_0.ogg")
-            os.replace(raw, fallback)
-            outs = [fallback]
-        add_sample(sid, outs[0])
-        song = await asyncio.to_thread(recognize, outs)
-        if not song:
-            return await msg.reply_text(tr(lang, "not_found"))
-        remember_alts(sid, song)
-        set_last(sid, song)
-    media_cache_put(fid, song, sid)
+            size = getattr(media, "file_size", 0) or 0
+            if size > 20 * 1024 * 1024:  # Telegram bots cannot download bigger files
+                return await msg.reply_text(tr(lang, "err"))
+            if not await asyncio.to_thread(use_quota, uid):
+                return await msg.reply_text(tr(lang, "quota"))
+            charged = True
+            raw = os.path.join(SAMPLES_DIR, sid + ".raw")
+            await (await media.get_file()).download_to_drive(raw)
+            outs = await asyncio.to_thread(make_samples, raw, sid)
+            if outs:
+                os.remove(raw)
+            else:
+                fallback = os.path.join(SAMPLES_DIR, f"{sid}_0.ogg")
+                os.replace(raw, fallback)
+                outs = [fallback]
+            await asyncio.to_thread(add_sample, sid, outs[0])
+            song = await asyncio.to_thread(recognize, outs)
+            if not song:
+                await asyncio.to_thread(refund_quota, uid)
+                charged = False
+                return await msg.reply_text(tr(lang, "not_found"))
+            charged = False
+            remember_alts(sid, song)
+            set_last(sid, song)
+    except Exception:
+        if charged:
+            await asyncio.to_thread(refund_quota, uid)
+        raise
+    await asyncio.to_thread(media_cache_put, fid, song, sid)
     audio_task = asyncio.create_task(prepare_song_audio(song))
     await msg.reply_text(result_caption(song), parse_mode="HTML",
                          reply_markup=result_keyboard(sid, song, lang), **NO_PREVIEW)
@@ -2243,8 +2297,8 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not msg or not msg.from_user:
         return
     uid = msg.from_user.id
-    touch_user(msg.from_user)
-    lang = get_lang(uid)
+    await asyncio.to_thread(touch_user, msg.from_user)
+    lang = await asyncio.to_thread(get_lang, uid)
     if not rate_ok(uid):
         return await msg.reply_text(tr(lang, "slow"))
     media = msg.voice or msg.audio or msg.video_note
@@ -2279,7 +2333,7 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_rec(q, data: str):
     action, sid = data.split(":", 1)
     uid = q.from_user.id
-    lang = get_lang(uid)
+    lang = await asyncio.to_thread(get_lang, uid)
 
     if action == "rec":
         entry = PREP.get(sid)
@@ -2328,12 +2382,18 @@ async def on_rec(q, data: str):
     else:
         if not paths:
             return await q.answer(tr(lang, "no_result"), show_alert=True)
-        if not use_quota(uid):
+        if not await asyncio.to_thread(use_quota, uid):
             return await q.answer(tr(lang, "quota_short"), show_alert=True)
         await q.answer(tr(lang, "identifying"))
-        song = await asyncio.to_thread(recognize, paths, tuple(tried))
+        try:
+            song = await asyncio.to_thread(recognize, paths, tuple(tried))
+        except Exception:
+            await asyncio.to_thread(refund_quota, uid)
+            raise
         if song:
             remember_alts(sid, song)
+        else:
+            await asyncio.to_thread(refund_quota, uid)  # nothing found: give the recognition back
     if not song:
         txt = tr(lang, "not_found") if not tried else tr(lang, "no_more")
         return await q.message.reply_text(txt)
@@ -2386,6 +2446,20 @@ async def on_pick(q, ctx, data: str):
     if not _VID_RE.match(vid):
         return await q.answer()
     if not rate_ok(q.from_user.id, limit=RATE_LIMIT * 2):
+        return await q.answer(tr(lang, "slow"), show_alert=True)
+    await q.answer(tr(lang, "downloading"))
+    try:
+        async with chat_action(ctx.bot, q.message.chat_id, ChatAction.RECORD_VOICE):
+            await send_mp3(q.message, f"https://www.youtube.com/watch?v={vid}", lang=lang)
+    except Exception:
+        log.exception("pick failed")
+        await q.message.reply_text(tr(lang, "err"))
+
+
+async def on_more(q, data: str):
+    lang = get_lang(q.from_user.id)
+    _, sid, page = data.split(":")
+    if sid not in SEARCH:
         return await q.answer(tr(lang, "expired"), show_alert=True)
     await q.answer()
     try:
@@ -2412,7 +2486,7 @@ async def on_lang_button(q, data: str):
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     data = q.data or ""
-    touch_user(q.from_user)
+    await asyncio.to_thread(touch_user, q.from_user)
     if data.startswith(("rec:", "bad:")):
         return await on_rec(q, data)
     if data.startswith("pick:"):
@@ -2505,7 +2579,7 @@ def main():
     ))
     app.add_error_handler(on_error)
     # Admin features live in ./admin and are optional: if that folder is missing or broken,
-    # the bot still starts and continues without it.
+    # the bot still starts anyway.
     try:
         from admin import register as register_admin
         register_admin(app, sys.modules[__name__])
