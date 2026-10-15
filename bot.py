@@ -144,16 +144,17 @@ STR = {
             "🌐 زبان بات رو از دکمه‌های پایین عوض کن"),
         "lang_set": "✅ زبان بات شد فارسی",
         "working": "⏳ در حال پردازش...",
-        "err": "❌ این فایل در دسترس نیست. یه لینک یا آهنگ دیگه امتحان کن یا چند دقیقه بعد دوباره بفرست.",
+        "err": "❌ دریافت رسانه از منبع ممکن نیست.",
         "clip_missing": "⚠️ کلیپ پیدا نشد یا بزرگ‌تر از ۵۰ مگابایته.",
         "quota": "⛔ سقف تشخیص امروزت پر شده، فردا دوباره امتحان کن.",
         "quota_short": "⛔ سقف تشخیص امروزت پر شده.",
-        "not_found": "😕 آهنگ رو نشناختم.",
+        "not_found": "😕 آهنگ شناسایی نشد.\nبخش دیگری بفرست که موسیقی در آن واضح شنیده شود، بدون صحبت یا سروصدای زیاد.",
         "no_more": "😕 موتور دیگه‌ای برای امتحان نمونده.",
         "expired": "نمونه منقضی شده، لینک یا فایل رو دوباره بفرست.",
         "no_result": "نتیجه‌ی دیگه‌ای نیست.",
-        "identifying": "⏳ در حال شناسایی...",
-        "wait_toast": "⏳ چند ثانیه صبر کن...",
+        "identifying": "⏳ در حال شناسایی آهنگ...",
+        "wait_toast": "⏳ در حال شناسایی آهنگ...",
+        "downloading": "⏳ در حال دریافت آهنگ...",
         "lyrics_wait": "⏳ در حال پیدا کردن متن ترانه...",
         "lyrics_none": "😕 متن این آهنگ پیدا نشد.",
         "track_missing": "اطلاعات آهنگ پیدا نشد.",
@@ -177,16 +178,17 @@ STR = {
             "🌐 Change the bot language with the buttons below"),
         "lang_set": "✅ Language set to English",
         "working": "⏳ Working on it...",
-        "err": "❌ This file isn't available right now. Try another link or song, or try again in a few minutes.",
+        "err": "❌ Couldn't get the media from the source.",
         "clip_missing": "⚠️ Clip not found or larger than 50 MB.",
         "quota": "⛔ You've reached today's recognition limit. Try again tomorrow.",
         "quota_short": "⛔ You've reached today's recognition limit.",
-        "not_found": "😕 I couldn't identify the song.",
+        "not_found": "😕 Couldn't identify the song.\nSend another part where the music is clearly audible, without speech or too much noise.",
         "no_more": "😕 No other engine left to try.",
         "expired": "This sample has expired. Please send the link or file again.",
         "no_result": "No other result.",
-        "identifying": "⏳ Identifying...",
-        "wait_toast": "⏳ Just a few seconds...",
+        "identifying": "⏳ Identifying the song...",
+        "wait_toast": "⏳ Identifying the song...",
+        "downloading": "⏳ Getting the song...",
         "lyrics_wait": "⏳ Looking for the lyrics...",
         "lyrics_none": "😕 Couldn't find lyrics for this song.",
         "track_missing": "Song info not found.",
@@ -2298,7 +2300,7 @@ async def on_pick(q, ctx, data: str):
         return await q.answer()
     if not rate_ok(q.from_user.id, limit=RATE_LIMIT * 2):
         return await q.answer(tr(lang, "slow"), show_alert=True)
-    await q.answer(tr(lang, "wait_toast"))
+    await q.answer(tr(lang, "downloading"))
     try:
         async with chat_action(ctx.bot, q.message.chat_id, ChatAction.RECORD_VOICE):
             await send_mp3(q.message, f"https://www.youtube.com/watch?v={vid}", lang=lang)
@@ -2430,9 +2432,12 @@ def main():
     ))
     app.add_error_handler(on_error)
     # Admin features live in ./admin and are optional: if that folder is missing or broken,
-    # the bot still starts and recognition works as usual.
-    try:
-        from admin import register as register_admin
-        register_admin(app, sys.modules[__name__])
+    # the bot still starts an
+          register_admin(app, sys.modules[__name__])
     except Exception:
-        l
+        log.exception("admin module not loaded - the bot continues without it")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
