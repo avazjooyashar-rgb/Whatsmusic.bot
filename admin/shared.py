@@ -40,4 +40,5 @@ def admin_menu():
         [Btn("🔒 عضویت اجباری", callback_data="adm:fj"), Btn("🚫 مسدود / آزاد", callback_data="adm:ban")],
         [Btn("➕ ACRCloud", callback_data="adm:addacr"), Btn("➕ AudD", callback_data="adm:addaudd")],
         [Btn("📋 اکانت‌ها", callback_data="adm:list"), Btn("⚙️ سقف روزانه", callback_data="adm:limit")],
+        [Btn("🧪 تست اکانت‌ها", callback_data="adm:test")],
     ])
