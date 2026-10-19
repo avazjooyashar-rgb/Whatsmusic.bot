@@ -6,7 +6,7 @@ from telegram import InlineKeyboardButton as Btn, InlineKeyboardMarkup as Markup
 from telegram.ext import (ApplicationHandlerStop, CallbackQueryHandler,
                           CommandHandler, MessageHandler, filters)
 from . import shared as S
-from . import join, broadcast
+from . import join, broadcast, tester
 
 log = logging.getLogger("admin.panel")
 
@@ -86,6 +86,10 @@ async def admin_cb(q, ctx, data: str):
         await show_accounts(q)
     elif act == "stats":
         await q.edit_message_text(stats_text(), reply_markup=S.BACK)
+    elif act == "test":
+        await tester.run_test(q, ctx)
+    elif act == "testoff":
+        await tester.disable_bad(q, ctx)
     elif act.startswith("fj"):
         await join.cb(q, ctx, act, parts)
     elif act.startswith("bc"):
