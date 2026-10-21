@@ -1,5 +1,5 @@
 """
-Music recognition Telegram bot  -  v3 (all fixes merged)
+Music recognition Telegram bot  -  v4 (quota-friendly)
 
   * clips of ANY length: short ones are used whole, long ones are sampled over the whole file,
     too long / too big for Telegram -> audio-only identification
@@ -8,6 +8,10 @@ Music recognition Telegram bot  -  v3 (all fixes merged)
   * audio download folders cannot leak (own folder + periodic cleanup)
   * speed: shared thread pool, vote stops when two engines agree, one Shazam client
   * safety: exact host matching, download whitelist, atomic quota, rate limit
+  * NEW: ACRCloud + Shazam are asked first; AudD (small quota) is only the backup: ONE request on ONE
+         short piece, and only when the first two are not sure
+  * NEW: an account that reports "limit reached" / bad key is paused automatically (no more wasted requests)
+  * NEW: AudD lyrics search only after the free YouTube lyrics search failed
 """
 import json, asyncio, sqlite3, datetime, os, re, tempfile, glob, time, hmac, hashlib, base64, uuid
 import subprocess, logging, html, shutil, sys, threading, array, unicodedata
@@ -53,6 +57,10 @@ ACR_SECRET = os.environ.get("ACR_SECRET")
 AUDD_TOKEN = os.environ.get("AUDD_TOKEN")
 ODESLI_KEY = os.environ.get("ODESLI_KEY")  # optional
 ENGINE_ORDER = os.environ.get("ENGINES", "acr,audd,shazam").split(",")
+PRIMARY_ENGINES = ("acr", "shazam")  # generous engines: always asked first, on several pieces
+BACKUP_ENGINES = ("audd",)  # small quota: asked ONLY when the primary engines are not sure, on ONE piece
+COOLDOWN_SEC = int(os.environ.get("COOLDOWN_SEC", str(6 * 3600)))  # pause of an account that is out of quota
+AUDD_SEC = int(os.environ.get("AUDD_SEC", "12"))  # length of the piece sent to AudD (short = cheap)
 LYRICS_ENGINE = os.environ.get("LYRICS_ENGINE", "1") == "1"  # last resort: transcribe singing, search words
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")  # tiny = lighter, base = fast, small = accurate
 WHISPER_WAIT = int(os.environ.get("WHISPER_WAIT", "25"))  # seconds a request may wait for the Whisper lock
@@ -801,6 +809,30 @@ def _shazam_client():
 
 
 # ======================================================================================
+# Account protection: an account that is out of quota / has a bad key is paused automatically
+# ======================================================================================
+class QuotaError(Exception):
+    """The engine account is out of quota or its key is rejected: stop using it for a while."""
+
+
+_COOLDOWN = {}  # account id -> time until which the account is not used (kept in memory)
+
+
+def cool_down(acc_id: int, why: str, sec: int = None):
+    sec = sec or COOLDOWN_SEC
+    _COOLDOWN[acc_id] = time.time() + sec
+    log.warning("account #%s paused for %d min: %s", acc_id, sec // 60, why)
+
+
+def cooling(acc_id: int) -> bool:
+    until = _COOLDOWN.get(acc_id)
+    if until and until > time.time():
+        return True
+    _COOLDOWN.pop(acc_id, None)
+    return False
+
+
+# ======================================================================================
 # Engine 1: ACRCloud   Engine 2: AudD   Engine 3: Shazam
 # ======================================================================================
 def _hum_score(h: dict) -> float:
@@ -828,7 +860,13 @@ def acr_identify(path: str, acc):
         files={"sample": data},
         timeout=40,
     ).json()
-    if r.get("status", {}).get("code") != 0:
+    st = r.get("status", {})
+    code = st.get("code")
+    if code in (3001, 3003, 3014):  # bad key / limit reached / bad signature
+        raise QuotaError(f"acr {code}: {st.get('msg', '')}")
+    if code != 0:
+        if code not in (1001, 2004):  # 1001 = no result (normal), 2004 = not fingerprintable
+            log.info("acr status %s: %s", code, st.get("msg", ""))
         return None
     md = r.get("metadata") or {}
     music = md.get("music") or []
@@ -864,14 +902,48 @@ def acr_identify(path: str, acc):
     return {"title": m["title"], "artist": artist, "link": link, "yt": yt}
 
 
+def _audd_check(r: dict):
+    """AudD answers 900 (bad token), 901 / 902 (trial or quota finished, limit reached)."""
+    err = r.get("error") or {}
+    code = err.get("error_code")
+    if code in (900, 901, 902):
+        raise QuotaError(f"audd {code}: {err.get('error_message', '')}")
+
+
+def _trim_for_audd(path: str, sec: int):
+    """A short copy of the piece: AudD charges by audio length, so a short piece is cheaper.
+    Returns the temp file path, or None when ffmpeg failed (the original is used then)."""
+    fd, out = tempfile.mkstemp(suffix=".mp3", dir=SAMPLES_DIR)
+    os.close(fd)
+    try:
+        subprocess.run(["ffmpeg", "-y", "-i", path, "-t", str(sec), "-vn", "-ac", "1", "-b:a", "96k", out],
+                       check=True, capture_output=True, timeout=60)
+        return out
+    except Exception:
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+        return None
+
+
 def audd_identify(path: str, acc):
-    with open(path, "rb") as f:
-        r = HTTP.post(
-            "https://api.audd.io/",
-            data={"api_token": acc["key"], "return": "spotify,apple_music"},
-            files={"file": f},
-            timeout=40,
-        ).json()
+    small = _trim_for_audd(path, AUDD_SEC)
+    try:
+        with open(small or path, "rb") as f:
+            r = HTTP.post(
+                "https://api.audd.io/",
+                data={"api_token": acc["key"], "return": "spotify,apple_music"},
+                files={"file": f},
+                timeout=40,
+            ).json()
+    finally:
+        if small:
+            try:
+                os.remove(small)
+            except OSError:
+                pass
+    _audd_check(r)
     res = r.get("result")
     if not res:
         return None
@@ -1497,23 +1569,36 @@ def _base(tag: str) -> str:
     return (tag or "").split("#")[0]
 
 
-def _active_engines(skip) -> list:
+def _active_engines(skip, names=None) -> list:
+    """Engines that may be asked now. `names` limits the list (PRIMARY_ENGINES / BACKUP_ENGINES).
+    Accounts that are paused (out of quota / bad key) are left out."""
     with db() as c:
         rows = c.execute("SELECT * FROM accounts WHERE enabled=1 ORDER BY id").fetchall()
     jobs = []
     for name in [n.strip() for n in ENGINE_ORDER]:
+        if names is not None and name not in names:
+            continue
         if name == "shazam":
             if "shazam#0" not in skip:
                 jobs.append(("shazam", []))
         elif name in ENGINE_FN:
-            accs = [r for r in rows if r["type"] == name and f'{name}#{r["id"]}' not in skip]
+            accs = [r for r in rows
+                    if r["type"] == name and f'{name}#{r["id"]}' not in skip and not cooling(r["id"])]
             if accs:
                 jobs.append((name, accs))
     return jobs
 
 
+def _audd_accounts() -> list:
+    with db() as c:
+        rows = c.execute("SELECT * FROM accounts WHERE enabled=1 AND type='audd' ORDER BY id").fetchall()
+    return [r for r in rows if not cooling(r["id"])]
+
+
 def call_engine(name: str, accs, path: str):
-    """Ask ONE engine about ONE piece of audio. Every call is retried once on a network error."""
+    """Ask ONE engine about ONE piece of audio. ACR is retried once on a network error;
+    AudD is NOT retried (a timed-out request may already have been counted).
+    An account that is out of quota is paused and the next account of the engine is tried."""
     if name == "shazam":
         for attempt in (1, 2):
             try:
@@ -1525,9 +1610,10 @@ def call_engine(name: str, accs, path: str):
             except Exception as e:
                 log.warning("shazam failed (try %s): %s", attempt, e)
         return None
+    attempts = 1 if name == "audd" else 2
     for r in accs:
         tag = f'{name}#{r["id"]}'
-        for attempt in (1, 2):
+        for attempt in range(1, attempts + 1):
             try:
                 res = ENGINE_FN[name](path, r)
                 with db() as c:
@@ -1536,9 +1622,14 @@ def call_engine(name: str, accs, path: str):
                     res["engine"] = tag
                     return res
                 return None  # real "no match": don't burn the other accounts on the same audio
+            except QuotaError as e:
+                cool_down(r["id"], str(e))
+                with db() as c:
+                    c.execute("UPDATE accounts SET errors=errors+1 WHERE id=?", (r["id"],))
+                break  # next account of this engine
             except Exception as e:
                 log.warning("account %s failed (try %s): %s", r["id"], attempt, e)
-                if attempt == 2:
+                if attempt == attempts:
                     with db() as c:
                         c.execute("UPDATE accounts SET errors=errors+1 WHERE id=?", (r["id"],))
     return None
@@ -1631,6 +1722,7 @@ def audd_find_lyrics(words, acc):
     q = " ".join(words[:40])
     r = HTTP.get("https://api.audd.io/findLyrics/", params={"q": q, "api_token": acc["key"]},
                  timeout=30).json()
+    _audd_check(r)
     for it in (r.get("result") or [])[:3]:
         if not (it.get("title") and it.get("artist")):
             continue
@@ -1643,6 +1735,24 @@ def audd_find_lyrics(words, acc):
         if lyrics and lyric_overlap(words, lyrics) < 0.35:
             continue
         return {"title": it["title"], "artist": it["artist"], "link": it.get("song_link")}
+    return None
+
+
+def _audd_lyrics_try(words):
+    """findLyrics on the first usable AudD account. A paused / out-of-quota account is skipped."""
+    for acc in _audd_accounts():
+        try:
+            res = audd_find_lyrics(words, acc)
+            with db() as c:
+                c.execute("UPDATE accounts SET uses=uses+1 WHERE id=?", (acc["id"],))
+            return res  # None = no match: don't spend the other accounts on the same words
+        except QuotaError as e:
+            cool_down(acc["id"], str(e))
+        except Exception as e:
+            log.warning("audd findLyrics failed: %s", e)
+            with db() as c:
+                c.execute("UPDATE accounts SET errors=errors+1 WHERE id=?", (acc["id"],))
+            break
     return None
 
 
@@ -1704,22 +1814,15 @@ def lyrics_identify(paths):
     words = re.findall(r"\w+", " ".join(texts).lower())
     if len(words) < 6:  # instrumental, humming or too little singing
         return None
-    with db() as c:
-        accs = c.execute("SELECT * FROM accounts WHERE enabled=1 AND type='audd' ORDER BY id").fetchall()
-    for acc in accs:
-        try:
-            res = audd_find_lyrics(words, acc)
-            with db() as c:
-                c.execute("UPDATE accounts SET uses=uses+1 WHERE id=?", (acc["id"],))
-            if res:
-                return res
-            break  # no match: don't spend the other accounts on the same words
-        except Exception as e:
-            log.warning("lyrics search failed: %s", e)
-            with db() as c:
-                c.execute("UPDATE accounts SET errors=errors+1 WHERE id=?", (acc["id"],))
     best = max(texts, key=len)  # the longest transcript makes the best search query
-    return yt_lyrics_search(re.findall(r"\w+", best.lower()) or words)
+    # 1) free: YouTube search verified against real lyrics
+    res = yt_lyrics_search(re.findall(r"\w+", best.lower()) or words)
+    if res:
+        return res
+    # 2) AudD findLyrics costs quota: only with enough words to make a good match
+    if len(words) >= 12:
+        return _audd_lyrics_try(words)
+    return None
 
 
 def find_song_by_words(words):
@@ -1727,31 +1830,25 @@ def find_song_by_words(words):
     res = yt_lyrics_search(words)
     if res:
         return res
-    with db() as c:
-        accs = c.execute("SELECT * FROM accounts WHERE enabled=1 AND type='audd' ORDER BY id").fetchall()
-    for acc in accs[:1]:
-        try:
-            return audd_find_lyrics(words, acc)
-        except Exception as e:
-            log.warning("audd findLyrics failed: %s", e)
-    return None
+    return _audd_lyrics_try(words)
 
 
 def recognize(paths, skip=(), extra=None):
-    """Listens like a human would, with all the 'ears' at once:
-    1) every engine (ACRCloud, AudD, Shazam) listens at the same time on the best piece of audio;
+    """Listens like a human would:
+    1) ACRCloud + Shazam (generous quota) listen at the same time on the best piece of audio;
        answers are collected AS THEY ARRIVE and the vote stops the moment two of them agree
-    2) if not sure yet, more pieces are tried (2 at a time)
-    3) if nobody agrees, the singing is transcribed and matched with real lyrics
-    4) if still nothing, slowed / sped-up versions of the audio are tried
+    2) if not sure yet, more pieces are tried (2 at a time, at most 5 pieces)
+    3) if still not sure, AudD (small quota) is asked ONCE on the best piece
+    4) if nobody agrees, the singing is transcribed and matched with real lyrics
+    5) if still nothing, slowed / sped-up versions of the audio are tried (primary engines only)
     `extra` is a weak hint (e.g. the audio name on an Instagram reel): it counts as one vote.
     The result has an "alts" list with the runner-up answers."""
     if isinstance(paths, str):
         paths = [paths]
     skip = tuple(skip)
     rejected = {t[2:] for t in skip if t.startswith("k:")}  # songs the user said are wrong
-    jobs = _active_engines(skip)
-    order = {n: i for i, (n, _a) in enumerate(jobs)}
+    primary = _active_engines(skip, PRIMARY_ENGINES)
+    order = {n.strip(): i for i, n in enumerate(ENGINE_ORDER)}
     hits = []
     if extra and extra.get("title") and "meta#0" not in skip and title_key(extra["title"]) not in rejected:
         hits.append({"song": dict(extra, engine="meta#0"), "engine": "meta#0", "sample": 98,
@@ -1771,7 +1868,7 @@ def recognize(paths, skip=(), extra=None):
             hits.append({"song": mo, "engine": mo["engine"], "sample": idx,
                          "w": base_w * mo.get("wmul", 0.5)})
 
-    def run_batch(batch):
+    def run_batch(batch, jobs):
         futs = {ENGINE_POOL.submit(call_engine, name, accs, p): (name, idx)
                 for idx, p in batch for name, accs in jobs}
         if not futs:
@@ -1797,16 +1894,23 @@ def recognize(paths, skip=(), extra=None):
     pieces = list(enumerate(paths[:MAX_SAMPLES]))
     pos = 0
     ranked = _group(hits)
-    for size in (1, 2, 2, 2):  # best piece first; only listen to more if the engines don't agree yet
+    for size in (1, 2, 2):  # best piece first; only listen to more if the engines don't agree yet
         batch = pieces[pos:pos + size]
         pos += size
         if not batch:
             break
-        run_batch(batch)
+        run_batch(batch, primary)
         ranked = _group(hits)
         if _confident(ranked):
             break
     ranked = _group(hits)
+
+    # AudD = the last arrow: ONE short piece, only when the first engines are not sure
+    if pieces and not _confident(ranked):
+        backup = _active_engines(skip, BACKUP_ENGINES)
+        if backup:
+            run_batch(pieces[:1] if primary else pieces[:2], backup)
+            ranked = _group(hits)
 
     if LYRICS_ENGINE and "lyrics#0" not in skip and not _confident(ranked):
         try:
@@ -1818,11 +1922,11 @@ def recognize(paths, skip=(), extra=None):
         except Exception as e:
             log.warning("lyrics stage failed: %s", e)
 
-    if not ranked and paths:  # nothing at all: try slowed / sped-up versions of the best piece
+    if not ranked and paths and primary:  # nothing at all: try slowed / sped-up versions of the best piece
         try:
             vs = make_variants(paths[0])
             if vs:
-                run_batch(list(enumerate(vs, start=50)))
+                run_batch(list(enumerate(vs, start=50)), primary)
                 ranked = _group(hits)
         except Exception as e:
             log.warning("variant stage failed: %s", e)
