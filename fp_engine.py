@@ -80,6 +80,24 @@ def fingerprint_file(path: str):
     return make_hashes(find_peaks(load_audio(path)))
 
 
+def best_alignment(song_hashes, clip_hashes) -> int:
+    """How many hashes of a short clip line up (same time shift) with the hashes of a full song.
+    Used to VERIFY that a clip really comes from a given audio before it is learned."""
+    idx = defaultdict(list)
+    for h, off in song_hashes:
+        idx[h].append(off)
+    votes = defaultdict(int)
+    for h, qoff in clip_hashes:
+        for off in idx.get(h, ()):
+            votes[off - qoff] += 1
+    best = 0
+    for d, c in votes.items():
+        s = c + votes.get(d - 1, 0) + votes.get(d + 1, 0)
+        if s > best:
+            best = s
+    return best
+
+
 # ---------------- دیتابیس ----------------
 class FingerprintDB:
     def __init__(self, path: str = DB_PATH):
@@ -102,6 +120,7 @@ class FingerprintDB:
                 offset INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_fp_hash ON fingerprints(hash);
+            CREATE INDEX IF NOT EXISTS idx_fp_track ON fingerprints(track_id);
         """)
         self.conn.commit()
 
@@ -159,6 +178,20 @@ class Engine:
         tid = self.db.get_or_create_track(title, artist, source)
         self.db.add_hashes(tid, hashes)
         return tid
+
+    def ingest_verified(self, song_hashes, title, artist) -> int:
+        """Store the hashes of a WHOLE, verified song. Replaces unverified clip hashes of the same track.
+        Returns the number of hashes stored (0 = the track was already complete)."""
+        tid = self.db.get_or_create_track(title, artist, "verified")
+        conn = self.db.conn
+        src, n = conn.execute("SELECT source, n_hashes FROM tracks WHERE id=?", (tid,)).fetchone()
+        if src in ("verified", "manual") and n > 0:
+            return 0
+        conn.execute("DELETE FROM fingerprints WHERE track_id=?", (tid,))
+        conn.execute("UPDATE tracks SET source='verified', n_hashes=0 WHERE id=?", (tid,))
+        conn.commit()
+        self.db.add_hashes(tid, song_hashes)
+        return len(song_hashes)
 
     def recognize(self, path):
         """برمی‌گرداند dict شامل title, artist, score, confidence یا None."""
