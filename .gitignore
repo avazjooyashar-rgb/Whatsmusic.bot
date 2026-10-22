@@ -1,6 +1,13 @@
 .env
 *.db
+*.db-wal
+*.db-shm
 __pycache__/
 *.mp3
 *.ogg
+*.wav
+*.opus
+*.m4a
+*.flac
 venv/
+.venv/
