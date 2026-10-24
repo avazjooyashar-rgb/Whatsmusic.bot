@@ -10,12 +10,21 @@ fp_engine.py - موتور تشخیص آهنگ (Audio Fingerprinting)
     python fp_engine.py add-dir ./songs          # فایل‌ها به شکل "Artist - Title.mp3"
     python fp_engine.py recognize clip.ogg
     python fp_engine.py stats
+
+تغییرات این نسخه (API همان قبلی است، چیزی در bot.py یا seed_fp.py عوض نمی‌شود):
+    * اسم‌ها تمیز می‌شوند ("Red Wine ~ Music-Fa.Com" -> "Red Wine"، "[128]" و "<unknown>" حذف)
+    * یک آهنگ با دو شکل اسم ("Haydeh/Reza Parsa" و "Reza Parsa") یک ردیف می‌شود
+      (ریمیکس / اسلو با اسم جدا باقی می‌مانند، چون صدایشان فرق دارد)
+    * add_track دوباره هش اضافه نمی‌کند (قبلاً دو بار add-dir هش‌ها را دو برابر می‌کرد)
+    * در recognize، همان آهنگ با اسم دیگر دیگر «رقیب» حساب نمی‌شود
 """
 import argparse
 import os
+import re
 import sqlite3
 import subprocess
 import time
+import unicodedata
 from collections import defaultdict
 
 import numpy as np
@@ -30,10 +39,51 @@ PEAK_NEIGHBORHOOD = (20, 20)   # (فرکانس، زمان) برای پیدا ک�
 PEAK_DB_BELOW_MAX = 45     # قله‌های ضعیف‌تر از (حداکثر - این مقدار dB) حذف میشن
 FAN_OUT = 10               # هر قله با چند قله بعدی جفت میشه
 MIN_DT, MAX_DT = 1, 200    # بازه مجاز فاصله زمانی جفت (فریم)
-MIN_ALIGNED = 8            # حداقل تعداد هش هم‌راستا برای قبول نتیجه
+MIN_ALIGNED = int(os.environ.get("FP_MIN_ALIGNED", "8"))   # حداقل تعداد هش هم‌راستا برای قبول نتیجه
 MIN_RATIO = 1.5            # نسبت امتیاز اول به دوم
 LEARN_SKIP_SCORE = 40      # اگه تشخیص محلی از این قوی‌تر بود، یاد نگیر (جلوگیری از تکرار)
 DB_PATH = os.environ.get("FP_DB", "fingerprints.db")
+
+
+# ---------------- اسم‌ها ----------------
+_DOMAIN = re.compile(r"\s*[~|\-\u2013]*\s*\b(?:www\.)?[\w-]+\.(?:com|ir|net|org|info|co)\b", re.I)
+_JUNK = re.compile(r"\[\s*\d{2,3}\s*(?:kbps)?\s*\]|<unknown>|\(\s*official[^)]*\)|\s*-\s*topic$", re.I)
+_SPLIT = re.compile(r"\s+(?:feat\.?|featuring|ft\.?|with|x|and|و)\s+|\s*[,&;/+،]\s*", re.I)
+
+
+def clean_name(s: str) -> str:
+    """'Red Wine ~ Music-Fa.Com' -> 'Red Wine', 'Song [128]' -> 'Song', '<unknown>' -> ''."""
+    s = (s or "").replace("_", " ")
+    s = _JUNK.sub(" ", s)
+    s = _DOMAIN.sub(" ", s)
+    s = re.sub(r"\s*~\s*[\w-]+\s*$", "", s)
+    return re.sub(r"\s+", " ", s).strip(" -~|")
+
+
+def _fold(s: str) -> str:
+    s = (s or "").lower().replace("ي", "ی").replace("ك", "ک")
+    s = unicodedata.normalize("NFKD", s)
+    return "".join(ch for ch in s if not unicodedata.combining(ch))
+
+
+def _tkey(title: str) -> str:
+    # NOT stripping brackets on purpose: "Raaze del (SlowRemix)" is another recording than "Raaze del"
+    return re.sub(r"[\W_]+", "", _fold(clean_name(title)))
+
+
+def _akeys(artist: str) -> set:
+    keys = {re.sub(r"[\W_]+", "", _fold(p)) for p in _SPLIT.split(clean_name(artist)) if p and p.strip()}
+    keys.discard("")
+    keys.discard("unknown")
+    return keys
+
+
+def _same_artist(a: set, b: set) -> bool:
+    if not a or not b:
+        return False
+    if a & b:
+        return True
+    return any(x in y or y in x for x in a for y in b if len(x) >= 4 and len(y) >= 4)
 
 
 # ---------------- صدا -> نمونه‌ها ----------------
@@ -125,14 +175,22 @@ class FingerprintDB:
         self.conn.commit()
 
     def get_or_create_track(self, title, artist, source="manual") -> int:
+        title = clean_name(title) or (title or "").strip()
+        artist = clean_name(artist) or (artist or "").strip() or "Unknown"
         row = self.conn.execute(
             "SELECT id FROM tracks WHERE lower(title)=lower(?) AND lower(artist)=lower(?)",
-            (title.strip(), artist.strip())).fetchone()
+            (title, artist)).fetchone()
         if row:
             return row[0]
+        # same recording under another spelling of the name / singers -> the same track
+        tk, ak = _tkey(title), _akeys(artist)
+        if tk:
+            for tid, t, a in self.conn.execute("SELECT id, title, artist FROM tracks").fetchall():
+                if _tkey(t) == tk and _same_artist(ak, _akeys(a)):
+                    return tid
         cur = self.conn.execute(
             "INSERT INTO tracks(title, artist, source, added_at) VALUES(?,?,?,?)",
-            (title.strip(), artist.strip(), source, int(time.time())))
+            (title, artist, source, int(time.time())))
         self.conn.commit()
         return cur.lastrowid
 
@@ -176,6 +234,14 @@ class Engine:
         if not hashes:
             raise ValueError("no fingerprints extracted (file too short or silent)")
         tid = self.db.get_or_create_track(title, artist, source)
+        if source == "manual":
+            conn = self.db.conn
+            src, n = conn.execute("SELECT source, n_hashes FROM tracks WHERE id=?", (tid,)).fetchone()
+            if n > 0 and src in ("manual", "verified"):
+                return tid  # already stored completely: do not double the hashes
+            conn.execute("DELETE FROM fingerprints WHERE track_id=?", (tid,))  # replace clip-only hashes
+            conn.execute("UPDATE tracks SET source='manual', n_hashes=0 WHERE id=?", (tid,))
+            conn.commit()
         self.db.add_hashes(tid, hashes)
         return tid
 
@@ -218,12 +284,19 @@ class Engine:
                 best[tid] = s
         ranked = sorted(best.items(), key=lambda x: x[1], reverse=True)
         top_tid, top_score = ranked[0]
-        second = ranked[1][1] if len(ranked) > 1 else 0
+        top_title, top_artist = self.db.track_info(top_tid)
+        top_tk, top_ak = _tkey(top_title), _akeys(top_artist)
+        second = 0
+        for tid, sc in ranked[1:]:  # the same recording under another spelling is not a rival
+            t, a = self.db.track_info(tid)
+            if _tkey(t) == top_tk and (_same_artist(top_ak, _akeys(a)) or not top_ak or not _akeys(a)):
+                continue
+            second = sc
+            break
 
         if top_score < MIN_ALIGNED or top_score < MIN_RATIO * max(second, 1):
             return None
-        title, artist = self.db.track_info(top_tid)
-        return {"track_id": top_tid, "title": title, "artist": artist,
+        return {"track_id": top_tid, "title": top_title, "artist": top_artist,
                 "score": top_score,
                 "confidence": round(top_score / (top_score + second + 10), 2)}
 
@@ -234,8 +307,8 @@ class Engine:
         """
         existing = self.recognize(path)
         if (existing and existing["score"] >= LEARN_SKIP_SCORE
-                and existing["title"].lower() == title.strip().lower()
-                and existing["artist"].lower() == artist.strip().lower()):
+                and _tkey(existing["title"]) == _tkey(title)
+                and _same_artist(_akeys(existing["artist"]), _akeys(artist))):
             return False
         self.add_track(path, title, artist, source=source)
         return True
