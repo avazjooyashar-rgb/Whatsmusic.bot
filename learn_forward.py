@@ -6,10 +6,15 @@ Usage in Telegram (only the owner):
     /learn off   -> normal behaviour again
 A summary with the learned names is sent after you stop forwarding.
 
-NAMES: channel tags are often broken ("To Aziz Delami To Chesmat ~ UpMusic"), so a 20 s piece of every song is
-also sent to Shazam and ITS name is stored. The tag name is used only when Shazam does not know the song (marked
-with ⚠️ in the summary) or when the tag says remix / slowed / sped up (those are kept on purpose).
-Set LEARN_USE_SHAZAM=0 to always use the tags.
+NAMES: channel tags are often broken ("To Aziz Delami To Chesmat ~ UpMusic", artist "@musyone"), so
+  * @handles and t.me links are removed from tags,
+  * a 20 s piece of every song is sent to Shazam and ITS name is stored. The tag name is used only when Shazam does
+    not know the song (marked with ⚠️ in the summary) or when the tag says remix / slowed / sped up.
+  Set LEARN_USE_SHAZAM=0 to always use the tags.
+
+AUDIO: the Telegram file_id of the forwarded audio (a short string, NOT the file) is saved in the bot's song cache, so
+  when this song is recognised the bot sends your channel's own file instead of searching YouTube (remixes that exist
+  only in your channel can then be sent too). Only for messages sent as audio, not as documents.
 
 Hook it into bot.py (apply_learn_patch.py does it):
     import learn_forward
@@ -17,14 +22,16 @@ Hook it into bot.py (apply_learn_patch.py does it):
 
 Who may teach the bot: LEARN_OWNER_ID (comma separated ids) if set, otherwise ADMIN_IDS from the env.
 Bots cannot download files bigger than 20 MB: those are reported as failed.
+Files shorter than LEARN_MIN_SEC (default 60) or longer than LEARN_MAX_SEC (default 720) are skipped.
 """
 import asyncio
 import logging
 import os
 import re
-import subprocess
-import tempfile
 import shutil
+import subprocess
+import sys
+import tempfile
 
 from telegram import Update
 from telegram.ext import (ApplicationHandlerStop, CommandHandler, ContextTypes,
@@ -51,10 +58,16 @@ MAX_NAMES = 25     # names listed in one summary
 
 # versions the owner put in the channel on purpose: keep their tag name, Shazam would name the original
 _KEEP_TAG = re.compile(r"remix|slowed|sped\s?up|speed\s?up|reverb|nightcore|karaoke|ریمیکس|ریمیک|اسلو", re.I)
+_HANDLE = re.compile(r"@\w+|(?:https?://)?t\.me/\S+", re.I)
 
 _eng = None
 _sh = None
 _SEM = asyncio.Semaphore(2)  # bot.py runs with concurrent_updates: never process 50 forwards at once
+
+
+def _tidy(s: str) -> str:
+    """Remove @handles / t.me links left in a tag."""
+    return re.sub(r"\s+", " ", _HANDLE.sub(" ", s or "")).strip(" -~|")
 
 
 def _engine() -> Engine:
@@ -70,6 +83,23 @@ def _learn(path: str, title: str, artist: str) -> int:
     if not hashes:
         raise ValueError("no fingerprints (silent / too short)")
     return _engine().ingest_verified(hashes, title, artist or "Unknown")
+
+
+def _bot_module():
+    """bot.py itself (it runs as __main__): its song cache is used to remember the channel's file."""
+    for name in ("__main__", "bot"):
+        m = sys.modules.get(name)
+        if m is not None and hasattr(m, "song_keys") and hasattr(m, "cache_put"):
+            return m
+    return None
+
+
+def _remember_file(file_id: str, title: str, artist: str):
+    m = _bot_module()
+    if not m or not file_id:
+        return
+    for k in m.song_keys({"title": title, "artist": artist}):
+        m.cache_put(k, file_id, title, None)
 
 
 def _cut(src: str, out: str, dur: int):
@@ -101,17 +131,17 @@ async def shazam_name(path: str, dur: int):
     return None
 
 
-async def _process(att, tmp: str):
+async def _process(att, tmp: str, file_id=None):
     """Returns (kind, label); kind is added / had / skipped / failed."""
     fname = getattr(att, "file_name", "") or ""
     dur = getattr(att, "duration", 0) or 0
     if dur and not (MIN_SEC <= dur <= MAX_SEC):
         return "skipped", ""
-    title = clean_name(getattr(att, "title", "") or "")
-    artist = clean_name(getattr(att, "performer", "") or "")
+    title = _tidy(clean_name(getattr(att, "title", "") or ""))
+    artist = _tidy(clean_name(getattr(att, "performer", "") or ""))
     if not title:
-        title, artist2 = name_from_file(fname)
-        artist = artist or artist2
+        t2, a2 = name_from_file(fname)
+        title, artist = _tidy(t2), artist or _tidy(a2)
     tgfile = await att.get_file()          # fails above 20 MB
     path = os.path.join(tmp, "a")
     await tgfile.download_to_drive(path)
@@ -127,7 +157,20 @@ async def _process(att, tmp: str):
     if artist.strip().lower() == title.strip().lower():
         artist = ""                        # broken tags: same text in both fields
     n = await asyncio.to_thread(_learn, path, title, artist)
-    label = f"{flag}{artist or 'Unknown'} - {title}"
+    name_t, name_a = title, artist or "Unknown"
+    if not n:                              # already known: use the name stored in the database
+        try:
+            r = await asyncio.to_thread(_engine().recognize, path)
+            if r and r.get("title"):
+                name_t, name_a = r["title"], r.get("artist") or "Unknown"
+        except Exception as e:
+            log.info("learn_forward: lookup of the stored name failed: %s", e)
+    if file_id:
+        try:
+            await asyncio.to_thread(_remember_file, file_id, name_t, name_a)
+        except Exception as e:
+            log.warning("learn_forward: saving file_id failed: %s", e)
+    label = f"{flag}{name_a} - {name_t}"
     return ("added" if n else "had"), label
 
 
@@ -168,12 +211,13 @@ async def on_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return  # normal recognition flow continues
     msg = update.effective_message
     att = msg.audio or msg.document
+    file_id = msg.audio.file_id if msg.audio else None   # only audio file_ids can be re-sent as audio
     stats = context.bot_data.setdefault(
         "learn_stats", {"added": 0, "had": 0, "skipped": 0, "failed": 0, "names": [], "errors": []})
     tmp = tempfile.mkdtemp(prefix="fwd_")
     try:
         async with _SEM:
-            kind, label = await _process(att, tmp)
+            kind, label = await _process(att, tmp, file_id)
     except Exception as e:
         kind, label = "failed", ""
         stats["errors"].append(f"{getattr(att, 'file_name', '') or msg.message_id}: {str(e)[:80]}")
@@ -181,7 +225,7 @@ async def on_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     stats[kind] += 1
-    if label and kind == "added":
+    if label and kind in ("added", "had"):
         stats["names"].append(label)
     task = context.bot_data.get("learn_task")
     if task and not task.done():
