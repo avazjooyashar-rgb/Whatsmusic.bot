@@ -32,6 +32,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 
 from telegram import Update
 from telegram.ext import (ApplicationHandlerStop, CommandHandler, ContextTypes,
@@ -62,6 +63,7 @@ _HANDLE = re.compile(r"@\w+|(?:https?://)?t\.me/\S+", re.I)
 
 _eng = None
 _sh = None
+_DB_LOCK = threading.Lock()  # one SQLite connection: never use it from two threads at once
 _SEM = asyncio.Semaphore(2)  # bot.py runs with concurrent_updates: never process 50 forwards at once
 
 
@@ -82,7 +84,13 @@ def _learn(path: str, title: str, artist: str) -> int:
     hashes = fingerprint_file(path)
     if not hashes:
         raise ValueError("no fingerprints (silent / too short)")
-    return _engine().ingest_verified(hashes, title, artist or "Unknown")
+    with _DB_LOCK:
+        return _engine().ingest_verified(hashes, title, artist or "Unknown")
+
+
+def _lookup(path: str):
+    with _DB_LOCK:
+        return _engine().recognize(path)
 
 
 def _bot_module():
@@ -160,7 +168,7 @@ async def _process(att, tmp: str, file_id=None):
     name_t, name_a = title, artist or "Unknown"
     if not n:                              # already known: use the name stored in the database
         try:
-            r = await asyncio.to_thread(_engine().recognize, path)
+            r = await asyncio.to_thread(_lookup, path)
             if r and r.get("title"):
                 name_t, name_a = r["title"], r.get("artist") or "Unknown"
         except Exception as e:
