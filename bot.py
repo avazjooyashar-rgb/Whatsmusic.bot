@@ -6,7 +6,7 @@ Music recognition Telegram bot  -  v6 (accurate)
   * accuracy first: a result is accepted only when it is confirmed
     (two engines agree, or two different pieces of the audio agree) and has no close competitor
   * up to MAX_SAMPLES pieces of the clip / file are checked until a confirmed answer exists
-  * progress bar with a seconds counter under the clip button / voice message
+  * while recognizing: a fixed "identifying" text + the chat status at the top stays on until the song is found
   * quota is refunded when nothing is recognized or something crashes
 """
 import json, asyncio, sqlite3, datetime, os, re, tempfile, glob, time, hmac, hashlib, base64, uuid
@@ -344,11 +344,6 @@ def tr(lang: str, key: str, **kw) -> str:
 def lang_keyboard():
     btns = [Btn(label, callback_data=f"lang:{code}") for code, label in LANGS.items()]
     return Markup([btns[i:i + 2] for i in range(0, len(btns), 2)])
-
-
-def progress_text(label: str, s: int) -> str:
-    k = min(5, 1 + s // 4)
-    return f"{label}\n{'▰' * k}{'▱' * (5 - k)}  {s}s"
 
 
 # ======================================================================================
@@ -998,18 +993,148 @@ def odesli_to_youtube(link: str, timeout: int = 8):
     params = {"url": link}
     if ODESLI_KEY:
         params["key"] = ODESLI_KEY
-    r = HTTP.get("https://api.song.link/v1-alpha.1/links", params=params, timeout=timeout)
-    if not r.ok:
+    j = None
+    for attempt in range(2):
+        try:
+            r = HTTP.get("https://api.song.link/v1-alpha.1/links", params=params, timeout=timeout)
+            if r.ok:
+                j = r.json()
+                break
+            if r.status_code not in (429, 500, 502, 503, 504):
+                break
+        except (requests.RequestException, ValueError) as e:
+            log.warning("odesli request failed: %s", e)
+        if attempt == 0:
+            time.sleep(1)
+    if not isinstance(j, dict):
         return None, None
-    j = r.json()
-    plat = j.get("linksByPlatform", {})
+    plat = j.get("linksByPlatform") or {}
     yt = (plat.get("youtube") or plat.get("youtubeMusic") or {}).get("url")
-    ent = j.get("entitiesByUniqueId", {}).get(j.get("entityUniqueId"), {})
+    ent = (j.get("entitiesByUniqueId") or {}).get(j.get("entityUniqueId")) or {}
     name = f"{ent.get('artistName', '')} - {ent.get('title', '')}".strip(" -")
     if len(_ODESLI) > 500:
         _ODESLI.clear()
     _ODESLI[link] = (time.time(), (yt, name))
     return yt, name
+
+
+# --- Fallback without Odesli: read artist/title from the music page itself ---------------
+META_HOSTS = ("spotify.com", "spotify.link", "music.apple.com", "itunes.apple.com", "deezer.com",
+              "link.deezer.com", "deezer.page.link", "tidal.com", "music.amazon.com",
+              "pandora.com", "anghami.com", "napster.com", "audiomack.com")
+_META = {}
+_UA = {"User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+       "Accept-Language": "en-US,en;q=0.8"}
+_SITE_RE = r"(?:Spotify|Deezer|TIDAL|Apple Music|Amazon Music|Pandora|Anghami|Napster|Audiomack)"
+
+
+def _meta_tags(page: str) -> dict:
+    out = {}
+    for tag in re.findall(r"<meta\s[^>]*>", page, re.I):
+        attrs = {k.lower(): (a or b) for k, a, b in re.findall(r"([\w:-]+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)')", tag)}
+        key = attrs.get("property") or attrs.get("name")
+        if key and "content" in attrs:
+            out.setdefault(key.lower(), attrs["content"])
+    m = re.search(r"<title[^>]*>(.*?)</title>", page, re.I | re.S)
+    if m:
+        out.setdefault("title", m.group(1))
+    return out
+
+
+def _clean_meta(title: str, desc: str) -> str:
+    t = html.unescape(title or "").strip()
+    t = re.sub(r"^Listen to\s+", "", t, flags=re.I)
+    t = re.sub(r"\s*[|\u2022\u00b7-]\s*" + _SITE_RE + r"\b.*$", "", t, flags=re.I)
+    t = re.sub(r"\s+on\s+" + _SITE_RE + r"\b.*$", "", t, flags=re.I)
+    t = re.sub(r"\s*-\s*(?:song|single|album|EP)\b(?:\s+and lyrics)?\s+by\s+", " ", t, flags=re.I)
+    t = re.sub(r"\s+", " ", t).strip(" -\u2013|")
+    d = html.unescape(desc or "").strip()
+    d = re.sub(r"^Listen to .*?\.\s+", "", d, flags=re.I)
+    artist = ""
+    for part in (x.strip() for x in d.split("\u00b7")):
+        if part and not re.fullmatch(r"(?i)song|single|album|ep|track|playlist|\d{4}", part) \
+                and part.lower() not in t.lower() and len(part) < 80:
+            artist = part
+            break
+    return f"{artist} - {t}".strip(" -") if artist else t
+
+
+def _fetch_page(url: str, timeout: int) -> str:
+    """GET with manual redirects; every hop must stay on a whitelisted music host."""
+    for _ in range(5):
+        if not url.lower().startswith("https://") or not host_in(url, META_HOSTS):
+            return ""
+        r = HTTP.get(url, headers=_UA, timeout=timeout, allow_redirects=False, stream=True)
+        try:
+            if r.is_redirect or r.status_code in (301, 302, 303, 307, 308):
+                nxt = r.headers.get("Location") or ""
+                url = requests.compat.urljoin(url, nxt)
+                continue
+            if not r.ok:
+                return ""
+            raw = b""
+            for chunk in r.iter_content(65536):
+                raw += chunk
+                if len(raw) > 600_000:
+                    break
+            return raw.decode(r.encoding or "utf-8", errors="replace")
+        finally:
+            r.close()
+    return ""
+
+
+def _apple_name(link: str, timeout: int) -> str:
+    u = urlparse(link)
+    q = parse_qs(u.query)
+    parts = [x for x in u.path.split("/") if x]
+    tid = (q.get("i") or [None])[0] or next((x for x in reversed(parts) if x.isdigit()), None)
+    if not tid:
+        return ""
+    cc = parts[0] if parts and re.fullmatch(r"[a-z]{2}", parts[0]) else "us"
+    r = HTTP.get("https://itunes.apple.com/lookup", params={"id": tid, "country": cc}, timeout=timeout)
+    if not r.ok:
+        return ""
+    res = (r.json().get("results") or [None])[0] or {}
+    return f"{res.get('artistName', '')} - {res.get('trackName') or res.get('collectionName') or ''}".strip(" -")
+
+
+def link_meta_name(link: str, timeout: int = 8) -> str:
+    """Artist - title for a streaming link without Odesli (iTunes lookup / og tags). '' if unknown."""
+    hit = _META.get(link)
+    if hit and time.time() - hit[0] < 3600:
+        return hit[1]
+    if not host_in(link, META_HOSTS):
+        return ""
+    path = urlparse(link).path
+    if host_in(link, ("spotify.com",)) and re.match(r"/(?:intl-[a-z]+/)?(?:artist|playlist|user|show|episode)/", path):
+        return ""
+    name = ""
+    if host_in(link, ("music.apple.com", "itunes.apple.com")):
+        name = _apple_name(link, timeout)
+    if not name:
+        tags = _meta_tags(_fetch_page(link, timeout))
+        name = _clean_meta(tags.get("og:title") or tags.get("twitter:title") or tags.get("title"),
+                           tags.get("og:description") or tags.get("description"))
+    if len(_META) > 500:
+        _META.clear()
+    if name:
+        _META[link] = (time.time(), name)
+    return name
+
+
+def link_to_youtube(link: str, timeout: int = 8):
+    """Odesli first; if it fails or finds nothing, fall back to reading the page. -> (yt_url|None, name|None)"""
+    try:
+        yt, name = odesli_to_youtube(link, timeout=timeout)
+        if yt or name:
+            return yt, name
+    except Exception as e:
+        log.warning("odesli failed: %s", e)
+    try:
+        return None, (link_meta_name(link, timeout=timeout) or None)
+    except Exception as e:
+        log.warning("link meta failed: %s", e)
+        return None, None
 
 
 def pick_target(song: dict) -> str:
@@ -1020,7 +1145,7 @@ def pick_target(song: dict) -> str:
         return link
     if link:
         try:
-            yt, _ = odesli_to_youtube(link, timeout=3)
+            yt, _ = link_to_youtube(link, timeout=4)
             if yt and host_in(yt, ("youtube.com", "youtu.be")):
                 return yt
         except Exception:
@@ -1419,9 +1544,9 @@ async def send_results(msg, query: str, lang: str):
 def resolve(text: str):
     url = first_url(text)
     if url:
-        if host_in(url, DIRECT_HOSTS):
+        if host_in(url, DIRECT_HOSTS) or host_in(url, ("soundcloud.com",)):
             return url, None
-        yt, name = odesli_to_youtube(url, timeout=20)
+        yt, name = link_to_youtube(url, timeout=20)
         if not yt and not name:
             raise ValueError("unsupported link")
         return (yt or f"ytsearch1:{name}"), name
@@ -2205,33 +2330,21 @@ async def do_clip(msg, url: str):
             await asyncio.gather(samples_task, quick_task, return_exceptions=True)
 
 
-async def tick_button(q, entry, lang: str):
-    """Progress bar with a seconds counter on the button, until the song name is known."""
-    t0 = time.time()
-    while not (entry.get("song") or entry["task"].done()):
-        s = int(time.time() - t0)
-        k = min(5, 1 + s // 4)
-        try:
-            await q.edit_message_reply_markup(reply_markup=Markup(
-                [[Btn(f"⏳ {'▰' * k}{'▱' * (5 - k)}  {s}s", callback_data="noop:")]]))
-        except Exception:
-            pass
-        await asyncio.sleep(2)
-
-
 async def show_prepared(q, sid: str, entry: dict, lang: str):
-    """The user tapped 'identify': show the progress bar, then the result as soon as the name is known."""
+    """The user tapped 'identify': show a fixed 'identifying' text, then the result as soon as the name is known."""
     if entry.get("used"):
         return await q.answer()
     await q.answer(tr(lang, "wait_toast"))
     task = entry["task"]
-    ticker = asyncio.create_task(tick_button(q, entry, lang))
+    try:  # one fixed "identifying" text on the button (no counter)
+        await q.edit_message_reply_markup(reply_markup=Markup(
+            [[Btn(tr(lang, "identifying"), callback_data="noop:")]]))
+    except Exception:
+        pass
     t0 = time.time()
-    try:
+    async with chat_action(q.get_bot(), q.message.chat_id):  # status at the top of the chat stays on until found
         while not (entry.get("song") or task.done()) and time.time() - t0 < 240:
             await asyncio.sleep(0.3)
-    finally:
-        ticker.cancel()
     res = task.result() if task.done() and not task.cancelled() else {}
     song = entry.get("song") or res.get("song")
     if not song:
@@ -2307,23 +2420,10 @@ async def handle_media(msg, media, lang: str):
                     os.replace(raw, fallback)
                     outs = [fallback]
                 await asyncio.to_thread(add_sample, sid, outs[0])
-                status = await msg.reply_text(progress_text(tr(lang, "identifying"), 0))
-
-                async def tick():
-                    t0 = time.time()
-                    while True:
-                        await asyncio.sleep(2)
-                        s = int(time.time() - t0)
-                        try:
-                            await status.edit_text(progress_text(tr(lang, "identifying"), s))
-                        except Exception:
-                            pass
-
-                ticker = asyncio.create_task(tick())
+                status = await msg.reply_text(tr(lang, "identifying"))
                 try:
                     song = await asyncio.to_thread(recognize, outs)
                 finally:
-                    ticker.cancel()
                     try:
                         await status.delete()
                     except Exception:
@@ -2570,7 +2670,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await on_lyrics(q, data)
     if data.startswith("lang:"):
         return await on_lang_button(q, data)
-    await q.answer()  # "noop:" (progress button) ends up here
+    await q.answer()  # "noop:" (the fixed identifying button) ends up here
 
 
 # ======================================================================================
