@@ -1,9 +1,11 @@
 """
-Music recognition Telegram bot  -  v5 (fast)
+Music recognition Telegram bot  -  v6 (accurate)
 
   * own fingerprint DB (fp_engine) is asked FIRST: free and instant
-  * ACRCloud + Shazam are the online engines; AudD is optional (off by default)
-  * answer is accepted as soon as ONE good engine answers (no long waiting for the slow one)
+  * ACRCloud + Shazam are the ONLY online engines (AudD removed)
+  * accuracy first: a result is accepted only when it is confirmed
+    (two engines agree, or two different pieces of the audio agree) and has no close competitor
+  * up to MAX_SAMPLES pieces of the clip / file are checked until a confirmed answer exists
   * progress bar with a seconds counter under the clip button / voice message
   * quota is refunded when nothing is recognized or something crashes
 """
@@ -54,24 +56,22 @@ BOT_USERNAME = os.environ.get("BOT_USERNAME", "Whatsmuziccbot").lstrip("@")
 ACR_HOST = os.environ.get("ACR_HOST")
 ACR_KEY = os.environ.get("ACR_KEY")
 ACR_SECRET = os.environ.get("ACR_SECRET")
-AUDD_TOKEN = os.environ.get("AUDD_TOKEN")
 ODESLI_KEY = os.environ.get("ODESLI_KEY")  # optional
 ENGINE_ORDER = os.environ.get("ENGINES", "acr,shazam").split(",")
 PRIMARY_ENGINES = ("acr", "shazam")
-BACKUP_ENGINES = ("audd",)  # only used if an AudD account exists
 COOLDOWN_SEC = int(os.environ.get("COOLDOWN_SEC", str(6 * 3600)))
-AUDD_SEC = int(os.environ.get("AUDD_SEC", "12"))
 LYRICS_ENGINE = os.environ.get("LYRICS_ENGINE", "1") == "1"
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")
 WHISPER_WAIT = int(os.environ.get("WHISPER_WAIT", "25"))
 HUM_MIN_SCORE = int(os.environ.get("HUM_MIN_SCORE", "30"))
-MAX_SAMPLES = max(int(os.environ.get("MAX_SAMPLES", "7")), 7)
+MAX_SAMPLES = max(int(os.environ.get("MAX_SAMPLES", "10")), 10)
+# STRICT=1: if the best answer is still not confirmed after all pieces, say "not found" instead of guessing
+STRICT = os.environ.get("STRICT", "0") == "1"
 DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "20"))
 RATE_LIMIT = int(os.environ.get("RATE_LIMIT", "10"))
 DL_CONCURRENCY = int(os.environ.get("DL_CONCURRENCY", "4"))
 ENGINE_THREADS = int(os.environ.get("ENGINE_THREADS", "12"))
-ENGINE_TIMEOUT = int(os.environ.get("ENGINE_TIMEOUT", "20"))  # max wait for one batch of engine answers
-GRACE_SEC = float(os.environ.get("GRACE_SEC", "4"))  # after the first answer, wait at most this long for the other engine
+ENGINE_TIMEOUT = int(os.environ.get("ENGINE_TIMEOUT", "30"))  # max wait for one batch of engine answers
 CLIP_MAX_SEC = int(os.environ.get("CLIP_MAX_SEC", "900"))
 MAX_SRC_SEC = int(os.environ.get("MAX_SRC_SEC", str(3 * 3600)))
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
@@ -483,6 +483,8 @@ def same_song(a: dict, b: dict) -> bool:
     ta, tb = title_key(a.get("title")), title_key(b.get("title"))
     if not ta or not tb:
         return False
+    if title_penalty(a) != title_penalty(b):  # original vs remix / cover / live are different songs
+        return False
     if ta != tb:
         short, long_ = sorted((ta, tb), key=len)
         if not (len(short) >= 6 and long_.startswith(short)):
@@ -543,6 +545,8 @@ def migrate():
             cols = [r[1] for r in c.execute(f"PRAGMA table_info({table})")]
             if col not in cols:
                 c.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
+        # AudD is not used anymore: drop its old accounts
+        c.execute("DELETE FROM accounts WHERE type='audd'")
 
 
 def seed_from_env():
@@ -551,8 +555,6 @@ def seed_from_env():
             return
         if all([ACR_HOST, ACR_KEY, ACR_SECRET]):
             c.execute("INSERT INTO accounts(type,host,key,secret) VALUES('acr',?,?,?)", (ACR_HOST, ACR_KEY, ACR_SECRET))
-        if AUDD_TOKEN:
-            c.execute("INSERT INTO accounts(type,key) VALUES('audd',?)", (AUDD_TOKEN,))
 
 
 def get_setting(k, default=None):
@@ -818,39 +820,56 @@ def local_identify(paths):
     NOTE: fp_engine.identify(path) must return {"title","artist"[,"link","yt"]} or None."""
     if not fp_engine:
         return None
-    for p in paths[:3]:
+    use = paths[:3]
+    found = []
+    for p in use:
         try:
             r = fp_engine.identify(p)  # <- change the function name here if yours differs
         except Exception as e:
             log.warning("local fp failed: %s", e)
             continue
         if r and r.get("title"):
-            return {"title": r["title"], "artist": r.get("artist") or "",
-                    "link": r.get("link"), "yt": r.get("yt"), "engine": "local#0"}
+            found.append({"title": r["title"], "artist": r.get("artist") or "",
+                          "link": r.get("link"), "yt": r.get("yt"), "engine": "local#0"})
+    # a single loose hit is not trusted when several pieces were asked: two pieces must agree
+    need = 2 if len(use) >= 2 else 1
+    for f in found:
+        if sum(1 for g in found if same_song(f, g)) >= need:
+            return f
     return None
 
 
 def quick_local(src: str, sid: str):
-    """Cuts ONE short raw piece from the start and asks the local DB. Needs no quota, no engines."""
+    """Asks the local DB with two different raw pieces (start + middle) and accepts the answer only if both
+    agree. Very short sources use one piece. Needs no quota, no engines."""
     if not fp_engine:
         return None
-    out = os.path.join(SAMPLES_DIR, f"{sid}_q.mp3")
+    d = probe_duration(src)
+    starts = [0] if d < 30 else [0, max(0, d / 2 - 6)]
+    outs, found = [], []
     try:
-        if not cut_sample(src, out, 0, 12, True):
+        for i, st in enumerate(starts):
+            out = os.path.join(SAMPLES_DIR, f"{sid}_q{i}.mp3")
+            outs.append(out)
+            found.append(local_identify([out]) if cut_sample(src, out, st, 12, True) else None)
+        if not found or any(f is None for f in found):
             return None
-        return local_identify([out])
+        if len(found) > 1 and not same_song(found[0], found[1]):
+            return None
+        return found[0]
     except Exception as e:
         log.warning("quick local failed: %s", e)
         return None
     finally:
-        try:
-            os.remove(out)
-        except OSError:
-            pass
+        for out in outs:
+            try:
+                os.remove(out)
+            except OSError:
+                pass
 
 
 # ======================================================================================
-# Engines: ACRCloud, AudD, Shazam
+# Engines: ACRCloud, Shazam
 # ======================================================================================
 def _hum_score(h: dict) -> float:
     s = h.get("score") or 0
@@ -904,66 +923,35 @@ def acr_identify(path: str, acc):
             return top
         log.info("acr: no music match (metadata keys: %s)", list(md.keys()))
         return None
-    m = music[0]
-    ext = m.get("external_metadata", {})
-    link = None
-    yt = None
-    if ext.get("spotify", {}).get("track", {}).get("id"):
-        link = "https://open.spotify.com/track/" + ext["spotify"]["track"]["id"]
-    if ext.get("youtube", {}).get("vid"):
-        yt = "https://www.youtube.com/watch?v=" + ext["youtube"]["vid"]
-        link = link or yt
-    artist = ", ".join(a["name"] for a in (m.get("artists") or []) if a.get("name"))
-    return {"title": m["title"], "artist": artist, "link": link, "yt": yt}
-
-
-def _audd_check(r: dict):
-    err = r.get("error") or {}
-    code = err.get("error_code")
-    if code in (900, 901, 902):
-        raise QuotaError(f"audd {code}: {err.get('error_message', '')}")
-
-
-def _trim_for_audd(path: str, sec: int):
-    fd, out = tempfile.mkstemp(suffix=".mp3", dir=SAMPLES_DIR)
-    os.close(fd)
-    try:
-        subprocess.run(["ffmpeg", "-y", "-i", path, "-t", str(sec), "-vn", "-ac", "1", "-b:a", "96k", out],
-                       check=True, capture_output=True, timeout=60)
-        return out
-    except Exception:
+    cands = []
+    for m in music[:3]:
+        if not m.get("title"):
+            continue
+        ext = m.get("external_metadata", {})
+        link = None
+        yt = None
+        if ext.get("spotify", {}).get("track", {}).get("id"):
+            link = "https://open.spotify.com/track/" + ext["spotify"]["track"]["id"]
+        if ext.get("youtube", {}).get("vid"):
+            yt = "https://www.youtube.com/watch?v=" + ext["youtube"]["vid"]
+            link = link or yt
+        artist = ", ".join(a["name"] for a in (m.get("artists") or []) if a.get("name"))
         try:
-            os.remove(out)
-        except OSError:
-            pass
+            sc = float(m.get("score"))
+        except (TypeError, ValueError):
+            sc = 100.0
+        cands.append({"title": m["title"], "artist": artist, "link": link, "yt": yt,
+                      "wmul": max(0.5, min(1.0, sc / 100.0))})
+    if not cands:
         return None
+    # the original (non remix / cover / live) result goes first, then ACR's own score order
+    cands.sort(key=lambda c: (title_penalty(c) < 1, -c["wmul"]))
+    top = cands[0]
+    top["more"] = [dict(c, wmul=c["wmul"] * 0.5) for c in cands[1:]]
+    return top
 
 
-def audd_identify(path: str, acc):
-    small = _trim_for_audd(path, AUDD_SEC)
-    try:
-        with open(small or path, "rb") as f:
-            r = HTTP.post(
-                "https://api.audd.io/",
-                data={"api_token": acc["key"], "return": "spotify,apple_music"},
-                files={"file": f},
-                timeout=40,
-            ).json()
-    finally:
-        if small:
-            try:
-                os.remove(small)
-            except OSError:
-                pass
-    _audd_check(r)
-    res = r.get("result")
-    if not res:
-        return None
-    link = (res.get("spotify") or {}).get("external_urls", {}).get("spotify") or res.get("song_link")
-    return {"title": res["title"], "artist": res["artist"], "link": link}
-
-
-ENGINE_FN = {"acr": acr_identify, "audd": audd_identify}
+ENGINE_FN = {"acr": acr_identify}
 
 
 def _shazam_lyrics_text(track: dict) -> str:
@@ -1324,9 +1312,10 @@ def loud_offsets(src: str, win: int, n: int = 2, maxsec: int = 600) -> list:
 
 
 def pick_offsets(src: str, d: float, win: int = 15) -> list:
+    """More pieces than before: accuracy matters more than speed."""
     if not d or d <= win + 3:
         return [0]
-    n = 3 if d <= 60 else 4 if d <= 300 else 6
+    n = 4 if d <= 60 else 6 if d <= 300 else 8
     loud = loud_offsets(src, win, 2, int(min(d, MAX_SRC_SEC)))
     even = [d * (k + 0.5) / n - win / 2 for k in range(n)]
     mid = even[n // 2]
@@ -1344,10 +1333,10 @@ def make_samples(src: str, sid: str) -> list:
     d = probe_duration(src)
     win = 15
     offs = pick_offsets(src, d, win)
-    jobs = [(os.path.join(SAMPLES_DIR, f"{sid}_{i}.mp3"), o, False) for i, o in enumerate(offs)]
-    jobs.append((os.path.join(SAMPLES_DIR, f"{sid}_r.mp3"), offs[0], True))
+    # RAW pieces only: filters like dynaudnorm change the audio and hurt fingerprint matching
+    jobs = [(os.path.join(SAMPLES_DIR, f"{sid}_{i}.mp3"), o) for i, o in enumerate(offs)]
     with ThreadPoolExecutor(max_workers=len(jobs)) as ex:
-        res = list(ex.map(lambda j: j[0] if cut_sample(src, j[0], j[1], 20 if j[2] else win, j[2]) else None, jobs))
+        res = list(ex.map(lambda j: j[0] if cut_sample(src, j[0], j[1], win, True) else None, jobs))
     return [r for r in res if r]
 
 
@@ -1552,7 +1541,8 @@ def split_text(t: str, n: int = 4000) -> list:
 # ======================================================================================
 # Recognition: voting between engines
 # ======================================================================================
-ENGINE_W = {"acr": 1.0, "shazam": 1.0, "audd": 0.9, "lyrics": 1.2}
+# lyrics weight is lower than ACR / Shazam: a text-only match must be confirmed by another vote
+ENGINE_W = {"acr": 1.0, "shazam": 1.0, "lyrics": 0.8}
 META_W = 0.6
 
 
@@ -1578,12 +1568,6 @@ def _active_engines(skip, names=None) -> list:
     return jobs
 
 
-def _audd_accounts() -> list:
-    with db() as c:
-        rows = c.execute("SELECT * FROM accounts WHERE enabled=1 AND type='audd' ORDER BY id").fetchall()
-    return [r for r in rows if not cooling(r["id"])]
-
-
 def call_engine(name: str, accs, path: str):
     if name == "shazam":
         for attempt in (1, 2):
@@ -1596,7 +1580,7 @@ def call_engine(name: str, accs, path: str):
             except Exception as e:
                 log.warning("shazam failed (try %s): %s", attempt, e)
         return None
-    attempts = 1 if name == "audd" else 2
+    attempts = 2
     for r in accs:
         tag = f'{name}#{r["id"]}'
         for attempt in range(1, attempts + 1):
@@ -1651,11 +1635,16 @@ def _group(hits: list) -> list:
 
 
 def _confident(ranked: list) -> bool:
-    """One clean answer from ACR / Shazam is enough (score >= 0.95); humming matches are weaker and
-    still need a second vote. Mashup / remix-like titles never stop the search early."""
-    if not ranked or ranked[0]["bad"]:
+    """Accuracy first. The top answer must be confirmed (two engines agree, or two different pieces of
+    the audio agree), must not look like a remix / mashup, and must have no close competitor.
+    A single answer from one engine on one piece is never enough."""
+    if not ranked or ranked[0]["bad"] or not ranked[0]["solid"]:
         return False
-    return ranked[0]["solid"] or ranked[0]["score"] >= 0.95
+    if len(ranked) > 1:
+        second = ranked[1]
+        if second["solid"] or second["score"] >= ranked[0]["score"] * 0.7:
+            return False
+    return True
 
 
 # ---------- Last resort: what the singer says ----------
@@ -1697,43 +1686,6 @@ def lyric_overlap(words, lyrics: str) -> float:
         return 0.0
     lw = set(re.findall(r"\w+", _fold(lyrics)))
     return len(ws & lw) / len(ws)
-
-
-def audd_find_lyrics(words, acc):
-    q = " ".join(words[:40])
-    r = HTTP.get("https://api.audd.io/findLyrics/", params={"q": q, "api_token": acc["key"]},
-                 timeout=30).json()
-    _audd_check(r)
-    for it in (r.get("result") or [])[:3]:
-        if not (it.get("title") and it.get("artist")):
-            continue
-        lyrics = it.get("lyrics")
-        if not lyrics:
-            try:
-                lyrics = get_lyrics(it["artist"], it["title"])
-            except Exception:
-                lyrics = None
-        if lyrics and lyric_overlap(words, lyrics) < 0.35:
-            continue
-        return {"title": it["title"], "artist": it["artist"], "link": it.get("song_link")}
-    return None
-
-
-def _audd_lyrics_try(words):
-    for acc in _audd_accounts():
-        try:
-            res = audd_find_lyrics(words, acc)
-            with db() as c:
-                c.execute("UPDATE accounts SET uses=uses+1 WHERE id=?", (acc["id"],))
-            return res
-        except QuotaError as e:
-            cool_down(acc["id"], str(e))
-        except Exception as e:
-            log.warning("audd findLyrics failed: %s", e)
-            with db() as c:
-                c.execute("UPDATE accounts SET errors=errors+1 WHERE id=?", (acc["id"],))
-            break
-    return None
 
 
 def _parse_yt_title(title: str, channel: str):
@@ -1793,27 +1745,21 @@ def lyrics_identify(paths):
     if len(words) < 6:
         return None
     best = max(texts, key=len)
-    res = yt_lyrics_search(re.findall(r"\w+", best.lower()) or words)
-    if res:
-        return res
-    if len(words) >= 12:
-        return _audd_lyrics_try(words)
-    return None
+    return yt_lyrics_search(re.findall(r"\w+", best.lower()) or words)
 
 
 def find_song_by_words(words):
-    res = yt_lyrics_search(words)
-    if res:
-        return res
-    return _audd_lyrics_try(words)
+    return yt_lyrics_search(words)
 
 
 def recognize(paths, skip=(), extra=None):
-    """Order:
+    """Order (accuracy first):
     0) own fingerprint DB (free, instant)
-    1) ACRCloud + Shazam together; the first clean answer ends the vote (GRACE_SEC for the slower one)
-    2) more pieces if not sure, 3) AudD only if configured, 4) lyrics, 5) slowed / sped-up copies.
-    The result has an "alts" list with the runner-up answers."""
+    1) ACRCloud + Shazam on every piece, batch by batch (2, 2, 3, 3 pieces). A batch is always finished
+       completely, then the vote is checked; the next batch runs only while the answer is not confirmed
+    2) lyrics (what the singer says) as an extra vote, 3) slowed / sped-up copies as the last try.
+    The result has an "alts" list with the runner-up answers.
+    STRICT=1: an unconfirmed answer is dropped ("not found") instead of being guessed."""
     if isinstance(paths, str):
         paths = [paths]
     skip = tuple(skip)
@@ -1847,36 +1793,29 @@ def recognize(paths, skip=(), extra=None):
                          "w": base_w * mo.get("wmul", 0.5)})
 
     def run_batch(batch, jobs):
+        """Runs every engine on every piece of the batch and waits for ALL answers (up to ENGINE_TIMEOUT)."""
         futs = {ENGINE_POOL.submit(call_engine, name, accs, p): (name, idx)
                 for idx, p in batch for name, accs in jobs}
         if not futs:
             return
         pending = set(futs)
         deadline = time.time() + ENGINE_TIMEOUT
-        first = None  # time of the first real answer
-        while pending:
-            now = time.time()
-            if now >= deadline or (first and now - first > GRACE_SEC):
-                break
-            done, pending = wait(pending, timeout=min(deadline - now, 1.0), return_when=FIRST_COMPLETED)
-            n0 = len(hits)
+        while pending and time.time() < deadline:
+            done, pending = wait(pending, timeout=min(deadline - time.time(), 1.0),
+                                 return_when=FIRST_COMPLETED)
             for f in done:
                 name, idx = futs[f]
                 try:
                     absorb(name, idx, f.result())
                 except Exception as e:
                     log.warning("engine %s crashed: %s", name, e)
-            if len(hits) > n0 and first is None:
-                first = time.time()
-            if _confident(_group(hits)):
-                break
         for f in pending:
             f.cancel()
 
     pieces = list(enumerate(paths[:MAX_SAMPLES]))
     pos = 0
     ranked = _group(hits)
-    for size in (2, 2, 3):  # two pieces at once from the start: faster
+    for size in (2, 2, 3, 3):
         batch = pieces[pos:pos + size]
         pos += size
         if not batch:
@@ -1886,12 +1825,6 @@ def recognize(paths, skip=(), extra=None):
         if _confident(ranked):
             break
     ranked = _group(hits)
-
-    if pieces and not _confident(ranked):
-        backup = _active_engines(skip, BACKUP_ENGINES)
-        if backup:
-            run_batch(pieces[:1] if primary else pieces[:2], backup)
-            ranked = _group(hits)
 
     if LYRICS_ENGINE and "lyrics#0" not in skip and not _confident(ranked):
         try:
@@ -1903,7 +1836,7 @@ def recognize(paths, skip=(), extra=None):
         except Exception as e:
             log.warning("lyrics stage failed: %s", e)
 
-    if not ranked and paths and primary:
+    if not _confident(ranked) and paths and primary:
         try:
             vs = make_variants(paths[0])
             if vs:
@@ -1916,6 +1849,9 @@ def recognize(paths, skip=(), extra=None):
         return None
     log.info("recognize: %s", [(r["song"].get("title"), r["song"].get("artist"), round(r["score"], 2), r["solid"])
                                for r in ranked[:3]])
+    if STRICT and not ranked[0]["solid"]:
+        log.info("recognize: best answer is not confirmed, STRICT is on -> not found")
+        return None
     top = ranked[0]["song"]
     top["alts"] = [r["song"] for r in ranked[1:4]]
     return top
