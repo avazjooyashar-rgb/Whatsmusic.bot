@@ -1,7 +1,14 @@
 .env
+cookies.txt
 *.db
 *.db-wal
 *.db-shm
+*.bak*
+bot.py.before_*
+bot.py.server_backup
+bot_local.py
+apply_speed_patch.py
+samples/
 __pycache__/
 *.mp3
 *.ogg
