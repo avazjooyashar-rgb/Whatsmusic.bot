@@ -11,7 +11,9 @@ fp_engine.py - موتور تشخیص آهنگ (Audio Fingerprinting)
     python fp_engine.py recognize clip.ogg
     python fp_engine.py stats
 
-تغییرات این نسخه (API همان قبلی است، چیزی در bot.py یا seed_fp.py عوض نمی‌شود):
+تغییرات این نسخه (API همان قبلی است، چیزی در seed_fp.py عوض نمی‌شود):
+    * identify(path) اضافه شد: همان تابعی که bot.py صدا می‌زند (قبلاً وجود نداشت و دیتابیس محلی
+      در عمل کار نمی‌کرد). برای هر thread یک Engine جدا می‌سازد، چون sqlite بین threadها امن نیست.
     * اسم‌ها تمیز می‌شوند ("Red Wine ~ Music-Fa.Com" -> "Red Wine"، "[128]" و "<unknown>" حذف)
     * یک آهنگ با دو شکل اسم ("Haydeh/Reza Parsa" و "Reza Parsa") یک ردیف می‌شود
       (ریمیکس / اسلو با اسم جدا باقی می‌مانند، چون صدایشان فرق دارد)
@@ -23,6 +25,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import threading
 import time
 import unicodedata
 from collections import defaultdict
@@ -151,7 +154,7 @@ def best_alignment(song_hashes, clip_hashes) -> int:
 # ---------------- دیتابیس ----------------
 class FingerprintDB:
     def __init__(self, path: str = DB_PATH):
-        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.executescript("""
@@ -314,10 +317,32 @@ class Engine:
         return True
 
 
+# ---------------- API برای bot.py ----------------
+_TL = threading.local()
+
+
+def _thread_engine() -> Engine:
+    """One Engine (= one sqlite connection) per thread: the bot calls us from many threads at once."""
+    eng = getattr(_TL, "eng", None)
+    if eng is None:
+        eng = _TL.eng = Engine()
+    return eng
+
+
+def identify(path: str):
+    """The function bot.py calls (fp_engine.identify).
+    Returns {"title", "artist", "score", "confidence"} or None."""
+    r = _thread_engine().recognize(path)
+    if not r:
+        return None
+    return {"title": r["title"], "artist": r["artist"],
+            "score": r["score"], "confidence": r["confidence"]}
+
+
 # ---------------- اتصال به ربات ----------------
 def recognize_with_fallback(engine: Engine, path: str, external_recognizer):
     """
-    external_recognizer(path) -> (title, artist) یا None   (همون ACRCloud/AudD/Shazam خودت)
+    external_recognizer(path) -> (title, artist) یا None   (همون ACRCloud/Shazam خودت)
     اول دیتابیس خودمون؛ اگه نبود API؛ اگه API پیدا کرد، یاد می‌گیریم.
     برمی‌گرداند: (title, artist, source) یا None
     """
