@@ -1,12 +1,16 @@
 """
-Music recognition Telegram bot  -  v6 (accurate)
+Music recognition Telegram bot  -  v7 (accurate + fast)
 
   * own fingerprint DB (fp_engine) is asked FIRST: free and instant
-  * ACRCloud + Shazam are the ONLY online engines (AudD removed)
-  * accuracy first: a result is accepted only when it is confirmed
-    (two engines agree, or two different pieces of the audio agree) and has no close competitor
-  * up to MAX_SAMPLES pieces of the clip / file are checked until a confirmed answer exists
-  * while recognizing: a fixed "identifying" text + the chat status at the top stays on until the song is found
+  * ACRCloud + Shazam work TOGETHER: every piece of audio goes to both engines at the same time, the votes
+    are added up, and the answer is sent the moment it is confirmed (no waiting for slow pieces)
+  * a result is accepted only when it is confirmed (two engines agree, or two different pieces agree)
+    and has no close competitor
+  * the ORIGINAL file is downloaded: direct YouTube id from ACR first, otherwise YouTube results are
+    scored (title, artist, "- Topic" / VEVO / official channel, duration vs the real duration,
+    remix / live / cover / sped-up are rejected) and the best one is taken
+  * while recognizing: ONLY the status at the top of the chat (typing / recording...) stays on until the
+    song is found. Nothing is shown under the clip, for voice, clip link, lyrics text and song name
   * quota is refunded when nothing is recognized or something crashes
 """
 import json, asyncio, sqlite3, datetime, os, re, tempfile, glob, time, hmac, hashlib, base64, uuid
@@ -64,14 +68,14 @@ LYRICS_ENGINE = os.environ.get("LYRICS_ENGINE", "1") == "1"
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")
 WHISPER_WAIT = int(os.environ.get("WHISPER_WAIT", "25"))
 HUM_MIN_SCORE = int(os.environ.get("HUM_MIN_SCORE", "30"))
-MAX_SAMPLES = max(int(os.environ.get("MAX_SAMPLES", "10")), 10)
+MAX_SAMPLES = max(3, min(int(os.environ.get("MAX_SAMPLES", "10")), 12))
 # STRICT=1: if the best answer is still not confirmed after all pieces, say "not found" instead of guessing
 STRICT = os.environ.get("STRICT", "0") == "1"
 DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "20"))
 RATE_LIMIT = int(os.environ.get("RATE_LIMIT", "10"))
 DL_CONCURRENCY = int(os.environ.get("DL_CONCURRENCY", "4"))
 ENGINE_THREADS = int(os.environ.get("ENGINE_THREADS", "12"))
-ENGINE_TIMEOUT = int(os.environ.get("ENGINE_TIMEOUT", "30"))  # max wait for one batch of engine answers
+ENGINE_TIMEOUT = int(os.environ.get("ENGINE_TIMEOUT", "30"))  # max wait for one wave of engine answers
 CLIP_MAX_SEC = int(os.environ.get("CLIP_MAX_SEC", "900"))
 MAX_SRC_SEC = int(os.environ.get("MAX_SRC_SEC", str(3 * 3600)))
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
@@ -88,11 +92,13 @@ URL_RE = re.compile(r"https?://\S+")
 CLIP_HOSTS = ("youtube.com", "youtu.be", "instagram.com")
 DIRECT_HOSTS = CLIP_HOSTS
 AUDIO_HOSTS = ("youtube.com", "youtu.be", "soundcloud.com")
+YT_HOSTS = ("youtube.com", "youtu.be")
 MP3_PREFIX = "🎵 "
+SONG_KEYS = ("title", "artist", "link", "yt", "dur")
 
 esc = html.escape
 
-PREP = {}   # sid -> {"task", "src", "created", "used", "song"}
+PREP = {}   # sid -> {"task", "src", "created", "used", "busy", "song"}
 CANDS = {}  # sid -> {"alts": [...], "created": ts}
 SEARCH = {}  # sid -> {"items": [...], "created": ts}
 PAGE = 8
@@ -347,10 +353,12 @@ def lang_keyboard():
 
 
 # ======================================================================================
-# Small helpers: chat action, rate limit, URL / host handling
+# Small helpers: chat action (the status at the top of the chat), rate limit, URL / host handling
 # ======================================================================================
 @asynccontextmanager
 async def chat_action(bot, chat_id, action=ChatAction.RECORD_VOICE):
+    """Keeps the status at the top of the chat ("recording voice..." / "typing...") alive while the
+    block runs. This is the ONLY progress indicator: nothing is posted under the clip."""
     async def loop():
         while True:
             try:
@@ -593,7 +601,7 @@ def clip_get(url):
 def clip_put(url, file_id, song=None):
     data = None
     if song:
-        data = json.dumps({k: song.get(k) for k in ("title", "artist", "link", "yt")}, ensure_ascii=False)
+        data = json.dumps({k: song.get(k) for k in SONG_KEYS}, ensure_ascii=False)
     with db() as c:
         c.execute("""INSERT INTO clips(url,file_id,song) VALUES(?,?,?)
                      ON CONFLICT(url) DO UPDATE SET
@@ -617,7 +625,7 @@ def media_cache_get(uid: str):
 
 
 def media_cache_put(uid: str, song: dict, sid: str):
-    data = json.dumps({k: song.get(k) for k in ("title", "artist", "link", "yt")}, ensure_ascii=False)
+    data = json.dumps({k: song.get(k) for k in SONG_KEYS}, ensure_ascii=False)
     with db() as c:
         c.execute("INSERT OR REPLACE INTO media_songs VALUES(?,?,?)", (uid, data, sid))
 
@@ -875,6 +883,14 @@ def _hum_score(h: dict) -> float:
     return s * 100 if s <= 1 else s
 
 
+def _acr_dur(m: dict):
+    try:
+        ms = float(m.get("duration_ms"))
+        return ms / 1000.0 if ms > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
 def acr_identify(path: str, acc):
     ts = str(int(time.time()))
     sig_str = "\n".join(["POST", "/v1/identify", acc["key"], "audio", "1", ts])
@@ -936,6 +952,7 @@ def acr_identify(path: str, acc):
         except (TypeError, ValueError):
             sc = 100.0
         cands.append({"title": m["title"], "artist": artist, "link": link, "yt": yt,
+                      "dur": _acr_dur(m),
                       "wmul": max(0.5, min(1.0, sc / 100.0))})
     if not cands:
         return None
@@ -1137,20 +1154,107 @@ def link_to_youtube(link: str, timeout: int = 8):
         return None, None
 
 
-def pick_target(song: dict) -> str:
+# ======================================================================================
+# Picking the ORIGINAL file on YouTube
+# ======================================================================================
+_JUNK_YT_RE = re.compile(r"full\s+album|playlist|compilation|non-?stop|jukebox|\b\d+\s*hours?\b|"
+                         r"1\s*hour|reaction|tutorial|how to play|instrumental|acoustic", re.I)
+
+
+def _ck(s: str) -> str:
+    return re.sub(r"[\W_]+", "", _fold(s or ""))
+
+
+def yt_match_score(item: dict, song: dict) -> float:
+    """Higher = more likely the original studio track of this song."""
+    t = item.get("title") or ""
+    ch = item.get("channel") or item.get("uploader") or ""
+    tl, chl = t.lower(), ch.lower()
+    tc, chc = _ck(t), _ck(ch)
+    s = 0.0
+    want = _ck(clean_title(song.get("title")) or song.get("title"))
+    if want and want in tc:
+        s += 4
+    else:
+        s -= 3
+    arts = artist_set(song.get("artist"), song.get("title"))
+    if arts:
+        hit = sum(1 for a in arts if a in tc or a in chc)
+        s += (2 + 0.5 * min(hit - 1, 2)) if hit else -1.5
+    if _BAD_TITLE_RE.search(t) and not _BAD_TITLE_RE.search(song.get("title") or ""):
+        s -= 6
+    if _JUNK_YT_RE.search(t):
+        s -= 5
+    if chl.endswith("- topic"):
+        s += 3
+    if "vevo" in chl:
+        s += 1.5
+    if "official" in tl:
+        s += 1
+    if "audio" in tl:
+        s += 0.5
+    if "lyric" in tl:
+        s -= 0.5
+    d, v = song.get("dur"), item.get("duration")
+    if d and v:
+        diff = abs(float(v) - float(d))
+        s += 3 if diff <= 3 else 1.5 if diff <= 8 else 0 if diff <= 20 else -3
+    elif v:
+        if v > 600 or v < 60:
+            s -= 3
+    return s
+
+
+def rank_youtube(song: dict, n: int = 8) -> list:
+    """[(score, video_id)] best first, for the original recording of this song."""
+    artist = (song.get("artist") or "")[:80]
+    q = f"{artist} - {song.get('title') or ''}".strip(" -")
+    ranked = []
+    for query in (q, q + " official audio"):
+        try:
+            items = yt_search(query, n)
+        except Exception as e:
+            log.warning("yt rank search failed: %s", e)
+            items = []
+        seen = {v for _, v in ranked}
+        for it in items:
+            vid = it.get("id")
+            if vid and vid not in seen and it.get("title"):
+                ranked.append((yt_match_score(it, song), vid))
+                seen.add(vid)
+        ranked.sort(reverse=True)
+        if ranked and ranked[0][0] >= 6:  # a clear winner: no second search needed
+            break
+    return ranked
+
+
+def pick_targets(song: dict) -> list:
+    """Download candidates, best first. The caller tries the next one if the duration is clearly wrong."""
+    out = []
+
+    def add(t):
+        if t and t not in out:
+            out.append(t)
+
     if song.get("yt"):
-        return song["yt"]
+        add(norm_url(song["yt"]))
     link = song.get("link") or ""
-    if host_in(link, ("youtube.com", "youtu.be")):
-        return link
-    if link:
+    if host_in(link, YT_HOSTS):
+        add(norm_url(link))
+    elif link and not out:
         try:
             yt, _ = link_to_youtube(link, timeout=4)
-            if yt and host_in(yt, ("youtube.com", "youtu.be")):
-                return yt
+            if yt and host_in(yt, YT_HOSTS):
+                add(norm_url(yt))
         except Exception:
             pass
-    return f"ytsearch1:{song['artist']} - {song['title']}"
+    # without a known duration a direct id cannot be verified, so skip the extra search
+    if not out or song.get("dur"):
+        for score, vid in rank_youtube(song)[:3]:
+            if score >= 2:
+                add(f"https://www.youtube.com/watch?v={vid}")
+    add(f"ytsearch1:{song.get('artist', '')} - {song.get('title', '')}")
+    return out[:4]
 
 
 def ydl_base():
@@ -1196,7 +1300,7 @@ def download_audio(target: str, outdir: str, fallback=None):
         try:
             return run(t, fast)
         except Exception:
-            if fast is plain or not ARIA2:
+            if not ARIA2:
                 raise
             log.warning("aria2c download failed, retrying with the normal downloader")
             for f in glob.glob(f"{outdir}/*"):
@@ -1664,7 +1768,7 @@ def split_text(t: str, n: int = 4000) -> list:
 
 
 # ======================================================================================
-# Recognition: voting between engines
+# Recognition: ACRCloud + Shazam vote TOGETHER
 # ======================================================================================
 # lyrics weight is lower than ACR / Shazam: a text-only match must be confirmed by another vote
 ENGINE_W = {"acr": 1.0, "shazam": 1.0, "lyrics": 0.8}
@@ -1731,6 +1835,8 @@ def call_engine(name: str, accs, path: str):
 
 
 def _group(hits: list) -> list:
+    """Groups the answers of all engines / pieces by song. Votes of different engines add up, so when ACR and
+    Shazam agree the song wins clearly. Details (link, yt id, real duration) are merged from every engine."""
     clusters = []
     for h in hits:
         for cl in clusters:
@@ -1745,7 +1851,7 @@ def _group(hits: list) -> list:
         song = dict(best["song"])
         song["artist"] = max((h["song"].get("artist") or "" for h in hs),
                              key=lambda a: (len(artist_set(a)), len(a)))
-        for k in ("link", "yt"):
+        for k in ("link", "yt", "dur"):
             song[k] = next((h["song"].get(k) for h in hs if h["song"].get(k)), None)
         per = {}
         for h in hs:
@@ -1878,10 +1984,11 @@ def find_song_by_words(words):
 
 
 def recognize(paths, skip=(), extra=None):
-    """Order (accuracy first):
+    """Order (accuracy first, but fast):
     0) own fingerprint DB (free, instant)
-    1) ACRCloud + Shazam on every piece, batch by batch (2, 2, 3, 3 pieces). A batch is always finished
-       completely, then the vote is checked; the next batch runs only while the answer is not confirmed
+    1) ACRCloud + Shazam on every piece AT THE SAME TIME, in waves (3, 3, 4 pieces). Answers are voted as they
+       arrive; the moment the vote is confirmed the answer is returned and the slow rest is ignored.
+       A new wave starts only while the answer is not confirmed yet
     2) lyrics (what the singer says) as an extra vote, 3) slowed / sped-up copies as the last try.
     The result has an "alts" list with the runner-up answers.
     STRICT=1: an unconfirmed answer is dropped ("not found") instead of being guessed."""
@@ -1917,16 +2024,18 @@ def recognize(paths, skip=(), extra=None):
             hits.append({"song": mo, "engine": mo["engine"], "sample": idx,
                          "w": base_w * mo.get("wmul", 0.5)})
 
-    def run_batch(batch, jobs):
-        """Runs every engine on every piece of the batch and waits for ALL answers (up to ENGINE_TIMEOUT)."""
+    def run_wave(batch, jobs) -> bool:
+        """Sends every piece of the wave to BOTH engines at once. Votes are counted as answers arrive and the
+        wave stops early as soon as the answer is confirmed. Returns True when confirmed."""
         futs = {ENGINE_POOL.submit(call_engine, name, accs, p): (name, idx)
                 for idx, p in batch for name, accs in jobs}
         if not futs:
-            return
+            return False
         pending = set(futs)
         deadline = time.time() + ENGINE_TIMEOUT
-        while pending and time.time() < deadline:
-            done, pending = wait(pending, timeout=min(deadline - time.time(), 1.0),
+        confirmed = False
+        while pending and time.time() < deadline and not confirmed:
+            done, pending = wait(pending, timeout=min(max(deadline - time.time(), 0.05), 1.0),
                                  return_when=FIRST_COMPLETED)
             for f in done:
                 name, idx = futs[f]
@@ -1934,20 +2043,20 @@ def recognize(paths, skip=(), extra=None):
                     absorb(name, idx, f.result())
                 except Exception as e:
                     log.warning("engine %s crashed: %s", name, e)
+            if done and _confident(_group(hits)):
+                confirmed = True
         for f in pending:
-            f.cancel()
+            f.cancel()  # not started yet -> never sent to the engine, no quota used
+        return confirmed
 
     pieces = list(enumerate(paths[:MAX_SAMPLES]))
     pos = 0
-    ranked = _group(hits)
-    for size in (2, 2, 3, 3):
+    for size in (3, 3, 4):
         batch = pieces[pos:pos + size]
         pos += size
         if not batch:
             break
-        run_batch(batch, primary)
-        ranked = _group(hits)
-        if _confident(ranked):
+        if run_wave(batch, primary):
             break
     ranked = _group(hits)
 
@@ -1965,7 +2074,7 @@ def recognize(paths, skip=(), extra=None):
         try:
             vs = make_variants(paths[0])
             if vs:
-                run_batch(list(enumerate(vs, start=50)), primary)
+                run_wave(list(enumerate(vs, start=50)), primary)
                 ranked = _group(hits)
         except Exception as e:
             log.warning("variant stage failed: %s", e)
@@ -2076,8 +2185,27 @@ async def fetch_audio(target: str, song=None) -> dict:
 
 
 async def prepare_song_audio(song: dict) -> dict:
-    target = await asyncio.to_thread(pick_target, song)
-    return await fetch_audio(target, song)
+    """Downloads the ORIGINAL recording. Candidates come from pick_targets (best first). If the downloaded
+    length is clearly different from the real song length, the next candidate is tried."""
+    targets = await asyncio.to_thread(pick_targets, song)
+    want = song.get("dur")
+    err = None
+    for i, t in enumerate(targets):
+        last = i == len(targets) - 1
+        try:
+            a = await fetch_audio(t, song)
+        except Exception as e:
+            err = e
+            if last:
+                raise
+            continue
+        got = a.get("duration")
+        if want and got and not last and "file_id" not in a and abs(got - want) > 20:
+            log.info("wrong length (%ss vs %ss) for %s, trying the next candidate", got, int(want), t)
+            shutil.rmtree(a["dir"], ignore_errors=True)
+            continue
+        return a
+    raise err or RuntimeError("no download candidate")
 
 
 async def deliver_audio(msg, a: dict, song=None, lang: str = "fa"):
@@ -2119,7 +2247,7 @@ async def upload_video(msg, path: str, caption: str, kb=None):
 
 async def identify_audio_and_reply(msg, src: str, audio_path: str, meta, lang: str):
     uid = msg.from_user.id
-    trusted = bool(meta) and host_in(src, ("youtube.com", "youtu.be"))
+    trusted = bool(meta) and host_in(src, YT_HOSTS)
     sid = uuid.uuid4().hex[:10]
     charged = False
     song = None
@@ -2188,7 +2316,7 @@ async def identify_clip(uid: int, sid: str, meta, src: str, samples_task, quick_
             meta_song = {"title": meta["title"], "artist": meta["artist"],
                          "link": src if "youtu" in src else None, "engine": "meta#0",
                          "w": meta.get("w", META_W)}
-            if host_in(src, ("youtube.com", "youtu.be")):
+            if host_in(src, YT_HOSTS):
                 meta["link"] = src
                 with open(os.path.join(SAMPLES_DIR, sid + ".json"), "w", encoding="utf-8") as f:
                     json.dump(meta, f, ensure_ascii=False)
@@ -2269,7 +2397,7 @@ async def clip_from_cache(msg, src: str, hit, lang: str):
         return res
 
     PREP[sid] = {"task": asyncio.create_task(prep()), "src": src, "created": time.time(),
-                 "used": False, "song": song}
+                 "used": False, "busy": False, "song": song}
     try:
         await msg.reply_video(hit["file_id"], caption=footer(src), parse_mode="HTML",
                               reply_markup=clip_keyboard(sid, lang), supports_streaming=True)
@@ -2316,7 +2444,8 @@ async def do_clip(msg, url: str):
         quick_task = asyncio.create_task(asyncio.to_thread(quick_local, path, sid))
         samples_task = asyncio.create_task(asyncio.to_thread(make_samples, path, sid))
         prep_task = asyncio.create_task(prep_clip(uid, sid, meta, src, samples_task, quick_task))
-        PREP[sid] = {"task": prep_task, "src": src, "created": time.time(), "used": False, "song": None}
+        PREP[sid] = {"task": prep_task, "src": src, "created": time.time(), "used": False,
+                     "busy": False, "song": None}
         try:
             sent = await upload_video(msg, path, footer(src), clip_keyboard(sid, lang))
             fid = _msg_video_id(sent)
@@ -2331,28 +2460,21 @@ async def do_clip(msg, url: str):
 
 
 async def show_prepared(q, sid: str, entry: dict, lang: str):
-    """The user tapped 'identify': show a fixed 'identifying' text, then the result as soon as the name is known."""
-    if entry.get("used"):
+    """The user tapped 'identify'. The ONLY progress indicator is the status at the top of the chat; the button
+    under the clip is left untouched. The result appears as soon as the name is known."""
+    if entry.get("used") or entry.get("busy"):
         return await q.answer()
-    await q.answer(tr(lang, "wait_toast"))
+    entry["busy"] = True
+    await q.answer()  # clears the button spinner, no text
     task = entry["task"]
-    try:  # one fixed "identifying" text on the button (no counter)
-        await q.edit_message_reply_markup(reply_markup=Markup(
-            [[Btn(tr(lang, "identifying"), callback_data="noop:")]]))
-    except Exception:
-        pass
     t0 = time.time()
-    async with chat_action(q.get_bot(), q.message.chat_id):  # status at the top of the chat stays on until found
+    async with chat_action(q.get_bot(), q.message.chat_id):  # top-of-chat status stays on until found
         while not (entry.get("song") or task.done()) and time.time() - t0 < 240:
             await asyncio.sleep(0.3)
     res = task.result() if task.done() and not task.cancelled() else {}
     song = entry.get("song") or res.get("song")
     if not song:
         drop_entry(sid)  # the next tap recognizes again
-        try:
-            await q.edit_message_reply_markup(reply_markup=clip_keyboard(sid, lang))
-        except Exception:
-            pass
         key = "quota_short" if res.get("blocked") else "not_found"
         return await q.message.reply_text(tr(lang, key))
     if entry.get("used"):
@@ -2365,8 +2487,9 @@ async def show_prepared(q, sid: str, entry: dict, lang: str):
     except Exception:
         log.warning("edit caption failed", exc_info=True)
     try:
-        r2 = await asyncio.wait_for(asyncio.shield(task), timeout=240)
-        a = (r2 or {}).get("audio") or await prepare_song_audio(song)
+        async with chat_action(q.get_bot(), q.message.chat_id):  # keep the status while the mp3 is prepared
+            r2 = await asyncio.wait_for(asyncio.shield(task), timeout=240)
+            a = (r2 or {}).get("audio") or await prepare_song_audio(song)
         await deliver_audio(q.message, a, song, lang)
     except Exception:
         log.exception("mp3 failed")
@@ -2378,6 +2501,8 @@ async def show_prepared(q, sid: str, entry: dict, lang: str):
 # Voice / audio / typed text from the user
 # ======================================================================================
 async def handle_media(msg, media, lang: str):
+    """Voice / audio / video note. No status message is posted: handle() keeps the top-of-chat status on
+    until the song is found."""
     uid = msg.from_user.id
     fid = media.file_unique_id
     sid = uuid.uuid4().hex[:10]
@@ -2411,7 +2536,7 @@ async def handle_media(msg, media, lang: str):
                 remember_alts(sid, song)
                 set_last(sid, song)
             else:
-                # 2) full recognition with a live seconds counter
+                # 2) full recognition (ACR + Shazam together)
                 outs = await asyncio.to_thread(make_samples, raw, sid)
                 if outs:
                     os.remove(raw)
@@ -2420,14 +2545,7 @@ async def handle_media(msg, media, lang: str):
                     os.replace(raw, fallback)
                     outs = [fallback]
                 await asyncio.to_thread(add_sample, sid, outs[0])
-                status = await msg.reply_text(tr(lang, "identifying"))
-                try:
-                    song = await asyncio.to_thread(recognize, outs)
-                finally:
-                    try:
-                        await status.delete()
-                    except Exception:
-                        pass
+                song = await asyncio.to_thread(recognize, outs)
                 if not song:
                     await asyncio.to_thread(refund_quota, uid)
                     charged = False
@@ -2483,6 +2601,8 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     is_clip = bool(url and host_in(url, CLIP_HOSTS) and host_of(url) != "music.youtube.com")
     action = ChatAction.UPLOAD_VIDEO if is_clip else ChatAction.RECORD_VOICE
     try:
+        # the status at the top of the chat stays on for the WHOLE request (voice, clip link, lyrics text,
+        # song name) until the answer is sent
         async with chat_action(ctx.bot, msg.chat_id, action):
             if media:
                 await handle_media(msg, media, lang)
@@ -2516,12 +2636,12 @@ async def on_rec(q, data: str):
             return await show_prepared(q, sid, entry, lang)
     else:
         drop_entry(sid)
-        media_cache_drop(sid)
+        await asyncio.to_thread(media_cache_drop, sid)
 
     with db() as c:
         row = c.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
     if row and action == "bad" and row["src"]:
-        clip_delete(row["src"])
+        await asyncio.to_thread(clip_delete, row["src"])
     paths = sorted(glob.glob(os.path.join(SAMPLES_DIR, f"{sid}_*")))
     mpath = os.path.join(SAMPLES_DIR, f"{sid}.json")
     if not row or not (paths or os.path.exists(mpath) or CANDS.get(sid)):
@@ -2558,9 +2678,10 @@ async def on_rec(q, data: str):
             return await q.answer(tr(lang, "no_result"), show_alert=True)
         if not await asyncio.to_thread(use_quota, uid):
             return await q.answer(tr(lang, "quota_short"), show_alert=True)
-        await q.answer(tr(lang, "identifying"))
+        await q.answer()  # no text: the status at the top of the chat shows the progress
         try:
-            song = await asyncio.to_thread(recognize, paths, tuple(tried))
+            async with chat_action(q.get_bot(), q.message.chat_id):
+                song = await asyncio.to_thread(recognize, paths, tuple(tried))
         except Exception:
             await asyncio.to_thread(refund_quota, uid)
             raise
@@ -2584,12 +2705,13 @@ async def on_rec(q, data: str):
     except Exception:
         await q.message.reply_text(cap, parse_mode="HTML", reply_markup=kb, **NO_PREVIEW)
     if src:
-        clip_set_song(src, song)
+        await asyncio.to_thread(clip_set_song, src, song)
         vid = getattr(q.message, "video", None)
         if vid:
-            clip_put(src, vid.file_id, song)
+            await asyncio.to_thread(clip_put, src, vid.file_id, song)
     try:
-        a = await audio_task
+        async with chat_action(q.get_bot(), q.message.chat_id):
+            a = await audio_task
         await deliver_audio(q.message, a, song, lang)
     except Exception:
         log.exception("mp3 failed")
@@ -2597,14 +2719,15 @@ async def on_rec(q, data: str):
 
 
 async def on_lyrics(q, data: str):
-    lang = get_lang(q.from_user.id)
+    lang = await asyncio.to_thread(get_lang, q.from_user.id)
     tid = data.split(":", 1)[1]
     with db() as c:
         row = c.execute("SELECT * FROM tracks WHERE id=?", (tid,)).fetchone()
     if not row:
         return await q.answer(tr(lang, "track_missing"), show_alert=True)
-    await q.answer(tr(lang, "lyrics_wait"))
-    text = await asyncio.to_thread(get_lyrics, row["artist"], row["title"])
+    await q.answer()  # no text: the status at the top of the chat shows the progress
+    async with chat_action(q.get_bot(), q.message.chat_id, ChatAction.TYPING):
+        text = await asyncio.to_thread(get_lyrics, row["artist"], row["title"])
     if not text:
         return await q.message.reply_text(tr(lang, "lyrics_none"))
     for chunk in split_text(f"🎤 {row['title']}\n\n{text}"):
@@ -2615,13 +2738,13 @@ _VID_RE = re.compile(r"^[\w-]{6,20}$")
 
 
 async def on_pick(q, ctx, data: str):
-    lang = get_lang(q.from_user.id)
+    lang = await asyncio.to_thread(get_lang, q.from_user.id)
     vid = data.split(":", 1)[1]
     if not _VID_RE.match(vid):
         return await q.answer()
     if not rate_ok(q.from_user.id, limit=RATE_LIMIT * 2):
         return await q.answer(tr(lang, "slow"), show_alert=True)
-    await q.answer(tr(lang, "downloading"))
+    await q.answer()
     try:
         async with chat_action(ctx.bot, q.message.chat_id, ChatAction.RECORD_VOICE):
             await send_mp3(q.message, f"https://www.youtube.com/watch?v={vid}", lang=lang)
@@ -2631,7 +2754,7 @@ async def on_pick(q, ctx, data: str):
 
 
 async def on_more(q, data: str):
-    lang = get_lang(q.from_user.id)
+    lang = await asyncio.to_thread(get_lang, q.from_user.id)
     _, sid, page = data.split(":")
     if sid not in SEARCH:
         return await q.answer(tr(lang, "expired"), show_alert=True)
@@ -2646,7 +2769,7 @@ async def on_lang_button(q, data: str):
     code = data.split(":", 1)[1]
     if code not in LANGS:
         return await q.answer()
-    set_lang(q.from_user.id, code)
+    await asyncio.to_thread(set_lang, q.from_user.id, code)
     toast = tr(code, "lang_set") if code in STR else "✅ " + LANGS[code]
     await q.answer(toast)
     text = tr(code, "welcome").rsplit("\n\n", 1)[0] + "\n\n🌐 /lang"
@@ -2670,7 +2793,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await on_lyrics(q, data)
     if data.startswith("lang:"):
         return await on_lang_button(q, data)
-    await q.answer()  # "noop:" (the fixed identifying button) ends up here
+    await q.answer()
 
 
 # ======================================================================================
@@ -2708,12 +2831,12 @@ async def on_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # Commands / lifecycle
 # ======================================================================================
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    touch_user(update.effective_user)
+    await asyncio.to_thread(touch_user, update.effective_user)
     await update.message.reply_text(LANG_PROMPT, reply_markup=lang_keyboard())
 
 
 async def cmd_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    touch_user(update.effective_user)
+    await asyncio.to_thread(touch_user, update.effective_user)
     await update.message.reply_text(LANG_PROMPT, reply_markup=lang_keyboard())
 
 
