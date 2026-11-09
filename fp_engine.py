@@ -14,14 +14,25 @@ fp_engine.py - موتور تشخیص آهنگ (Audio Fingerprinting)
     python fp_engine.py delete 123               # حذف یک ترک
     python fp_engine.py rename 123 --title "Longing" --artist "IMAN"
     python fp_engine.py clean-names              # تمیز کردن اسم‌های خراب (لینک، _ ، ...)
+    python fp_engine.py dedupe                   # پیش‌نمایش ترک‌های تکراری (همون صدا با اسم‌های مختلف)
+    python fp_engine.py dedupe --apply           # حذف تکراری‌ها (قدیمی‌ترین id می‌مونه)
 
-تغییرات این نسخه (API قبلی سازگار می‌ماند؛ seed_fp.py و bot.py بدون تغییر کار می‌کنند):
+تغییرات این نسخه (API قبلی سازگار می‌ماند؛ seed_fp.py، learn_forward.py و bot.py بدون تغییر کار می‌کنند):
+    * [جدید] تکراری بودن بر اساس «صدا» تشخیص داده میشه، نه اسم:
+      اگه یه آهنگ کامل با مدت مشابه (±DUR_TOL) و هم‌راستایی بالای هش‌ها از قبل تو دیتابیس باشه،
+      حتی با اسم/تگ متفاوت (مثلاً "Song (1)" یا "Song - Artist") ترک جدید ساخته نمیشه.
+      قبلاً اسم متفاوت = ترک جدید با هش‌های کامل بود، و رأی بین دو ترک مساوی تقسیم میشد و تشخیص رد میشد.
+    * [جدید] تو recognize، رقیبی که مدتش با نفر اول ≤ SAME_DUR_TOL ثانیه فرق داره و امتیازش ≥ SAME_SCORE_RATIO
+      نفر اولیه، «رقیب» حساب نمیشه، «نسخه‌ی جایگزین» (alternative) حساب میشه. اینجوری تساوی دو ثبت از یه صدا،
+      نتیجه رو با MIN_RATIO رد نمی‌کنه.
+    * [جدید] دستور CLI: dedupe [--apply] برای پاک کردن تکراری‌های قدیمی (file_id ترک حذف‌شده به ترک باقی‌مانده
+      منتقل میشه اگه اون نداشت). delete_track حالا fp_flags رو هم پاک می‌کنه.
     * هویت ترک = «ضبط (recording)» است، نه فقط «اسم + خواننده».
       دو ضبط هم‌اسم (مثلاً IMAN - Longing با ۳:۰۷ و ۴:۱۲، یا یک قطعه‌ی پیانو که هزار نفر زدن) دیگه
       توی یک ردیف ادغام نمیشن. تشخیص «همون ضبط» با مدت‌زمان + تطبیق واقعی اثرانگشت انجام میشه.
     * UNIQUE(title, artist) از جدول tracks برداشته شد (مهاجرت خودکار، اول بکاپ بگیر).
-    * ستون‌های جدید: duration (ثانیه) و file_id (فایل تلگرام همون ضبط).
-    * recognize / identify حالا track_id، duration، file_id و alternatives (نسخه‌های هم‌اسم) هم برمی‌گردونه
+    * ستون‌های: duration (ثانیه) و file_id (فایل تلگرام همون ضبط).
+    * recognize / identify track_id، duration، file_id و alternatives (نسخه‌های هم‌اسم) هم برمی‌گردونه
       تا ربات دقیقاً همون نسخه رو بفرسته. پارامتر exclude برای دکمه‌ی «آهنگ اشتباه» (نتیجه‌ی بعدی).
     * learn() خودکار (source=api) اگه با نتیجه‌ی قوی دیتابیس تناقض داشت، دیتابیس رو خراب نمی‌کنه.
     * flag_wrong(track_id): ترک‌هایی که خودکار از API یاد گرفته شدن پاک میشن؛ manual/verified حفظ میشن.
@@ -55,6 +66,9 @@ LEARN_SKIP_SCORE = 40      # اگه تشخیص محلی از این قوی‌ت�
 VERIFY_ALIGNED = int(os.environ.get("FP_VERIFY_ALIGNED", "12"))  # حداقل هم‌راستایی برای «همون ضبط»
 DUR_TOL = float(os.environ.get("FP_DUR_TOL", "3.0"))   # اختلاف مجاز مدت (ثانیه) برای «همون ضبط»
 ALT_RATIO = 0.5            # نسخه‌های هم‌اسم با امتیاز >= این نسبت از اولی در alternatives میان
+DUP_ALIGN_FRAC = float(os.environ.get("FP_DUP_FRAC", "0.3"))   # کسری از هش‌های آهنگ که باید هم‌راستا باشه تا «همون صدا» حساب بشه
+SAME_DUR_TOL = 1.5         # رقیب با این حد مدت مشابه + امتیاز نزدیک = همون صدا (alternative، نه رقیب)
+SAME_SCORE_RATIO = 0.8     # حداقل نسبت امتیاز رقیب به نفر اول برای «همون صدا»
 DB_PATH = os.environ.get("FP_DB", "fingerprints.db")
 
 
@@ -266,11 +280,34 @@ class FingerprintDB:
                 return best_alignment(rows, hashes) >= VERIFY_ALIGNED
         return True                                        # nothing to compare with: same name = same
 
+    def _audio_duplicate(self, duration, hashes):
+        """A WHOLE song whose AUDIO is already stored under ANY name -> that track id, else None.
+        Name is ignored on purpose: 'Song (1)' / 'Song - Artist' / a different tag are the same recording
+        when the length matches and a large part of the hashes line up."""
+        if duration is None or not hashes:
+            return None
+        rows = self.conn.execute(
+            "SELECT id FROM tracks WHERE source IN ('manual','verified') AND n_hashes > 0 "
+            "AND duration IS NOT NULL AND ABS(duration - ?) <= ? ORDER BY id",
+            (duration, DUR_TOL)).fetchall()
+        need = max(VERIFY_ALIGNED, int(DUP_ALIGN_FRAC * len(hashes)))
+        for (tid,) in rows:
+            stored = self.conn.execute(
+                "SELECT hash, offset FROM fingerprints WHERE track_id=?", (tid,)).fetchall()
+            if stored and best_alignment(stored, hashes) >= need:
+                return tid
+        return None
+
     def get_or_create_track(self, title, artist, source="manual", duration=None, hashes=None) -> int:
         """Returns the id of the track that IS this recording; creates a new track if there is none.
-        Same name but another recording (other length / hashes don't align) -> a separate track."""
+        1) same AUDIO already stored (any name) -> that track
+        2) same name + same recording -> that track
+        3) otherwise a new track (same name but another recording = a separate track)."""
         title = clean_name(title) or (title or "").strip()
         artist = clean_name(artist) or (artist or "").strip() or "Unknown"
+        dup = self._audio_duplicate(duration, hashes)
+        if dup:
+            return dup
         for tid, t, a, dur in self.conn.execute(
                 "SELECT id, title, artist, duration FROM tracks").fetchall():
             if _same_name(title, artist, t, a) and self._same_recording(tid, dur, duration, hashes):
@@ -318,6 +355,10 @@ class FingerprintDB:
     def delete_track(self, track_id):
         self.conn.execute("DELETE FROM fingerprints WHERE track_id=?", (track_id,))
         self.conn.execute("DELETE FROM tracks WHERE id=?", (track_id,))
+        try:  # جدول fp_flags رو bot.py می‌سازه؛ ممکنه وجود نداشته باشه
+            self.conn.execute("DELETE FROM fp_flags WHERE track_id=?", (track_id,))
+        except sqlite3.Error:
+            pass
         self.conn.commit()
 
     def stats(self):
@@ -394,7 +435,7 @@ class Engine:
     def recognize(self, path, exclude=()):
         """dict: track_id, title, artist, score, confidence, duration, file_id, alternatives  |  None.
         exclude = track_id هایی که نباید برگردن (دکمه‌ی «آهنگ اشتباه» -> نتیجه‌ی بعدی).
-        alternatives = نسخه‌های هم‌اسم (ضبط‌های دیگه‌ی همین آهنگ) که کلیپ تا حدی بهشون می‌خوره."""
+        alternatives = نسخه‌های هم‌اسم یا هم‌صدا (ضبط‌های دیگه‌ی همین آهنگ) که کلیپ تا حدی بهشون می‌خوره."""
         exclude = set(exclude or ())
         ranked = self._ranked(path, exclude)
         if not ranked:
@@ -407,8 +448,12 @@ class Engine:
             r = self.db.track_row(tid)
             if r is None:
                 continue
-            if _same_name(top[0], top[1], r[0], r[1]):
-                # another recording of the same song is not a "rival", it is an alternative version
+            same_song = _same_name(top[0], top[1], r[0], r[1]) or (
+                top[3] is not None and r[3] is not None
+                and abs(top[3] - r[3]) <= SAME_DUR_TOL
+                and sc >= SAME_SCORE_RATIO * top_score)
+            if same_song:
+                # another recording of the same song (or the same audio stored twice) is not a "rival"
                 if sc >= ALT_RATIO * top_score:
                     alts.append({"track_id": tid, "title": r[0], "artist": r[1],
                                  "score": sc, "duration": r[3], "file_id": r[4]})
@@ -454,6 +499,27 @@ class Engine:
 
     def set_file_id(self, track_id, file_id):
         self.db.set_file_id(track_id, file_id)
+
+    def dedupe(self, apply: bool = False):
+        """ترک‌های کامل (manual/verified) با n_hashes یکسان و مدت تقریباً برابر = همون صدا با اسم‌های مختلف.
+        قدیمی‌ترین id می‌مونه. برمی‌گرداند: لیست (removed_id, removed_title, kept_id, kept_title)."""
+        rows = self.db.conn.execute(
+            "SELECT id, title, file_id, n_hashes, duration FROM tracks "
+            "WHERE source IN ('manual','verified') AND n_hashes > 0 AND duration IS NOT NULL "
+            "ORDER BY id").fetchall()
+        kept = {}      # n_hashes -> [(id, title, duration)]
+        report = []
+        for tid, title, fid, n, dur in rows:
+            k = next((k for k in kept.get(n, []) if abs(k[2] - dur) < 0.5), None)
+            if k is None:
+                kept.setdefault(n, []).append((tid, title, dur))
+                continue
+            report.append((tid, title, k[0], k[1]))
+            if apply:
+                if fid and not (self.db.track_row(k[0]) or (None,) * 5)[4]:
+                    self.db.set_file_id(k[0], fid)
+                self.db.delete_track(tid)
+        return report
 
 
 # ---------------- API برای bot.py ----------------
@@ -529,6 +595,7 @@ def main():
     rn = sub.add_parser("rename"); rn.add_argument("id", type=int)
     rn.add_argument("--title"); rn.add_argument("--artist")
     sub.add_parser("clean-names")
+    dd = sub.add_parser("dedupe"); dd.add_argument("--apply", action="store_true")
     args = ap.parse_args()
 
     eng = Engine()
@@ -587,6 +654,11 @@ def main():
                 n += 1
         eng.db.conn.commit()
         print(n, "track(s) cleaned")
+    elif args.cmd == "dedupe":
+        report = eng.dedupe(apply=args.apply)
+        for rid, rt, kid, kt in report:
+            print(f"{'removed' if args.apply else 'would remove'} {rid} ({rt})  ->  keeps {kid} ({kt})")
+        print(len(report), "duplicate(s)", "removed" if args.apply else "found (use --apply to remove)")
 
 
 if __name__ == "__main__":
