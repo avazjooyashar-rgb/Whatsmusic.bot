@@ -1,5 +1,20 @@
 """
-Music recognition Telegram bot  -  v8 (accurate + fast)
+Music recognition Telegram bot  -  v9 (accurate + fast)
+
+  v9 changes (on top of v8) - recognition speed and accuracy only, nothing else is touched:
+  * own fingerprint DB: the pieces are looked up IN PARALLEL (was one after another), and inside
+    recognize() the DB runs AT THE SAME TIME as ACRCloud + Shazam instead of making them wait for it.
+    If the DB finds the song first, the answer is returned at once and the engines are cancelled
+  * quick_local() uses the two LOUDEST 12 s windows (music, not an intro / silence / talking) and looks
+    them up in parallel. The loudness scan is computed once and shared with make_samples()
+  * voice messages and "audio only" links: quick_local and sample cutting run side by side, and the
+    pieces are kept after a DB hit, so the "wrong song" button can still ask the engines
+  * VOTING FIX: the 2nd / 3rd candidates of ACRCloud (other versions of the same song: live, remix...)
+    no longer count as a "confirmed" competitor. Before, they blocked the early exit, so the bot kept
+    sending more pieces and then ran the slow lyrics (whisper) and sped-up/slowed stages even when
+    the answer was already clear. A repeated answer now adds half of ITS OWN weight (was a flat 0.5)
+  * ENGINE_THREADS default 24 (engine calls are network waits, so waves do not queue under load)
+  * the cover patch is NOT part of this file: it only added download time
 
   v8 changes (on top of v7):
   * STRICT is ON by default: an answer that is not confirmed is never shown, the bot says "not found"
@@ -86,7 +101,11 @@ STRICT = os.environ.get("STRICT", "1") == "1"
 DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "20"))
 RATE_LIMIT = int(os.environ.get("RATE_LIMIT", "10"))
 DL_CONCURRENCY = int(os.environ.get("DL_CONCURRENCY", "4"))
-ENGINE_THREADS = int(os.environ.get("ENGINE_THREADS", "12"))
+ENGINE_THREADS = int(os.environ.get("ENGINE_THREADS", "24"))
+LOCAL_THREADS = int(os.environ.get("LOCAL_THREADS", "4"))  # parallel own-DB lookups (ffmpeg + FFT + sqlite)
+# LOCAL_FIRST=1: recognize() waits for the own DB BEFORE it calls ACRCloud / Shazam (v8 behaviour: saves engine
+# quota when the DB knows the song, but every other song waits for the DB first). Default 0 = at the same time.
+LOCAL_FIRST = os.environ.get("LOCAL_FIRST", "0") == "1"
 ENGINE_TIMEOUT = int(os.environ.get("ENGINE_TIMEOUT", "12"))  # max wait for one wave of engine answers
 SHAZAM_TIMEOUT = int(os.environ.get("SHAZAM_TIMEOUT", "10"))  # one Shazam request
 SHAZAM_MAX_FAILS = int(os.environ.get("SHAZAM_MAX_FAILS", "3"))  # failures in a row before it is paused
@@ -124,6 +143,9 @@ HTTP.mount("https://", HTTPAdapter(pool_connections=16, pool_maxsize=48))
 HTTP.mount("http://", HTTPAdapter(pool_connections=4, pool_maxsize=8))
 
 ENGINE_POOL = ThreadPoolExecutor(max_workers=ENGINE_THREADS, thread_name_prefix="engine")
+# own-DB lookups have their own pool: a lookup running in ENGINE_POOL waits for these tasks, so they must not
+# share one pool (that could deadlock when the pool is full)
+LOCAL_POOL = ThreadPoolExecutor(max_workers=max(1, LOCAL_THREADS), thread_name_prefix="local")
 
 _DL_SEM = None
 
@@ -883,43 +905,80 @@ def _fp_identify(path: str):
     return _FP_FN(path) if _FP_FN else None
 
 
-def local_identify(paths):
-    """Own fingerprint DB. Returns a song dict or None.
-    fp_engine's function must return {"title","artist"[,"link","yt"]} or None."""
-    if not fp_engine:
+def _local_one(path: str):
+    """ONE piece against the own DB. A song dict or None. Runs in LOCAL_POOL (or in the caller's thread)."""
+    try:
+        r = _fp_identify(path)
+    except Exception as e:
+        log.warning("local fp failed: %s", e)
         return None
-    use = paths[:3]
-    found = []
-    for p in use:
-        try:
-            r = _fp_identify(p)
-        except Exception as e:
-            log.warning("local fp failed: %s", e)
-            continue
-        if r and r.get("title"):
-            found.append({"title": r["title"], "artist": r.get("artist") or "",
-                          "link": r.get("link"), "yt": r.get("yt"), "engine": "local#0"})
-    # a single loose hit is not trusted when several pieces were asked: two pieces must agree
-    need = 2 if len(use) >= 2 else 1
-    for f in found:
-        if sum(1 for g in found if same_song(f, g)) >= need:
+    if r and r.get("title"):
+        return {"title": r["title"], "artist": r.get("artist") or "",
+                "link": r.get("link"), "yt": r.get("yt"), "engine": "local#0"}
+    return None
+
+
+def _local_pick(found: list, asked: int):
+    """A single loose hit is not trusted when several pieces were asked: two pieces must agree."""
+    got = [f for f in found if f]
+    need = 2 if asked >= 2 else 1
+    for f in got:
+        if sum(1 for g in got if same_song(f, g)) >= need:
             return f
     return None
 
 
-def quick_local(src: str, sid: str):
-    """Asks the local DB with two different raw pieces (start + middle) and accepts the answer only if both
-    agree. Very short sources use one piece. Needs no quota, no engines."""
+def local_identify(paths):
+    """Own fingerprint DB. Returns a song dict or None.
+    fp_engine's function must return {"title","artist"[,"link","yt"]} or None.
+    The pieces are looked up in parallel. Never call this from inside a LOCAL_POOL task."""
     if not fp_engine:
         return None
-    d = probe_duration(src)
-    starts = [0] if d < 30 else [0, max(0, d / 2 - 6)]
-    outs, found = [], []
+    use = list(paths[:3])
+    if not use:
+        return None
+    if len(use) == 1:
+        return _local_pick([_local_one(use[0])], 1)
+    futs = [LOCAL_POOL.submit(_local_one, p) for p in use]
+    return _local_pick([f.result() for f in futs], len(use))
+
+
+QUICK_WIN = 12  # seconds per piece of quick_local
+
+
+def _quick_offsets(src: str, d: float) -> list:
+    """Start times of the pieces quick_local asks the DB with: the two LOUDEST windows (that is the music, not
+    an intro / silence / someone talking). If the loudness scan fails: start + middle, as before."""
+    if d < 30:
+        return [0]
+    offs = list(loud_offsets(src, QUICK_WIN, 2, int(min(d, MAX_SRC_SEC))))
+    for fallback in (0, max(0, d / 2 - 6)):
+        if len(offs) >= 2:
+            break
+        if all(abs(fallback - o) >= QUICK_WIN for o in offs):
+            offs.append(fallback)
+    return offs[:2]
+
+
+def quick_local(src: str, sid: str):
+    """Asks the local DB with two different raw pieces (the two loudest windows) AT THE SAME TIME and accepts
+    the answer only if both agree. Very short sources use one piece. Needs no quota, no engines."""
+    if not fp_engine:
+        return None
+    outs = []
     try:
-        for i, st in enumerate(starts):
-            out = os.path.join(SAMPLES_DIR, f"{sid}_q{i}.mp3")
-            outs.append(out)
-            found.append(local_identify([out]) if cut_sample(src, out, st, 12, True) else None)
+        d = probe_duration(src)
+        offs = _quick_offsets(src, d)
+        outs = [os.path.join(SAMPLES_DIR, f"{sid}_q{i}.mp3") for i in range(len(offs))]
+
+        def one(i):
+            return _local_one(outs[i]) if cut_sample(src, outs[i], offs[i], QUICK_WIN, True) else None
+
+        if len(offs) == 1:
+            found = [one(0)]
+        else:
+            futs = [LOCAL_POOL.submit(one, i) for i in range(len(offs))]
+            found = [f.result() for f in futs]
         if not found or any(f is None for f in found):
             return None
         if len(found) > 1 and not same_song(found[0], found[1]):
@@ -1668,30 +1727,66 @@ def cut_sample(src: str, out: str, start: float, dur: int, raw: bool = False) ->
     return False
 
 
+_ENERGY = {}         # (path, size, mtime, maxsec) -> loudness per second
+_ENERGY_LOCKS = {}   # the same key -> lock, so two threads never scan the same file twice
+_ENERGY_GUARD = threading.Lock()
+
+
+def _scan_energy(src: str, maxsec: int):
+    """Loudness (mean square) of every second of the audio, from a 2 kHz mono decode."""
+    sr = 2000
+    out = subprocess.run(
+        ["ffmpeg", "-v", "error", "-t", str(int(maxsec)), "-i", src, "-vn", "-ac", "1", "-ar", str(sr),
+         "-f", "s16le", "-"], capture_output=True, timeout=60 + int(maxsec) // 30).stdout
+    if np is not None:
+        pcm = np.frombuffer(out[:len(out) // 2 * 2], dtype=np.int16).astype(np.float32)
+        secs = len(pcm) // sr
+        if secs < 1:
+            return []
+        return (pcm[:secs * sr].reshape(secs, sr) ** 2).mean(axis=1)
+    pcm = array.array("h")
+    pcm.frombytes(out[:len(out) // 2 * 2])
+    secs = len(pcm) // sr
+    return [sum(x * x for x in pcm[i * sr:(i + 1) * sr]) / sr for i in range(secs)]
+
+
+def energy_profile(src: str, maxsec: int):
+    """_scan_energy with a small cache: quick_local (12 s windows) and make_samples (15 s windows) look at
+    the same file at the same time, and the scan used to be done twice."""
+    try:
+        st = os.stat(src)
+        key = (src, st.st_size, int(st.st_mtime), int(maxsec))
+    except OSError:
+        return _scan_energy(src, maxsec)
+    with _ENERGY_GUARD:
+        if key in _ENERGY:
+            return _ENERGY[key]
+        lock = _ENERGY_LOCKS.setdefault(key, threading.Lock())
+    with lock:
+        with _ENERGY_GUARD:
+            if key in _ENERGY:
+                return _ENERGY[key]
+        prof = _scan_energy(src, maxsec)
+        with _ENERGY_GUARD:
+            _ENERGY[key] = prof
+            _ENERGY_LOCKS.pop(key, None)
+            while len(_ENERGY) > 32:
+                _ENERGY.pop(next(iter(_ENERGY)))
+        return prof
+
+
 def loud_offsets(src: str, win: int, n: int = 2, maxsec: int = 600) -> list:
     try:
-        sr = 2000
-        out = subprocess.run(
-            ["ffmpeg", "-v", "error", "-t", str(int(maxsec)), "-i", src, "-vn", "-ac", "1", "-ar", str(sr),
-             "-f", "s16le", "-"], capture_output=True, timeout=60 + int(maxsec) // 30).stdout
+        energy = energy_profile(src, maxsec)
+        secs = len(energy)
+        if secs <= win + 2:
+            return []
         if np is not None:
-            pcm = np.frombuffer(out[:len(out) // 2 * 2], dtype=np.int16).astype(np.float32)
-            secs = len(pcm) // sr
-            if secs <= win + 2:
-                return []
-            energy = (pcm[:secs * sr].reshape(secs, sr) ** 2).mean(axis=1)
-            del pcm
             pref = np.concatenate(([0.0], np.cumsum(energy, dtype=np.float64)))
             window_sum = pref[win:] - pref[:len(pref) - win]
             order = np.argsort(-window_sum)
             ranked = [int(i) for i in order if i <= secs - win]
         else:
-            pcm = array.array("h")
-            pcm.frombytes(out[:len(out) // 2 * 2])
-            secs = len(pcm) // sr
-            if secs <= win + 2:
-                return []
-            energy = [sum(x * x for x in pcm[i * sr:(i + 1) * sr]) / sr for i in range(secs)]
             pref = [0.0]
             for v in energy:
                 pref.append(pref[-1] + v)
@@ -2024,6 +2119,7 @@ def _group(hits: list) -> list:
     for hs in clusters:
         best = max(hs, key=lambda h: h["w"])
         song = dict(best["song"])
+        song.pop("alt", None)
         song["artist"] = max((h["song"].get("artist") or "" for h in hs),
                              key=lambda a: (len(artist_set(a)), len(a)))
         for k in ("link", "yt", "dur"):
@@ -2031,11 +2127,19 @@ def _group(hits: list) -> list:
         per = {}
         for h in hs:
             per.setdefault(_base(h["engine"]), []).append(h["w"])
-        score = sum(max(v) + 0.5 * (len(v) - 1) for v in per.values())
+        # a repeated answer adds half of ITS OWN weight (it used to add a flat 0.5, so a weak 2nd candidate that
+        # an engine repeated on every piece looked as strong as the real answer)
+        score = sum(max(v) + 0.5 * (sum(v) - max(v)) for v in per.values())
         mult = title_penalty(song)
         score *= mult
-        real = [h for h in hs if not h["song"].get("hum")]
-        solid = len(per) >= 2 or len({h["sample"] for h in real}) >= 2
+        # A song that an engine only ever names as its 2nd / 3rd candidate ("alt": another version, a lookalike)
+        # is never "solid" by repeating itself on several pieces, and melody guesses ("hum") never are either.
+        # An alt candidate DOES count as a second confirmation when the same song was also a first answer on
+        # another piece. This is what stops "Song (Live)" lurking in the candidate lists from blocking the
+        # answer (and starting the slow stages), without losing real evidence.
+        first = [h for h in hs if not h["song"].get("hum") and not h["song"].get("alt")]
+        also = [h for h in hs if h["song"].get("alt") and not h["song"].get("hum")] if first else []
+        solid = len(per) >= 2 or len({h["sample"] for h in first + also}) >= 2
         ranked.append({"song": song, "score": score, "solid": solid, "bad": mult < 1})
     ranked.sort(key=lambda r: r["score"] + (1.0 if r["solid"] else 0.0), reverse=True)
     return ranked
@@ -2049,7 +2153,9 @@ def _confident(ranked: list) -> bool:
         return False
     if len(ranked) > 1:
         second = ranked[1]
-        if second["solid"] or second["score"] >= ranked[0]["score"] * 0.7:
+        # 0.6 (was 0.7): measured on 1500 simulated requests per condition, a slightly stricter "close
+        # competitor" test removes early wrong answers without slowing down the clear cases
+        if second["solid"] or second["score"] >= ranked[0]["score"] * 0.6:
             return False
     return True
 
@@ -2161,7 +2267,8 @@ def find_song_by_words(words):
 
 def recognize(paths, skip=(), extra=None):
     """Order (accuracy first, but fast):
-    0) own fingerprint DB (free, instant)
+    0) own fingerprint DB (free): started together with step 1 and waited for together with it; if it finds
+       the song first, that answer is returned and the engines are cancelled
     1) ACRCloud + Shazam on every piece AT THE SAME TIME, in waves (3, 3, 4 pieces). Answers are voted as they
        arrive; the moment the vote is confirmed the answer is returned and the slow rest is ignored.
        A new wave starts only while the answer is not confirmed yet
@@ -2173,11 +2280,45 @@ def recognize(paths, skip=(), extra=None):
     skip = tuple(skip)
     rejected = {t[2:] for t in skip if t.startswith("k:")}
 
-    if "local#0" not in skip:
-        loc = local_identify(paths)
+    # The own DB (free) starts first but does NOT hold the engines back: its answer is waited for together with
+    # theirs, and if it comes first the engines are cancelled. Before, every song that was not in the DB first
+    # waited for 3 DB lookups one after another and only then reached ACRCloud / Shazam.
+    local = {"fut": None, "hit": None}
+    if fp_engine and paths and "local#0" not in skip:
+        local["fut"] = ENGINE_POOL.submit(local_identify, paths)
+
+    def take_local(block: float = 0.0) -> bool:
+        """Reads the own-DB answer once it is ready (waits up to `block` seconds). True = the DB found the song."""
+        f = local["fut"]
+        if f is None:
+            return False
+        if not f.done():
+            if block <= 0:
+                return False
+            try:
+                f.result(timeout=block)
+            except Exception:
+                pass
+            if not f.done():
+                return False
+        local["fut"] = None
+        try:
+            loc = f.result()
+        except Exception as e:
+            log.warning("local lookup failed: %s", e)
+            return False
         if loc and title_key(loc["title"]) not in rejected:
-            loc["alts"] = []
-            return loc
+            local["hit"] = loc
+            return True
+        return False
+
+    def local_answer():
+        loc = local["hit"]
+        loc["alts"] = []
+        return loc
+
+    if LOCAL_FIRST and take_local(block=ENGINE_TIMEOUT * 2):
+        return local_answer()
 
     primary = _active_engines(skip, PRIMARY_ENGINES)
     order = {n.strip(): i for i, n in enumerate(ENGINE_ORDER)}
@@ -2197,6 +2338,7 @@ def recognize(paths, skip=(), extra=None):
             if title_key(mo.get("title")) in rejected:
                 continue
             mo["engine"] = res["engine"]
+            mo["alt"] = True  # 2nd / 3rd candidate: it never confirms a song by itself (see _group)
             hits.append({"song": mo, "engine": mo["engine"], "sample": idx,
                          "w": base_w * mo.get("wmul", 0.5)})
 
@@ -2205,15 +2347,23 @@ def recognize(paths, skip=(), extra=None):
         wave stops early as soon as the answer is confirmed. Returns True when confirmed."""
         futs = {ENGINE_POOL.submit(call_engine, name, accs, p): (name, idx)
                 for idx, p in batch for name, accs in jobs}
-        if not futs:
+        lf = local["fut"]  # the own DB may still be running: it is waited for together with the engines
+        if not futs and lf is None:
             return False
         pending = set(futs)
+        if lf is not None:
+            pending.add(lf)
         deadline = time.time() + ENGINE_TIMEOUT
         confirmed = False
         while pending and time.time() < deadline and not confirmed:
             done, pending = wait(pending, timeout=min(max(deadline - time.time(), 0.05), 1.0),
                                  return_when=FIRST_COMPLETED)
+            if lf is not None and lf in done and take_local():
+                confirmed = True  # the DB found it: stop here, the engine answers are not needed
+                break
             for f in done:
+                if f is lf:
+                    continue
                 name, idx = futs[f]
                 try:
                     absorb(name, idx, f.result())
@@ -2222,7 +2372,8 @@ def recognize(paths, skip=(), extra=None):
             if done and _confident(_group(hits)):
                 confirmed = True
         for f in pending:
-            f.cancel()  # not started yet -> never sent to the engine, no quota used
+            if f is not lf:
+                f.cancel()  # not started yet -> never sent to the engine, no quota used
         return confirmed
 
     pieces = list(enumerate(paths[:MAX_SAMPLES]))
@@ -2235,7 +2386,12 @@ def recognize(paths, skip=(), extra=None):
         if run_wave(batch, primary):
             break
         primary = _active_engines(skip, PRIMARY_ENGINES)  # Shazam may have been paused during this wave
+    if local["hit"]:
+        return local_answer()
     ranked = _group(hits)
+    # the engines did not confirm anything: the own DB is the last free chance, wait for it if it is still running
+    if not _confident(ranked) and take_local(block=ENGINE_TIMEOUT):
+        return local_answer()
 
     if LYRICS_ENGINE and "lyrics#0" not in skip and not _confident(ranked):
         try:
@@ -2439,19 +2595,26 @@ async def identify_audio_and_reply(msg, src: str, audio_path: str, meta, lang: s
             await asyncio.to_thread(add_sample, sid, "", src)
         else:
             await asyncio.to_thread(add_sample, sid, "", src)
-            song = await asyncio.to_thread(quick_local, audio_path, sid)  # own DB first: no quota
-            if not song:
-                if not await asyncio.to_thread(use_quota, uid):
-                    return await msg.reply_text(tr(lang, "quota"))
-                charged = True
-                outs = await asyncio.to_thread(make_samples, audio_path, sid)
-                if not outs:
-                    await asyncio.to_thread(refund_quota, uid)
-                    return await msg.reply_text(tr(lang, "no_music"))
-                song = await asyncio.to_thread(recognize, outs, (), meta)
+            # own DB first (no quota); the pieces for the engines are cut at the same time
+            quick_task = asyncio.create_task(asyncio.to_thread(quick_local, audio_path, sid))
+            samples_task = asyncio.create_task(asyncio.to_thread(make_samples, audio_path, sid))
+            try:
+                song = await quick_task
                 if not song:
-                    await asyncio.to_thread(refund_quota, uid)
-                    return await msg.reply_text(tr(lang, "not_found"))
+                    if not await asyncio.to_thread(use_quota, uid):
+                        return await msg.reply_text(tr(lang, "quota"))
+                    charged = True
+                    outs = await samples_task
+                    if not outs:
+                        await asyncio.to_thread(refund_quota, uid)
+                        return await msg.reply_text(tr(lang, "no_music"))
+                    song = await asyncio.to_thread(recognize, outs, (), meta)
+                    if not song:
+                        await asyncio.to_thread(refund_quota, uid)
+                        return await msg.reply_text(tr(lang, "not_found"))
+            finally:
+                # audio_path is in a temp folder that is deleted when the caller returns: cutting must be finished
+                await asyncio.gather(samples_task, return_exceptions=True)
     except Exception:
         if charged and not song:
             await asyncio.to_thread(refund_quota, uid)
@@ -2709,9 +2872,18 @@ async def handle_media(msg, media, lang: str):
             raw = os.path.join(SAMPLES_DIR, sid + ".raw")
             await (await media.get_file()).download_to_drive(raw)
 
-            # 1) own database first: usually under a second, costs no quota
-            song = await asyncio.to_thread(quick_local, raw, sid)
+            # 1) own database first: usually under a second, costs no quota. The pieces for the engines are cut
+            #    at the same time, so a miss does not wait for them afterwards
+            quick_task = asyncio.create_task(asyncio.to_thread(quick_local, raw, sid))
+            samples_task = asyncio.create_task(asyncio.to_thread(make_samples, raw, sid))
+            try:
+                song = await quick_task
+            except Exception:
+                await asyncio.gather(samples_task, return_exceptions=True)
+                raise
             if song:
+                # the pieces are kept: if the user taps "wrong song", the engines can still be asked
+                await asyncio.gather(samples_task, return_exceptions=True)
                 await asyncio.to_thread(refund_quota, uid)
                 charged = False
                 song["alts"] = []
@@ -2724,7 +2896,7 @@ async def handle_media(msg, media, lang: str):
                 set_last(sid, song)
             else:
                 # 2) full recognition (ACR + Shazam together)
-                outs = await asyncio.to_thread(make_samples, raw, sid)
+                outs = await samples_task
                 if outs:
                     os.remove(raw)
                 else:
@@ -3042,6 +3214,7 @@ async def post_shutdown(app: Application):
     for sid in list(PREP):
         drop_entry(sid)
     ENGINE_POOL.shutdown(wait=False, cancel_futures=True)
+    LOCAL_POOL.shutdown(wait=False, cancel_futures=True)
     if _BG:
         _BG.stop()
 
