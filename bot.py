@@ -1,6 +1,18 @@
 """
-Music recognition Telegram bot  -  v7 (accurate + fast)
+Music recognition Telegram bot  -  v8 (accurate + fast)
 
+  v8 changes (on top of v7):
+  * STRICT is ON by default: an answer that is not confirmed is never shown, the bot says "not found"
+  * humming-only answers (ACRCloud "humming") can never confirm a song by themselves
+  * Instagram reels: the caption ("Song - Artist") is read, checked against iTunes / Deezer and, when it
+    matches a real track, used at once (no quota, instant). Covers / piano versions work this way
+  * Shazam: one try, short timeout (SHAZAM_TIMEOUT), and a circuit breaker: after a few failures in a row
+    it is skipped for SHAZAM_PAUSE seconds, so recognition does not wait 25 s per piece any more
+  * ENGINE_TIMEOUT is 12 s instead of 30 s
+  * downloads: max 15 min and 48 MB (no more "Request Entity Too Large" for 1-hour videos)
+  * fp_engine: the identify function is looked up by name (identify / recognize / match / lookup / query)
+
+  v7 features kept:
   * own fingerprint DB (fp_engine) is asked FIRST: free and instant
   * ACRCloud + Shazam work TOGETHER: every piece of audio goes to both engines at the same time, the votes
     are added up, and the answer is sent the moment it is confirmed (no waiting for slow pieces)
@@ -14,7 +26,7 @@ Music recognition Telegram bot  -  v7 (accurate + fast)
   * quota is refunded when nothing is recognized or something crashes
 """
 import json, asyncio, sqlite3, datetime, os, re, tempfile, glob, time, hmac, hashlib, base64, uuid
-import subprocess, logging, html, shutil, sys, threading, array, unicodedata
+import subprocess, logging, html, shutil, sys, threading, array, unicodedata, difflib
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from contextlib import asynccontextmanager
@@ -69,13 +81,16 @@ WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")
 WHISPER_WAIT = int(os.environ.get("WHISPER_WAIT", "25"))
 HUM_MIN_SCORE = int(os.environ.get("HUM_MIN_SCORE", "30"))
 MAX_SAMPLES = max(3, min(int(os.environ.get("MAX_SAMPLES", "10")), 12))
-# STRICT=1: if the best answer is still not confirmed after all pieces, say "not found" instead of guessing
-STRICT = os.environ.get("STRICT", "0") == "1"
+# STRICT=1 (default): if the best answer is still not confirmed after all pieces, say "not found" instead of guessing
+STRICT = os.environ.get("STRICT", "1") == "1"
 DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "20"))
 RATE_LIMIT = int(os.environ.get("RATE_LIMIT", "10"))
 DL_CONCURRENCY = int(os.environ.get("DL_CONCURRENCY", "4"))
 ENGINE_THREADS = int(os.environ.get("ENGINE_THREADS", "12"))
-ENGINE_TIMEOUT = int(os.environ.get("ENGINE_TIMEOUT", "30"))  # max wait for one wave of engine answers
+ENGINE_TIMEOUT = int(os.environ.get("ENGINE_TIMEOUT", "12"))  # max wait for one wave of engine answers
+SHAZAM_TIMEOUT = int(os.environ.get("SHAZAM_TIMEOUT", "10"))  # one Shazam request
+SHAZAM_MAX_FAILS = int(os.environ.get("SHAZAM_MAX_FAILS", "3"))  # failures in a row before it is paused
+SHAZAM_PAUSE = int(os.environ.get("SHAZAM_PAUSE", "300"))  # seconds Shazam is skipped after that
 CLIP_MAX_SEC = int(os.environ.get("CLIP_MAX_SEC", "900"))
 MAX_SRC_SEC = int(os.environ.get("MAX_SRC_SEC", str(3 * 3600)))
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
@@ -84,6 +99,7 @@ SAMPLES_DIR = os.environ.get("SAMPLES_DIR", "samples")
 DL_DIR = os.path.join(SAMPLES_DIR, "dl")
 COOKIES = os.environ.get("COOKIES_FILE", "cookies.txt")
 MAX_BYTES = 49 * 1024 * 1024
+AUDIO_MAX_BYTES = 48 * 1024 * 1024
 ARIA2 = bool(shutil.which("aria2c")) and os.environ.get("ARIA2", "1") == "1"
 os.makedirs(SAMPLES_DIR, exist_ok=True)
 os.makedirs(DL_DIR, exist_ok=True)
@@ -791,6 +807,36 @@ def _shazam_client():
     return _SHAZAM["obj"]
 
 
+# Shazam circuit breaker: after a few failures in a row (timeouts, network errors) Shazam is skipped for a
+# while, so a slow / blocked Shazam can not make every recognition wait for it.
+_SHAZAM_STATE = {"fails": 0, "until": 0.0}
+_SHAZAM_LOCK = threading.Lock()
+
+
+def shazam_paused() -> bool:
+    return time.time() < _SHAZAM_STATE["until"]
+
+
+def _shazam_ok():
+    with _SHAZAM_LOCK:
+        _SHAZAM_STATE["fails"] = 0
+
+
+def _shazam_fail(e: Exception):
+    msg = str(e)
+    if "Unrecognized format" in msg or "EOF" in msg:
+        log.warning("shazam could not read this piece: %s", msg[:100])  # a bad piece, not a Shazam outage
+        return
+    with _SHAZAM_LOCK:
+        _SHAZAM_STATE["fails"] += 1
+        n = _SHAZAM_STATE["fails"]
+        log.warning("shazam failed (%d in a row): %s %s", n, type(e).__name__, msg[:100])
+        if n >= SHAZAM_MAX_FAILS:
+            _SHAZAM_STATE["fails"] = 0
+            _SHAZAM_STATE["until"] = time.time() + SHAZAM_PAUSE
+            log.warning("shazam paused for %d s (too many failures in a row)", SHAZAM_PAUSE)
+
+
 # ======================================================================================
 # Account protection
 # ======================================================================================
@@ -818,16 +864,35 @@ def cooling(acc_id: int) -> bool:
 # ======================================================================================
 # Local fingerprint database (fp_engine): free + instant
 # ======================================================================================
+_FP_FN = None
+
+
+def _fp_identify(path: str):
+    """Finds the identify function of fp_engine by name (first call only) and runs it."""
+    global _FP_FN
+    if _FP_FN is None:
+        for name in ("identify", "recognize", "match", "lookup", "query"):
+            f = getattr(fp_engine, name, None)
+            if callable(f):
+                _FP_FN = f
+                log.info("fp_engine: using fp_engine.%s()", name)
+                break
+        else:
+            _FP_FN = False
+            log.warning("fp_engine has no identify/recognize/match/lookup/query function: local database is off")
+    return _FP_FN(path) if _FP_FN else None
+
+
 def local_identify(paths):
     """Own fingerprint DB. Returns a song dict or None.
-    NOTE: fp_engine.identify(path) must return {"title","artist"[,"link","yt"]} or None."""
+    fp_engine's function must return {"title","artist"[,"link","yt"]} or None."""
     if not fp_engine:
         return None
     use = paths[:3]
     found = []
     for p in use:
         try:
-            r = fp_engine.identify(p)  # <- change the function name here if yours differs
+            r = _fp_identify(p)
         except Exception as e:
             log.warning("local fp failed: %s", e)
             continue
@@ -926,8 +991,9 @@ def acr_identify(path: str, acc):
             if score < HUM_MIN_SCORE:
                 continue
             artist = ", ".join(a["name"] for a in (h.get("artists") or []) if a.get("name"))
+            # "hum": a melody guess, never enough to confirm a song by itself (see _group)
             good.append({"title": h["title"], "artist": artist, "link": None, "yt": None,
-                         "wmul": min(0.9, 0.4 + score / 150)})
+                         "wmul": min(0.9, 0.4 + score / 150), "hum": True})
         if good:
             top = good[0]
             top["more"] = [dict(g, wmul=g["wmul"] * 0.6) for g in good[1:]]
@@ -982,9 +1048,9 @@ def shazam_identify(path: str):
     async def go():
         sh = _shazam_client()
         fn = getattr(sh, "recognize", None) or getattr(sh, "recognize_song")
-        return await fn(path)
+        return await asyncio.wait_for(fn(path), SHAZAM_TIMEOUT)
 
-    out = bg_loop().run(go(), timeout=25)
+    out = bg_loop().run(go(), timeout=SHAZAM_TIMEOUT + 3)
     t = (out or {}).get("track")
     if not t:
         return None
@@ -1280,8 +1346,10 @@ def to_mp3(src: str) -> str:
 
 def download_audio(target: str, outdir: str, fallback=None):
     target = normalize_target(target)
+    # max 15 minutes and 48 MB: a 1-hour video can never be sent to Telegram anyway
     plain = {**ydl_base(), "format": "bestaudio[ext=m4a][abr<=130]/bestaudio[ext=m4a]/bestaudio/best",
-             "outtmpl": f"{outdir}/%(id)s.%(ext)s", "max_filesize": 120 * 1024 * 1024}
+             "outtmpl": f"{outdir}/%(id)s.%(ext)s", "max_filesize": AUDIO_MAX_BYTES,
+             "match_filter": _len_filter(CLIP_MAX_SEC)}
     fast = dict(plain)
     if ARIA2:
         fast["external_downloader"] = {"default": "aria2c"}
@@ -1290,6 +1358,8 @@ def download_audio(target: str, outdir: str, fallback=None):
     def run(t, opts):
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(t, download=True)
+            if not info:
+                raise RuntimeError("rejected (too long / too big)")
             if "entries" in info:
                 if not info["entries"]:
                     raise RuntimeError("track not found on SoundCloud (YouTube is blocked too, cookies needed)")
@@ -1330,13 +1400,111 @@ def download_audio(target: str, outdir: str, fallback=None):
             "duration": int(dur) if dur else None}
 
 
-def _meta_from_info(info):
+# ======================================================================================
+# Names written in the caption of a reel ("Song - Artist"), checked against iTunes / Deezer
+# ======================================================================================
+_CAP_SEP = re.compile(r"\s+[-–—]\s+")
+
+
+def _sim(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, a, b).ratio() if a and b else 0.0
+
+
+def _caption_pair(info: dict):
+    """First line of the caption, 'A - B'. Returns (a, b) or None."""
+    text = info.get("description") or info.get("title") or ""
+    for raw in text.splitlines():
+        line = re.sub(r"https?://\S+", " ", raw)
+        line = re.sub(r"[#@]\S+", " ", line)
+        line = re.sub(r"\s+", " ", line).strip()
+        line = re.sub(r"^[\W_]+", "", line)
+        line = re.sub(r"[\s•·|.!~*_]+$", "", line)
+        if not line:
+            continue
+        if len(line) > 120:
+            return None
+        parts = _CAP_SEP.split(line)
+        if len(parts) != 2:
+            return None
+        a, b = parts[0].strip(), parts[1].strip()
+        if 2 <= len(a) <= 70 and 2 <= len(b) <= 70:
+            return a, b
+        return None
+    return None
+
+
+def _pair_score(claim_title: str, claim_artist: str, real_title: str, real_artist: str) -> float:
+    ts = _sim(title_key(claim_title), title_key(real_title))
+    ca, ra = _ck(claim_artist), _ck(real_artist)
+    if not ca or not ra:
+        return 0.0
+    if len(ca) >= 4 and (ca in ra or ra in ca):
+        art = 1.0
+    else:
+        art = _sim(ca, ra)
+    return min(ts, art)
+
+
+def _best_catalog_hit(results, a: str, b: str):
+    """results: [(title, artist)]. Both orders of 'a - b' are tried; the catalog tells which one is right."""
+    best = None
+    for t, ar in results:
+        if not t or not ar:
+            continue
+        for ct, ca in ((a, b), (b, a)):
+            s = _pair_score(ct, ca, t, ar)
+            if s >= 0.82 and (not best or s > best[0]):
+                best = (s, t, ar)
+    return {"title": best[1], "artist": best[2]} if best else None
+
+
+def _itunes_find(a: str, b: str):
+    try:
+        r = HTTP.get("https://itunes.apple.com/search",
+                     params={"term": f"{a} {b}", "media": "music", "entity": "song", "limit": 8}, timeout=6)
+        data = r.json().get("results") or [] if r.ok else []
+    except Exception as e:
+        log.warning("itunes search failed: %s", e)
+        return None
+    return _best_catalog_hit([(x.get("trackName"), x.get("artistName")) for x in data], a, b)
+
+
+def _deezer_find(a: str, b: str):
+    try:
+        r = HTTP.get("https://api.deezer.com/search", params={"q": f"{a} {b}", "limit": 8}, timeout=6)
+        data = r.json().get("data") or [] if r.ok else []
+    except Exception as e:
+        log.warning("deezer search failed: %s", e)
+        return None
+    return _best_catalog_hit([(x.get("title"), (x.get("artist") or {}).get("name")) for x in data], a, b)
+
+
+def caption_meta(info: dict):
+    """Song named in the caption AND found in a real catalog -> verified meta, else None. Blocking (network)."""
+    pair = _caption_pair(info)
+    if not pair:
+        return None
+    a, b = pair
+    hit = _itunes_find(a, b) or _deezer_find(a, b)
+    if not hit:
+        log.info("caption '%s' / '%s' is not a known track, ignored", a, b)
+        return None
+    log.info("caption song: %s - %s", hit["artist"], hit["title"])
+    return {"title": hit["title"], "artist": hit["artist"], "verified": True, "w": 0.95, "via": "caption"}
+
+
+def _meta_from_info(info, caption: bool = False):
     if not info:
         return None
     artist = info.get("artist") or ", ".join(info.get("artists") or [])
     track = info.get("track")
     if artist and track:
         return {"artist": artist.strip(), "title": track}
+    if caption and str(info.get("extractor_key") or "").lower().startswith("instagram"):
+        try:
+            return caption_meta(info)
+        except Exception as e:
+            log.warning("caption meta failed: %s", e)
     return None
 
 
@@ -1365,8 +1533,8 @@ def download_clip(url: str, outdir: str):
                 os.remove(f)
             except OSError:
                 pass
-        return None, (info or {}).get("title"), _meta_from_info(info)
-    return files[0], info.get("title") or "clip", _meta_from_info(info)
+        return None, (info or {}).get("title"), _meta_from_info(info, caption=True)
+    return files[0], info.get("title") or "clip", _meta_from_info(info, caption=True)
 
 
 def download_source_audio(url: str, outdir: str):
@@ -1384,7 +1552,7 @@ def download_source_audio(url: str, outdir: str):
     files = [f for f in glob.glob(f"{outdir}/src.*") if not f.endswith((".part", ".ytdl", ".aria2"))]
     if not info or not files:
         raise RuntimeError("source audio was not downloaded (too long / too big / unavailable)")
-    return files[0], _meta_from_info(info)
+    return files[0], _meta_from_info(info, caption=True)
 
 
 # ======================================================================================
@@ -1451,8 +1619,9 @@ def ig_post_audio(url: str, outdir: str, want_audio: bool = True):
         if not asset:
             log.info("instagram: this post has no music-library track (original sound or no music)")
         if asset.get("title") and asset.get("display_artist"):
+            # the name of the track from Instagram's own music library: trusted
             meta = {"title": asset["title"], "artist": asset["display_artist"], "link": None,
-                    "engine": "meta#0", "w": 0.8}
+                    "engine": "meta#0", "w": 0.95, "verified": True}
         if not want_audio:
             return {"path": None, "meta": meta}
         if not audio_url:
@@ -1680,6 +1849,8 @@ def shazam_lyrics(artist: str, title: str):
         import shazamio  # noqa: F401
     except Exception:
         return None
+    if shazam_paused():
+        return None
     tk = title_key(title)
 
     async def go():
@@ -1787,7 +1958,7 @@ def _active_engines(skip, names=None) -> list:
         if names is not None and name not in names:
             continue
         if name == "shazam":
-            if "shazam#0" not in skip:
+            if "shazam#0" not in skip and not shazam_paused():
                 jobs.append(("shazam", []))
         elif name in ENGINE_FN:
             accs = [r for r in rows
@@ -1799,15 +1970,17 @@ def _active_engines(skip, names=None) -> list:
 
 def call_engine(name: str, accs, path: str):
     if name == "shazam":
-        for attempt in (1, 2):
-            try:
-                res = shazam_identify(path)
-                if res and res.get("title"):
-                    res["engine"] = "shazam#0"
-                    return res
-                return None
-            except Exception as e:
-                log.warning("shazam failed (try %s): %s", attempt, e)
+        if shazam_paused():
+            return None
+        try:
+            res = shazam_identify(path)  # one try: a slow Shazam must not hold the answer back
+        except Exception as e:
+            _shazam_fail(e)
+            return None
+        _shazam_ok()
+        if res and res.get("title"):
+            res["engine"] = "shazam#0"
+            return res
         return None
     attempts = 2
     for r in accs:
@@ -1836,7 +2009,9 @@ def call_engine(name: str, accs, path: str):
 
 def _group(hits: list) -> list:
     """Groups the answers of all engines / pieces by song. Votes of different engines add up, so when ACR and
-    Shazam agree the song wins clearly. Details (link, yt id, real duration) are merged from every engine."""
+    Shazam agree the song wins clearly. Details (link, yt id, real duration) are merged from every engine.
+    A song is 'solid' when two different engines name it, or two different pieces of the audio name it with a
+    real (non-humming) match. A melody (humming) guess alone is never solid."""
     clusters = []
     for h in hits:
         for cl in clusters:
@@ -1859,7 +2034,8 @@ def _group(hits: list) -> list:
         score = sum(max(v) + 0.5 * (len(v) - 1) for v in per.values())
         mult = title_penalty(song)
         score *= mult
-        solid = len(per) >= 2 or len({h["sample"] for h in hs}) >= 2
+        real = [h for h in hs if not h["song"].get("hum")]
+        solid = len(per) >= 2 or len({h["sample"] for h in real}) >= 2
         ranked.append({"song": song, "score": score, "solid": solid, "bad": mult < 1})
     ranked.sort(key=lambda r: r["score"] + (1.0 if r["solid"] else 0.0), reverse=True)
     return ranked
@@ -1991,7 +2167,7 @@ def recognize(paths, skip=(), extra=None):
        A new wave starts only while the answer is not confirmed yet
     2) lyrics (what the singer says) as an extra vote, 3) slowed / sped-up copies as the last try.
     The result has an "alts" list with the runner-up answers.
-    STRICT=1: an unconfirmed answer is dropped ("not found") instead of being guessed."""
+    STRICT=1 (default): an unconfirmed answer is dropped ("not found") instead of being guessed."""
     if isinstance(paths, str):
         paths = [paths]
     skip = tuple(skip)
@@ -2058,6 +2234,7 @@ def recognize(paths, skip=(), extra=None):
             break
         if run_wave(batch, primary):
             break
+        primary = _active_engines(skip, PRIMARY_ENGINES)  # Shazam may have been paused during this wave
     ranked = _group(hits)
 
     if LYRICS_ENGINE and "lyrics#0" not in skip and not _confident(ranked):
@@ -2219,6 +2396,8 @@ async def deliver_audio(msg, a: dict, song=None, lang: str = "fa"):
                                      caption=audio_caption(info), parse_mode="HTML",
                                      reply_markup=kb)
     try:
+        if os.path.getsize(a["path"]) > MAX_BYTES:
+            raise RuntimeError("audio file is larger than Telegram's upload limit")
         with open(a["path"], "rb") as f:
             sent = await msg.reply_audio(f, title=title, performer=performer, duration=a.get("duration"),
                                          caption=audio_caption(info), parse_mode="HTML", reply_markup=kb,
@@ -2247,13 +2426,14 @@ async def upload_video(msg, path: str, caption: str, kb=None):
 
 async def identify_audio_and_reply(msg, src: str, audio_path: str, meta, lang: str):
     uid = msg.from_user.id
-    trusted = bool(meta) and host_in(src, YT_HOSTS)
+    trusted = bool(meta) and (host_in(src, YT_HOSTS) or bool(meta.get("verified")))
     sid = uuid.uuid4().hex[:10]
     charged = False
     song = None
     try:
         if trusted:
-            song = {"title": meta["title"], "artist": meta["artist"], "link": src, "engine": "meta#0"}
+            song = {"title": meta["title"], "artist": meta["artist"],
+                    "link": src if host_in(src, YT_HOSTS) else None, "engine": "meta#0"}
             with open(os.path.join(SAMPLES_DIR, sid + ".json"), "w", encoding="utf-8") as f:
                 json.dump(dict(song), f, ensure_ascii=False)
             await asyncio.to_thread(add_sample, sid, "", src)
@@ -2320,6 +2500,13 @@ async def identify_clip(uid: int, sid: str, meta, src: str, samples_task, quick_
                 meta["link"] = src
                 with open(os.path.join(SAMPLES_DIR, sid + ".json"), "w", encoding="utf-8") as f:
                     json.dump(meta, f, ensure_ascii=False)
+                return meta_song, False
+            if meta.get("verified"):
+                # a name from the reel's caption (checked in iTunes / Deezer) or from Instagram's own
+                # music library: instant, no quota. The samples are still cut for the "wrong song" button.
+                with open(os.path.join(SAMPLES_DIR, sid + ".json"), "w", encoding="utf-8") as f:
+                    json.dump({"title": meta["title"], "artist": meta["artist"], "link": None}, f,
+                              ensure_ascii=False)
                 return meta_song, False
         if quick_task:
             try:
