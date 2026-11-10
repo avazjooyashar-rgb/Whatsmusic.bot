@@ -1,59 +1,56 @@
 """
-Music recognition Telegram bot  -  v9 (accurate + fast)
+Music recognition Telegram bot - v10 (clean)
 
-  v9 changes (on top of v8) - recognition speed and accuracy only, nothing else is touched:
-  * own fingerprint DB: the pieces are looked up IN PARALLEL (was one after another), and inside
-    recognize() the DB runs AT THE SAME TIME as ACRCloud + Shazam instead of making them wait for it.
-    If the DB finds the song first, the answer is returned at once and the engines are cancelled
-  * quick_local() uses the two LOUDEST 12 s windows (music, not an intro / silence / talking) and looks
-    them up in parallel. The loudness scan is computed once and shared with make_samples()
-  * voice messages and "audio only" links: quick_local and sample cutting run side by side, and the
-    pieces are kept after a DB hit, so the "wrong song" button can still ask the engines
-  * VOTING FIX: the 2nd / 3rd candidates of ACRCloud (other versions of the same song: live, remix...)
-    no longer count as a "confirmed" competitor. Before, they blocked the early exit, so the bot kept
-    sending more pieces and then ran the slow lyrics (whisper) and sped-up/slowed stages even when
-    the answer was already clear. A repeated answer now adds half of ITS OWN weight (was a flat 0.5)
-  * ENGINE_THREADS default 24 (engine calls are network waits, so waves do not queue under load)
-  * the cover patch is NOT part of this file: it only added download time
+Recognition (see recognition.py):
+  1) own fingerprint DB (fp_engine): free, fast, knows remixes and special versions
+  2) ACRCloud, with several accounts in priority order: when one is out of quota the next one is used, and
+     the first one is used again as soon as its quota is open
+No Shazam, no whisper, no voting between engines.
 
-  v8 changes (on top of v7):
-  * STRICT is ON by default: an answer that is not confirmed is never shown, the bot says "not found"
-  * humming-only answers (ACRCloud "humming") can never confirm a song by themselves
-  * Instagram reels: the caption ("Song - Artist") is read, checked against iTunes / Deezer and, when it
-    matches a real track, used at once (no quota, instant). Covers / piano versions work this way
-  * Shazam: one try, short timeout (SHAZAM_TIMEOUT), and a circuit breaker: after a few failures in a row
-    it is skipped for SHAZAM_PAUSE seconds, so recognition does not wait 25 s per piece any more
-  * ENGINE_TIMEOUT is 12 s instead of 30 s
-  * downloads: max 15 min and 48 MB (no more "Request Entity Too Large" for 1-hour videos)
-  * fp_engine: the identify function is looked up by name (identify / recognize / match / lookup / query)
+Sources: Instagram / YouTube links (clip + one tap to identify), voice / audio / video notes, streaming links
+(Spotify, Apple Music...), song names (search), pieces of lyrics (find the song by its words).
 
-  v7 features kept:
-  * own fingerprint DB (fp_engine) is asked FIRST: free and instant
-  * ACRCloud + Shazam work TOGETHER: every piece of audio goes to both engines at the same time, the votes
-    are added up, and the answer is sent the moment it is confirmed (no waiting for slow pieces)
-  * a result is accepted only when it is confirmed (two engines agree, or two different pieces agree)
-    and has no close competitor
-  * the ORIGINAL file is downloaded: direct YouTube id from ACR first, otherwise YouTube results are
-    scored (title, artist, "- Topic" / VEVO / official channel, duration vs the real duration,
-    remix / live / cover / sped-up are rejected) and the best one is taken
-  * while recognizing: ONLY the status at the top of the chat (typing / recording...) stays on until the
-    song is found. Nothing is shown under the clip, for voice, clip link, lyrics text and song name
-  * quota is refunded when nothing is recognized or something crashes
+Environment:
+  BOT_TOKEN (required), BOT_USERNAME, ADMIN_IDS, DB_PATH, COOKIES_FILE, DAILY_LIMIT, RATE_LIMIT
+  ACR_HOST / ACR_KEY / ACR_SECRET            first ACRCloud account (only used when the accounts table is empty)
+  ACR_ACCOUNTS="host:key:secret,host:key:secret"   more accounts to seed (only used when the table is empty)
+  more accounts can be added to the `accounts` table (type='acr') at any time: lowest id = highest priority
 """
-import json, asyncio, sqlite3, datetime, os, re, tempfile, glob, time, hmac, hashlib, base64, uuid
-import subprocess, logging, html, shutil, sys, threading, array, unicodedata, difflib
+import array
+import asyncio
+import datetime
+import difflib
+import glob
+import hashlib
+import html
+import http.cookiejar
+import json
+import logging
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from contextlib import asynccontextmanager
 from urllib.parse import quote, urlparse, parse_qs
+
 import requests
-from requests.adapters import HTTPAdapter
 import yt_dlp
+from requests.adapters import HTTPAdapter
 from telegram import (Update, InlineKeyboardButton as Btn, InlineKeyboardMarkup as Markup,
                       InlineQueryResultArticle, InputTextMessageContent)
 from telegram.constants import ChatAction
 from telegram.ext import (Application, CommandHandler, MessageHandler, CallbackQueryHandler,
                           InlineQueryHandler, filters, ContextTypes)
+
+import recognition
+from recognition import title_key, artist_set, same_song, is_variant, fold, first_artist
 
 try:  # python-telegram-bot >= 21
     from telegram import LinkPreviewOptions
@@ -74,50 +71,35 @@ try:  # your own fingerprint database (optional)
     import fp_engine
 except Exception:
     fp_engine = None
-    log.warning("fp_engine not loaded: local database is off")
+    log.warning("fp_engine not loaded: the local database is off")
 
 
 # ======================================================================================
 # Config
 # ======================================================================================
+def _int(name: str, default) -> int:
+    return int(os.environ.get(name, default))
+
+
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 if "BOT_USERNAME" not in os.environ:
-    log.warning("BOT_USERNAME is not set in the environment, using the built-in default")
+    log.warning("BOT_USERNAME is not set, using the built-in default")
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "Whatsmuziccbot").lstrip("@")
 ACR_HOST = os.environ.get("ACR_HOST")
 ACR_KEY = os.environ.get("ACR_KEY")
 ACR_SECRET = os.environ.get("ACR_SECRET")
 ODESLI_KEY = os.environ.get("ODESLI_KEY")  # optional
-ENGINE_ORDER = os.environ.get("ENGINES", "acr,shazam").split(",")
-PRIMARY_ENGINES = ("acr", "shazam")
-COOLDOWN_SEC = int(os.environ.get("COOLDOWN_SEC", str(6 * 3600)))
-LYRICS_ENGINE = os.environ.get("LYRICS_ENGINE", "1") == "1"
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")
-WHISPER_WAIT = int(os.environ.get("WHISPER_WAIT", "25"))
-HUM_MIN_SCORE = int(os.environ.get("HUM_MIN_SCORE", "30"))
-MAX_SAMPLES = max(3, min(int(os.environ.get("MAX_SAMPLES", "10")), 12))
-# STRICT=1 (default): if the best answer is still not confirmed after all pieces, say "not found" instead of guessing
-STRICT = os.environ.get("STRICT", "1") == "1"
-DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "20"))
-RATE_LIMIT = int(os.environ.get("RATE_LIMIT", "10"))
-DL_CONCURRENCY = int(os.environ.get("DL_CONCURRENCY", "4"))
-ENGINE_THREADS = int(os.environ.get("ENGINE_THREADS", "24"))
-LOCAL_THREADS = int(os.environ.get("LOCAL_THREADS", "4"))  # parallel own-DB lookups (ffmpeg + FFT + sqlite)
-# LOCAL_FIRST=1: recognize() waits for the own DB BEFORE it calls ACRCloud / Shazam (v8 behaviour: saves engine
-# quota when the DB knows the song, but every other song waits for the DB first). Default 0 = at the same time.
-LOCAL_FIRST = os.environ.get("LOCAL_FIRST", "0") == "1"
-ENGINE_TIMEOUT = int(os.environ.get("ENGINE_TIMEOUT", "12"))  # max wait for one wave of engine answers
-SHAZAM_TIMEOUT = int(os.environ.get("SHAZAM_TIMEOUT", "10"))  # one Shazam request
-SHAZAM_MAX_FAILS = int(os.environ.get("SHAZAM_MAX_FAILS", "3"))  # failures in a row before it is paused
-SHAZAM_PAUSE = int(os.environ.get("SHAZAM_PAUSE", "300"))  # seconds Shazam is skipped after that
-CLIP_MAX_SEC = int(os.environ.get("CLIP_MAX_SEC", "900"))
-MAX_SRC_SEC = int(os.environ.get("MAX_SRC_SEC", str(3 * 3600)))
+DAILY_LIMIT = _int("DAILY_LIMIT", 20)
+RATE_LIMIT = _int("RATE_LIMIT", 10)
+DL_CONCURRENCY = _int("DL_CONCURRENCY", 4)
+CLIP_MAX_SEC = _int("CLIP_MAX_SEC", 900)         # longest clip / song that is downloaded
+MAX_SRC_SEC = _int("MAX_SRC_SEC", 3 * 3600)      # longest source that is scanned for recognition
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
 SAMPLES_DIR = os.environ.get("SAMPLES_DIR", "samples")
 DL_DIR = os.path.join(SAMPLES_DIR, "dl")
 COOKIES = os.environ.get("COOKIES_FILE", "cookies.txt")
-MAX_BYTES = 49 * 1024 * 1024
+MAX_BYTES = 49 * 1024 * 1024          # Telegram upload limit for bots
 AUDIO_MAX_BYTES = 48 * 1024 * 1024
 ARIA2 = bool(shutil.which("aria2c")) and os.environ.get("ARIA2", "1") == "1"
 os.makedirs(SAMPLES_DIR, exist_ok=True)
@@ -125,27 +107,21 @@ os.makedirs(DL_DIR, exist_ok=True)
 
 URL_RE = re.compile(r"https?://\S+")
 CLIP_HOSTS = ("youtube.com", "youtu.be", "instagram.com")
-DIRECT_HOSTS = CLIP_HOSTS
 AUDIO_HOSTS = ("youtube.com", "youtu.be", "soundcloud.com")
 YT_HOSTS = ("youtube.com", "youtu.be")
 MP3_PREFIX = "🎵 "
 SONG_KEYS = ("title", "artist", "link", "yt", "dur")
+PAGE = 8
 
 esc = html.escape
 
-PREP = {}   # sid -> {"task", "src", "created", "used", "busy", "song"}
-CANDS = {}  # sid -> {"alts": [...], "created": ts}
-SEARCH = {}  # sid -> {"items": [...], "created": ts}
-PAGE = 8
+PREP = {}    # sid -> {"task", "src", "created", "used", "busy", "song"}   (clips being prepared)
+CANDS = {}   # sid -> {"alts": [...], "created": ts}                        (other answers for "wrong song")
+SEARCH = {}  # sid -> {"items": [...], "created": ts}                        (search result pages)
 
 HTTP = requests.Session()
 HTTP.mount("https://", HTTPAdapter(pool_connections=16, pool_maxsize=48))
 HTTP.mount("http://", HTTPAdapter(pool_connections=4, pool_maxsize=8))
-
-ENGINE_POOL = ThreadPoolExecutor(max_workers=ENGINE_THREADS, thread_name_prefix="engine")
-# own-DB lookups have their own pool: a lookup running in ENGINE_POOL waits for these tasks, so they must not
-# share one pool (that could deadlock when the pool is full)
-LOCAL_POOL = ThreadPoolExecutor(max_workers=max(1, LOCAL_THREADS), thread_name_prefix="local")
 
 _DL_SEM = None
 
@@ -161,26 +137,11 @@ def dl_sem() -> asyncio.Semaphore:
 # Languages
 # ======================================================================================
 LANGS = {
-    "fa": "🇮🇷 زبان فارسی",
-    "en": "🇬🇧 English",
-    "uz": "🇺🇿 O'zbek",
-    "ru": "🇷🇺 Русский",
-    "es": "🇪🇸 Español",
-    "ar": "🇸🇦 اللغة العربية",
-    "tr": "🇹🇷 Türkçe",
-    "hi": "🇮🇳 हिंदी",
-    "vi": "🇻🇳 Tiếng Việt",
-    "uk": "🇺🇦 Українська",
-    "id": "🇮🇩 Bahasa Indonesia",
-    "ms": "🇲🇾 Melayu",
-    "ko": "🇰🇷 한국인",
-    "pt": "🇧🇷 Português",
-    "zh": "🇨🇳 中國人",
-    "fr": "🇫🇷 Français",
-    "de": "🇩🇪 Deutsch",
-    "it": "🇮🇹 Italiano",
-    "he": "🇮🇱 עברית",
-    "nl": "🇳🇱 Nederlands",
+    "fa": "🇮🇷 زبان فارسی", "en": "🇬🇧 English", "uz": "🇺🇿 O'zbek", "ru": "🇷🇺 Русский",
+    "es": "🇪🇸 Español", "ar": "🇸🇦 اللغة العربية", "tr": "🇹🇷 Türkçe", "hi": "🇮🇳 हिंदी",
+    "vi": "🇻🇳 Tiếng Việt", "uk": "🇺🇦 Українська", "id": "🇮🇩 Bahasa Indonesia", "ms": "🇲🇾 Melayu",
+    "ko": "🇰🇷 한국인", "pt": "🇧🇷 Português", "zh": "🇨🇳 中國人", "fr": "🇫🇷 Français",
+    "de": "🇩🇪 Deutsch", "it": "🇮🇹 Italiano", "he": "🇮🇱 עברית", "nl": "🇳🇱 Nederlands",
     "sv": "🇸🇪 Svenska",
 }
 
@@ -198,19 +159,14 @@ STR = {
             "بعد از شناسایی، لینک Spotify و YouTube Music و متن ترانه هم همین‌جاست ✨\n\n"
             "🌐 زبان بات رو از دکمه‌های پایین عوض کن"),
         "lang_set": "✅ زبان بات شد فارسی",
-        "working": "⏳ در حال پردازش...",
         "err": "❌ دریافت رسانه از منبع ممکن نیست.",
         "clip_missing": "⚠️ کلیپ پیدا نشد یا بزرگ‌تر از ۵۰ مگابایته.",
         "quota": "⛔ سقف تشخیص امروزت پر شده، فردا دوباره امتحان کن.",
         "quota_short": "⛔ سقف تشخیص امروزت پر شده.",
         "not_found": "😕 آهنگ شناسایی نشد.\nبخش دیگری بفرست که موسیقی در آن واضح شنیده شود، بدون صحبت یا سروصدای زیاد.",
-        "no_more": "😕 موتور دیگه‌ای برای امتحان نمونده.",
+        "no_more": "😕 نتیجه‌ی دیگه‌ای پیدا نشد.",
         "expired": "نمونه منقضی شده، لینک یا فایل رو دوباره بفرست.",
         "no_result": "نتیجه‌ی دیگه‌ای نیست.",
-        "identifying": "⏳ در حال شناسایی آهنگ...",
-        "wait_toast": "⏳ در حال شناسایی آهنگ...",
-        "downloading": "⏳ در حال دریافت آهنگ...",
-        "lyrics_wait": "⏳ در حال پیدا کردن متن ترانه...",
         "lyrics_none": "😕 متن این آهنگ پیدا نشد.",
         "track_missing": "اطلاعات آهنگ پیدا نشد.",
         "btn_rec": "شناسایی موسیقی",
@@ -232,19 +188,14 @@ STR = {
             "After identifying, you also get Spotify and YouTube Music links and the lyrics ✨\n\n"
             "🌐 Change the bot language with the buttons below"),
         "lang_set": "✅ Language set to English",
-        "working": "⏳ Working on it...",
         "err": "❌ Couldn't get the media from the source.",
         "clip_missing": "⚠️ Clip not found or larger than 50 MB.",
         "quota": "⛔ You've reached today's recognition limit. Try again tomorrow.",
         "quota_short": "⛔ You've reached today's recognition limit.",
         "not_found": "😕 Couldn't identify the song.\nSend another part where the music is clearly audible, without speech or too much noise.",
-        "no_more": "😕 No other engine left to try.",
+        "no_more": "😕 No other result found.",
         "expired": "This sample has expired. Please send the link or file again.",
         "no_result": "No other result.",
-        "identifying": "⏳ Identifying the song...",
-        "wait_toast": "⏳ Identifying the song...",
-        "downloading": "⏳ Getting the song...",
-        "lyrics_wait": "⏳ Looking for the lyrics...",
         "lyrics_none": "😕 Couldn't find lyrics for this song.",
         "track_missing": "Song info not found.",
         "btn_rec": "Identify music",
@@ -266,18 +217,14 @@ STR = {
             "Tanıdıktan sonra Spotify, YouTube Music bağlantıları ve şarkı sözleri de burada ✨\n\n"
             "🌐 Bot dilini aşağıdaki düğmelerle değiştirebilirsin"),
         "lang_set": "✅ Dil Türkçe olarak ayarlandı",
-        "working": "⏳ İşleniyor...",
         "err": "❌ Bu dosya şu an kullanılamıyor. Başka bir bağlantı veya şarkı dene ya da birkaç dakika sonra tekrar dene.",
         "clip_missing": "⚠️ Klip bulunamadı veya 50 MB'dan büyük.",
         "quota": "⛔ Bugünkü tanıma hakkın doldu, yarın tekrar dene.",
         "quota_short": "⛔ Bugünkü tanıma hakkın doldu.",
         "not_found": "😕 Şarkıyı tanıyamadım.",
-        "no_more": "😕 Denenecek başka motor kalmadı.",
+        "no_more": "😕 Başka sonuç bulunamadı.",
         "expired": "Örnek süresi doldu, bağlantıyı veya dosyayı tekrar gönder.",
         "no_result": "Başka sonuç yok.",
-        "identifying": "⏳ Tanınıyor...",
-        "wait_toast": "⏳ Birkaç saniye...",
-        "lyrics_wait": "⏳ Şarkı sözleri aranıyor...",
         "lyrics_none": "😕 Bu şarkının sözleri bulunamadı.",
         "track_missing": "Şarkı bilgisi bulunamadı.",
         "btn_rec": "Müziği tanı",
@@ -299,18 +246,14 @@ STR = {
             "بعد التعرّف تجد روابط Spotify وYouTube Music وكلمات الأغنية هنا ✨\n\n"
             "🌐 غيّر لغة البوت من الأزرار أدناه"),
         "lang_set": "✅ تم ضبط اللغة على العربية",
-        "working": "⏳ جارٍ المعالجة...",
         "err": "❌ هذا الملف غير متاح حالياً. جرّب رابطاً أو أغنية أخرى، أو حاول مرة أخرى بعد قليل.",
         "clip_missing": "⚠️ لم يتم العثور على المقطع أو أنه أكبر من 50 ميغابايت.",
         "quota": "⛔ وصلت إلى حد التعرّف اليومي، حاول غداً.",
         "quota_short": "⛔ وصلت إلى حد التعرّف اليومي.",
         "not_found": "😕 لم أستطع التعرّف على الأغنية.",
-        "no_more": "😕 لا توجد محركات أخرى لتجربتها.",
+        "no_more": "😕 لم أجد نتيجة أخرى.",
         "expired": "انتهت صلاحية العيّنة، أعد إرسال الرابط أو الملف.",
         "no_result": "لا توجد نتيجة أخرى.",
-        "identifying": "⏳ جارٍ التعرّف...",
-        "wait_toast": "⏳ بضع ثوانٍ...",
-        "lyrics_wait": "⏳ جارٍ البحث عن الكلمات...",
         "lyrics_none": "😕 لم أجد كلمات هذه الأغنية.",
         "track_missing": "معلومات الأغنية غير موجودة.",
         "btn_rec": "التعرّف على الموسيقى",
@@ -332,18 +275,14 @@ STR = {
             "После распознавания здесь же ссылки на Spotify и YouTube Music и текст песни ✨\n\n"
             "🌐 Язык бота можно сменить кнопками ниже"),
         "lang_set": "✅ Язык бота: русский",
-        "working": "⏳ Обрабатываю...",
         "err": "❌ Этот файл сейчас недоступен. Попробуй другую ссылку или песню или повтори через несколько минут.",
         "clip_missing": "⚠️ Клип не найден или больше 50 МБ.",
         "quota": "⛔ Дневной лимит распознавания исчерпан, попробуй завтра.",
         "quota_short": "⛔ Дневной лимит распознавания исчерпан.",
         "not_found": "😕 Не удалось распознать песню.",
-        "no_more": "😕 Других движков для проверки не осталось.",
+        "no_more": "😕 Других результатов не найдено.",
         "expired": "Образец устарел, отправь ссылку или файл заново.",
         "no_result": "Других результатов нет.",
-        "identifying": "⏳ Распознаю...",
-        "wait_toast": "⏳ Ещё несколько секунд...",
-        "lyrics_wait": "⏳ Ищу текст песни...",
         "lyrics_none": "😕 Текст этой песни не найден.",
         "track_missing": "Информация о песне не найдена.",
         "btn_rec": "Узнать музыку",
@@ -364,22 +303,6 @@ def detect_lang(code) -> str:
     return c if c in LANGS else "en"
 
 
-def get_lang(uid: int) -> str:
-    if uid in LANG_CACHE:
-        return LANG_CACHE[uid]
-    with db() as c:
-        r = c.execute("SELECT lang FROM users WHERE uid=?", (uid,)).fetchone()
-    lang = r["lang"] if r and r["lang"] else "fa"  # old users keep Persian
-    LANG_CACHE[uid] = lang
-    return lang
-
-
-def set_lang(uid: int, lang: str):
-    with db() as c:
-        c.execute("UPDATE users SET lang=? WHERE uid=?", (lang, uid))
-    LANG_CACHE[uid] = lang
-
-
 def tr(lang: str, key: str, **kw) -> str:
     s = STR.get(lang, STR["en"]).get(key) or STR["en"][key]
     return s.format(**kw) if kw else s
@@ -391,12 +314,12 @@ def lang_keyboard():
 
 
 # ======================================================================================
-# Small helpers: chat action (the status at the top of the chat), rate limit, URL / host handling
+# Small helpers: chat status, rate limit, URLs
 # ======================================================================================
 @asynccontextmanager
 async def chat_action(bot, chat_id, action=ChatAction.RECORD_VOICE):
-    """Keeps the status at the top of the chat ("recording voice..." / "typing...") alive while the
-    block runs. This is the ONLY progress indicator: nothing is posted under the clip."""
+    """Keeps the status at the top of the chat ("recording voice..." / "typing...") on while the block runs.
+    This is the ONLY progress indicator: nothing is posted under the clip."""
     async def loop():
         while True:
             try:
@@ -448,6 +371,7 @@ def host_in(url: str, hosts) -> bool:
 
 
 def norm_url(url: str) -> str:
+    """One canonical form per clip / video, so the cache hits no matter how the link was written."""
     try:
         u = urlparse(url)
         host = host_of(url)
@@ -477,64 +401,6 @@ def normalize_target(target: str) -> str:
     if re.match(r"(?:yt|sc)search1:", target):
         return target
     return f"ytsearch1:{target}"
-
-
-# ======================================================================================
-# Song / artist matching
-# ======================================================================================
-_SPLIT_RE = re.compile(r"\s+(?:feat\.?|featuring|ft\.?|with|x|and|و)\s+|\s*[,&;/+،]\s*", re.I)
-_FEAT_RE = re.compile(r"[\(\[]\s*(?:feat\.?|ft\.?|featuring)\s+([^\)\]]+)", re.I)
-
-_BAD_TITLE_RE = re.compile(
-    r"mash\s?-?up|remix|medley|megamix|nightcore|slowed|sped\s?up|speed\s?up|reverb|"
-    r"karaoke|8d\s?audio|bass\s?boosted|ringtone|"
-    r"\bcover\b|[\(\[\-–]\s*live\b|\blive\s+(?:at|from|in|on|session|version)\b|"
-    r"ریمیکس|ریمیک|مشاپ|مدلی|بازخوانی|کاور", re.I)
-
-
-def title_penalty(song: dict) -> float:
-    return 0.5 if _BAD_TITLE_RE.search(song.get("title") or "") else 1.0
-
-
-def _fold(s: str) -> str:
-    s = (s or "").lower().replace("ي", "ی").replace("ك", "ک")
-    s = unicodedata.normalize("NFKD", s)
-    return "".join(ch for ch in s if not unicodedata.combining(ch))
-
-
-def title_key(t: str) -> str:
-    t = re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", t or "")
-    t = re.split(r"\s+[-–—]\s+", t)[0]
-    return re.sub(r"[\W_]+", "", _fold(t))
-
-
-def artist_set(artist: str, title: str = "") -> set:
-    parts = [p for p in _SPLIT_RE.split(artist or "") if p and p.strip()]
-    for m in _FEAT_RE.findall(title or ""):
-        parts += [p for p in _SPLIT_RE.split(m) if p and p.strip()]
-    return {k for k in (re.sub(r"[\W_]+", "", _fold(p)) for p in parts) if k}
-
-
-def first_artist(artist: str) -> str:
-    parts = [p.strip() for p in _SPLIT_RE.split(artist or "") if p and p.strip()]
-    return parts[0] if parts else (artist or "").strip()
-
-
-def same_song(a: dict, b: dict) -> bool:
-    ta, tb = title_key(a.get("title")), title_key(b.get("title"))
-    if not ta or not tb:
-        return False
-    if title_penalty(a) != title_penalty(b):  # original vs remix / cover / live are different songs
-        return False
-    if ta != tb:
-        short, long_ = sorted((ta, tb), key=len)
-        if not (len(short) >= 6 and long_.startswith(short)):
-            return False
-    sa = artist_set(a.get("artist"), a.get("title"))
-    sb = artist_set(b.get("artist"), b.get("title"))
-    if not sa or not sb or (sa & sb):
-        return True
-    return any(x in y or y in x for x in sa for y in sb if len(x) >= 4 and len(y) >= 4)
 
 
 # ======================================================================================
@@ -581,21 +447,36 @@ def db():
 
 
 def migrate():
+    """Adds columns that older databases do not have yet."""
     with db() as c:
         for table, col in (("songs", "info"), ("samples", "src"), ("users", "lang")):
             cols = [r[1] for r in c.execute(f"PRAGMA table_info({table})")]
             if col not in cols:
                 c.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
-        # AudD is not used anymore: drop its old accounts
-        c.execute("DELETE FROM accounts WHERE type='audd'")
+        c.execute("DELETE FROM accounts WHERE type='audd'")  # AudD is not used anymore
 
 
-def seed_from_env():
+def seed_accounts():
+    """First start only: ACRCloud accounts from the environment. After that the table is the source of truth."""
+    specs = []
+    if all([ACR_HOST, ACR_KEY, ACR_SECRET]):
+        specs.append((ACR_HOST, ACR_KEY, ACR_SECRET))
+    for item in os.environ.get("ACR_ACCOUNTS", "").split(","):
+        parts = item.strip().split(":")
+        if len(parts) == 3 and all(parts):
+            specs.append(tuple(parts))
     with db() as c:
         if c.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]:
             return
-        if all([ACR_HOST, ACR_KEY, ACR_SECRET]):
-            c.execute("INSERT INTO accounts(type,host,key,secret) VALUES('acr',?,?,?)", (ACR_HOST, ACR_KEY, ACR_SECRET))
+        for host, key, secret in specs:
+            c.execute("INSERT INTO accounts(type,host,key,secret) VALUES('acr',?,?,?)", (host, key, secret))
+
+
+def load_accounts() -> list:
+    """Called by recognition.py (every 30 s at most): the enabled ACRCloud accounts."""
+    with db() as c:
+        rows = c.execute("SELECT id,host,key,secret FROM accounts WHERE type='acr' AND enabled=1 ORDER BY id")
+        return [dict(r) for r in rows.fetchall()]
 
 
 def get_setting(k, default=None):
@@ -613,10 +494,30 @@ def daily_limit() -> int:
     return int(get_setting("daily_limit", DAILY_LIMIT))
 
 
+def get_lang(uid: int) -> str:
+    if uid in LANG_CACHE:
+        return LANG_CACHE[uid]
+    with db() as c:
+        r = c.execute("SELECT lang FROM users WHERE uid=?", (uid,)).fetchone()
+    lang = r["lang"] if r and r["lang"] else "fa"  # old users keep Persian
+    LANG_CACHE[uid] = lang
+    return lang
+
+
+def set_lang(uid: int, lang: str):
+    with db() as c:
+        c.execute("UPDATE users SET lang=? WHERE uid=?", (lang, uid))
+    LANG_CACHE[uid] = lang
+
+
 def touch_user(u):
     with db() as c:
         c.execute("INSERT OR IGNORE INTO users(uid, first_seen, lang) VALUES(?,?,?)",
                   (u.id, datetime.date.today().isoformat(), detect_lang(u.language_code)))
+
+
+def _song_json(song: dict) -> str:
+    return json.dumps({k: song.get(k) for k in SONG_KEYS}, ensure_ascii=False)
 
 
 def cache_get(key):
@@ -637,18 +538,13 @@ def clip_get(url):
 
 
 def clip_put(url, file_id, song=None):
-    data = None
-    if song:
-        data = json.dumps({k: song.get(k) for k in SONG_KEYS}, ensure_ascii=False)
+    """file_id and song are filled separately (the song is known later): NULLs never overwrite a value."""
+    data = _song_json(song) if song else None
     with db() as c:
         c.execute("""INSERT INTO clips(url,file_id,song) VALUES(?,?,?)
                      ON CONFLICT(url) DO UPDATE SET
                        file_id=COALESCE(excluded.file_id, clips.file_id),
                        song=COALESCE(excluded.song, clips.song)""", (url, file_id, data))
-
-
-def clip_set_song(url, song):
-    clip_put(url, None, song)
 
 
 def clip_delete(url):
@@ -663,9 +559,8 @@ def media_cache_get(uid: str):
 
 
 def media_cache_put(uid: str, song: dict, sid: str):
-    data = json.dumps({k: song.get(k) for k in SONG_KEYS}, ensure_ascii=False)
     with db() as c:
-        c.execute("INSERT OR REPLACE INTO media_songs VALUES(?,?,?)", (uid, data, sid))
+        c.execute("INSERT OR REPLACE INTO media_songs VALUES(?,?,?)", (uid, _song_json(song), sid))
 
 
 def media_cache_drop(sid: str):
@@ -706,6 +601,7 @@ def add_sample(sid: str, path: str, src=None):
 
 
 def set_last(sid: str, song: dict):
+    """The answer currently shown for this sample: "wrong song" rejects it."""
     val = f"{song.get('engine') or ''}||{title_key(song.get('title'))}"
     with db() as c:
         c.execute("UPDATE samples SET last=? WHERE id=?", (val, sid))
@@ -715,6 +611,12 @@ def remember_alts(sid: str, song: dict):
     CANDS[sid] = {"alts": song.pop("alts", None) or [], "created": time.time()}
 
 
+def save_meta(sid: str, song: dict):
+    """The name found in the post (title / caption / music library): kept as a candidate for "wrong song"."""
+    with open(os.path.join(SAMPLES_DIR, sid + ".json"), "w", encoding="utf-8") as f:
+        json.dump({k: song.get(k) for k in ("title", "artist", "link")}, f, ensure_ascii=False)
+
+
 # ======================================================================================
 # Background housekeeping
 # ======================================================================================
@@ -722,8 +624,7 @@ def cleanup_samples():
     now = time.time()
     cutoff = int(now) - 86400
     with db() as c:
-        rows = c.execute("SELECT id FROM samples WHERE created<?", (cutoff,)).fetchall()
-        for r in rows:
+        for r in c.execute("SELECT id FROM samples WHERE created<?", (cutoff,)).fetchall():
             for p in glob.glob(os.path.join(SAMPLES_DIR, r["id"] + "*")):
                 try:
                     os.remove(p)
@@ -737,9 +638,6 @@ def cleanup_samples():
             p = os.path.join(SAMPLES_DIR, name)
             if os.path.isfile(p) and now - os.path.getmtime(p) > 86400:
                 os.remove(p)
-    except OSError:
-        pass
-    try:
         for name in os.listdir(DL_DIR):
             p = os.path.join(DL_DIR, name)
             if now - os.path.getmtime(p) > 3 * 3600:
@@ -760,6 +658,7 @@ def _rm_audio_of(task):
 
 
 def drop_entry(sid: str):
+    """Forgets a prepared clip and deletes the mp3 that was downloaded for it (if it was never sent)."""
     e = PREP.pop(sid, None)
     if not e:
         return
@@ -770,7 +669,7 @@ def drop_entry(sid: str):
         t.add_done_callback(_rm_audio_of)
 
 
-def cleanup_prep():
+def cleanup_memory():
     now = time.time()
     for sid in [s for s, e in PREP.items() if now - e["created"] > 3600]:
         drop_entry(sid)
@@ -788,342 +687,72 @@ async def maintenance_loop():
     while True:
         try:
             await asyncio.to_thread(cleanup_samples)
-            cleanup_prep()
+            cleanup_memory()
         except Exception:
             log.exception("maintenance failed")
         await asyncio.sleep(600)
 
 
 # ======================================================================================
-# Persistent background event loop (Shazam)
+# Recognition glue: own DB first (free), then ACRCloud (1 quota)
 # ======================================================================================
-class _BgLoop:
-    def __init__(self):
-        self.loop = asyncio.new_event_loop()
-        threading.Thread(target=self.loop.run_forever, daemon=True, name="bg-loop").start()
-
-    def run(self, coro, timeout: float = 60):
-        return asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout)
-
-    def stop(self):
-        self.loop.call_soon_threadsafe(self.loop.stop)
+class OutOfQuota(Exception):
+    """The user's daily recognition limit is used up."""
 
 
-_BG = None
-_BG_LOCK = threading.Lock()
-_SHAZAM = {}
-
-
-def bg_loop() -> _BgLoop:
-    global _BG
-    with _BG_LOCK:
-        if _BG is None:
-            _BG = _BgLoop()
-    return _BG
-
-
-def _shazam_client():
-    from shazamio import Shazam
-    if "obj" not in _SHAZAM:
-        _SHAZAM["obj"] = Shazam()
-    return _SHAZAM["obj"]
-
-
-# Shazam circuit breaker: after a few failures in a row (timeouts, network errors) Shazam is skipped for a
-# while, so a slow / blocked Shazam can not make every recognition wait for it.
-_SHAZAM_STATE = {"fails": 0, "until": 0.0}
-_SHAZAM_LOCK = threading.Lock()
-
-
-def shazam_paused() -> bool:
-    return time.time() < _SHAZAM_STATE["until"]
-
-
-def _shazam_ok():
-    with _SHAZAM_LOCK:
-        _SHAZAM_STATE["fails"] = 0
-
-
-def _shazam_fail(e: Exception):
-    msg = str(e)
-    if "Unrecognized format" in msg or "EOF" in msg:
-        log.warning("shazam could not read this piece: %s", msg[:100])  # a bad piece, not a Shazam outage
-        return
-    with _SHAZAM_LOCK:
-        _SHAZAM_STATE["fails"] += 1
-        n = _SHAZAM_STATE["fails"]
-        log.warning("shazam failed (%d in a row): %s %s", n, type(e).__name__, msg[:100])
-        if n >= SHAZAM_MAX_FAILS:
-            _SHAZAM_STATE["fails"] = 0
-            _SHAZAM_STATE["until"] = time.time() + SHAZAM_PAUSE
-            log.warning("shazam paused for %d s (too many failures in a row)", SHAZAM_PAUSE)
-
-
-# ======================================================================================
-# Account protection
-# ======================================================================================
-class QuotaError(Exception):
-    """The engine account is out of quota or its key is rejected."""
-
-
-_COOLDOWN = {}
-
-
-def cool_down(acc_id: int, why: str, sec: int = None):
-    sec = sec or COOLDOWN_SEC
-    _COOLDOWN[acc_id] = time.time() + sec
-    log.warning("account #%s paused for %d min: %s", acc_id, sec // 60, why)
-
-
-def cooling(acc_id: int) -> bool:
-    until = _COOLDOWN.get(acc_id)
-    if until and until > time.time():
-        return True
-    _COOLDOWN.pop(acc_id, None)
-    return False
-
-
-# ======================================================================================
-# Local fingerprint database (fp_engine): free + instant
-# ======================================================================================
-_FP_FN = None
-
-
-def _fp_identify(path: str):
-    """Finds the identify function of fp_engine by name (first call only) and runs it."""
-    global _FP_FN
-    if _FP_FN is None:
-        for name in ("identify", "recognize", "match", "lookup", "query"):
-            f = getattr(fp_engine, name, None)
-            if callable(f):
-                _FP_FN = f
-                log.info("fp_engine: using fp_engine.%s()", name)
-                break
-        else:
-            _FP_FN = False
-            log.warning("fp_engine has no identify/recognize/match/lookup/query function: local database is off")
-    return _FP_FN(path) if _FP_FN else None
-
-
-def _local_one(path: str):
-    """ONE piece against the own DB. A song dict or None. Runs in LOCAL_POOL (or in the caller's thread)."""
+async def identify(uid: int, paths, rejected=()):
+    """Own DB first: no quota. ACRCloud only when the DB does not know the song: costs 1 quota, refunded when
+    nothing is found or something breaks. -> song dict or None. Raises OutOfQuota / NoAccounts."""
+    rejected = set(rejected)
+    song = await asyncio.to_thread(recognition.ask_local, paths, rejected)
+    if song:
+        return song
+    if not await asyncio.to_thread(use_quota, uid):
+        raise OutOfQuota()
+    song = None
     try:
-        r = _fp_identify(path)
-    except Exception as e:
-        log.warning("local fp failed: %s", e)
-        return None
-    if r and r.get("title"):
-        return {"title": r["title"], "artist": r.get("artist") or "",
-                "link": r.get("link"), "yt": r.get("yt"), "engine": "local#0"}
-    return None
-
-
-def _local_pick(found: list, asked: int):
-    """A single loose hit is not trusted when several pieces were asked: two pieces must agree."""
-    got = [f for f in found if f]
-    need = 2 if asked >= 2 else 1
-    for f in got:
-        if sum(1 for g in got if same_song(f, g)) >= need:
-            return f
-    return None
-
-
-def local_identify(paths):
-    """Own fingerprint DB. Returns a song dict or None.
-    fp_engine's function must return {"title","artist"[,"link","yt"]} or None.
-    The pieces are looked up in parallel. Never call this from inside a LOCAL_POOL task."""
-    if not fp_engine:
-        return None
-    use = list(paths[:3])
-    if not use:
-        return None
-    if len(use) == 1:
-        return _local_pick([_local_one(use[0])], 1)
-    futs = [LOCAL_POOL.submit(_local_one, p) for p in use]
-    return _local_pick([f.result() for f in futs], len(use))
-
-
-QUICK_WIN = 12  # seconds per piece of quick_local
-
-
-def _quick_offsets(src: str, d: float) -> list:
-    """Start times of the pieces quick_local asks the DB with: the two LOUDEST windows (that is the music, not
-    an intro / silence / someone talking). If the loudness scan fails: start + middle, as before."""
-    if d < 30:
-        return [0]
-    offs = list(loud_offsets(src, QUICK_WIN, 2, int(min(d, MAX_SRC_SEC))))
-    for fallback in (0, max(0, d / 2 - 6)):
-        if len(offs) >= 2:
-            break
-        if all(abs(fallback - o) >= QUICK_WIN for o in offs):
-            offs.append(fallback)
-    return offs[:2]
-
-
-def quick_local(src: str, sid: str):
-    """Asks the local DB with two different raw pieces (the two loudest windows) AT THE SAME TIME and accepts
-    the answer only if both agree. Very short sources use one piece. Needs no quota, no engines."""
-    if not fp_engine:
-        return None
-    outs = []
-    try:
-        d = probe_duration(src)
-        offs = _quick_offsets(src, d)
-        outs = [os.path.join(SAMPLES_DIR, f"{sid}_q{i}.mp3") for i in range(len(offs))]
-
-        def one(i):
-            return _local_one(outs[i]) if cut_sample(src, outs[i], offs[i], QUICK_WIN, True) else None
-
-        if len(offs) == 1:
-            found = [one(0)]
-        else:
-            futs = [LOCAL_POOL.submit(one, i) for i in range(len(offs))]
-            found = [f.result() for f in futs]
-        if not found or any(f is None for f in found):
-            return None
-        if len(found) > 1 and not same_song(found[0], found[1]):
-            return None
-        return found[0]
-    except Exception as e:
-        log.warning("quick local failed: %s", e)
-        return None
+        song = await asyncio.to_thread(recognition.ask_acr, paths, rejected)
     finally:
-        for out in outs:
-            try:
-                os.remove(out)
-            except OSError:
-                pass
+        if not song:  # not found, no account answered, or cancelled: the user did not get anything
+            await asyncio.to_thread(refund_quota, uid)
+    return song
+
+
+async def find_song(uid: int, paths, fallback=None, rejected=()):
+    """identify() that never raises. `fallback` is a name already known from the post (used when recognition
+    gives nothing). -> (song | None, why) with why in ok / quota / busy / none."""
+    why = "none"
+    try:
+        song = await identify(uid, paths, rejected)
+        if song:
+            return song, "ok"
+    except OutOfQuota:
+        why = "quota"
+    except recognition.NoAccounts:
+        log.error("no ACRCloud account could answer")
+        why = "busy"
+    if fallback:
+        return dict(fallback), "ok"
+    return None, why
+
+
+WHY_KEY = {"quota": "quota", "busy": "err", "none": "not_found"}
+
+
+def meta_to_song(meta, src: str):
+    if not meta:
+        return None
+    return {"title": meta["title"], "artist": meta["artist"], "link": src if host_in(src, YT_HOSTS) else None,
+            "engine": "meta#0"}
+
+
+def meta_is_trusted(meta, src: str) -> bool:
+    """A YouTube title or a verified name (Instagram music library, a caption found in iTunes / Deezer)."""
+    return bool(meta) and (host_in(src, YT_HOSTS) or bool(meta.get("verified")))
 
 
 # ======================================================================================
-# Engines: ACRCloud, Shazam
-# ======================================================================================
-def _hum_score(h: dict) -> float:
-    s = h.get("score") or 0
-    try:
-        s = float(s)
-    except (TypeError, ValueError):
-        return 0.0
-    return s * 100 if s <= 1 else s
-
-
-def _acr_dur(m: dict):
-    try:
-        ms = float(m.get("duration_ms"))
-        return ms / 1000.0 if ms > 0 else None
-    except (TypeError, ValueError):
-        return None
-
-
-def acr_identify(path: str, acc):
-    ts = str(int(time.time()))
-    sig_str = "\n".join(["POST", "/v1/identify", acc["key"], "audio", "1", ts])
-    sig = base64.b64encode(
-        hmac.new(acc["secret"].encode(), sig_str.encode(), hashlib.sha1).digest()
-    ).decode()
-    with open(path, "rb") as f:
-        data = f.read()
-    r = HTTP.post(
-        f"https://{acc['host']}/v1/identify",
-        data={"access_key": acc["key"], "data_type": "audio", "signature_version": "1",
-              "signature": sig, "sample_bytes": len(data), "timestamp": ts},
-        files={"sample": data},
-        timeout=25,
-    ).json()
-    st = r.get("status", {})
-    code = st.get("code")
-    if code in (3001, 3003, 3014):
-        raise QuotaError(f"acr {code}: {st.get('msg', '')}")
-    if code != 0:
-        if code not in (1001, 2004):
-            log.info("acr status %s: %s", code, st.get("msg", ""))
-        return None
-    md = r.get("metadata") or {}
-    music = md.get("music") or []
-    if not music:
-        hum = [h for h in (md.get("humming") or []) if h.get("title")]
-        hum.sort(key=_hum_score, reverse=True)
-        log.info("acr humming: %s", [(h.get("title"), round(_hum_score(h), 1)) for h in hum[:5]])
-        good = []
-        for h in hum[:5]:
-            score = _hum_score(h)
-            if score < HUM_MIN_SCORE:
-                continue
-            artist = ", ".join(a["name"] for a in (h.get("artists") or []) if a.get("name"))
-            # "hum": a melody guess, never enough to confirm a song by itself (see _group)
-            good.append({"title": h["title"], "artist": artist, "link": None, "yt": None,
-                         "wmul": min(0.9, 0.4 + score / 150), "hum": True})
-        if good:
-            top = good[0]
-            top["more"] = [dict(g, wmul=g["wmul"] * 0.6) for g in good[1:]]
-            return top
-        log.info("acr: no music match (metadata keys: %s)", list(md.keys()))
-        return None
-    cands = []
-    for m in music[:3]:
-        if not m.get("title"):
-            continue
-        ext = m.get("external_metadata", {})
-        link = None
-        yt = None
-        if ext.get("spotify", {}).get("track", {}).get("id"):
-            link = "https://open.spotify.com/track/" + ext["spotify"]["track"]["id"]
-        if ext.get("youtube", {}).get("vid"):
-            yt = "https://www.youtube.com/watch?v=" + ext["youtube"]["vid"]
-            link = link or yt
-        artist = ", ".join(a["name"] for a in (m.get("artists") or []) if a.get("name"))
-        try:
-            sc = float(m.get("score"))
-        except (TypeError, ValueError):
-            sc = 100.0
-        cands.append({"title": m["title"], "artist": artist, "link": link, "yt": yt,
-                      "dur": _acr_dur(m),
-                      "wmul": max(0.5, min(1.0, sc / 100.0))})
-    if not cands:
-        return None
-    # the original (non remix / cover / live) result goes first, then ACR's own score order
-    cands.sort(key=lambda c: (title_penalty(c) < 1, -c["wmul"]))
-    top = cands[0]
-    top["more"] = [dict(c, wmul=c["wmul"] * 0.5) for c in cands[1:]]
-    return top
-
-
-ENGINE_FN = {"acr": acr_identify}
-
-
-def _shazam_lyrics_text(track: dict) -> str:
-    for sec in (track or {}).get("sections") or []:
-        if sec.get("type") == "LYRICS" and sec.get("text"):
-            return "\n".join(sec["text"])
-    return ""
-
-
-def shazam_identify(path: str):
-    try:
-        import shazamio  # noqa: F401
-    except Exception:
-        return None
-
-    async def go():
-        sh = _shazam_client()
-        fn = getattr(sh, "recognize", None) or getattr(sh, "recognize_song")
-        return await asyncio.wait_for(fn(path), SHAZAM_TIMEOUT)
-
-    out = bg_loop().run(go(), timeout=SHAZAM_TIMEOUT + 3)
-    t = (out or {}).get("track")
-    if not t:
-        return None
-    try:
-        lyr = _shazam_lyrics_text(t)
-        if lyr:
-            _store_lyrics(t.get("subtitle", ""), t.get("title", ""), lyr)
-    except Exception as e:
-        log.warning("saving shazam lyrics failed: %s", e)
-    return {"title": t.get("title", ""), "artist": t.get("subtitle", ""), "link": None}
-
-
-# ======================================================================================
-# Odesli / yt-dlp
+# Streaming links -> a name (Odesli, or the page itself)
 # ======================================================================================
 _ODESLI = {}
 
@@ -1160,7 +789,6 @@ def odesli_to_youtube(link: str, timeout: int = 8):
     return yt, name
 
 
-# --- Fallback without Odesli: read artist/title from the music page itself ---------------
 META_HOSTS = ("spotify.com", "spotify.link", "music.apple.com", "itunes.apple.com", "deezer.com",
               "link.deezer.com", "deezer.page.link", "tidal.com", "music.amazon.com",
               "pandora.com", "anghami.com", "napster.com", "audiomack.com")
@@ -1209,8 +837,7 @@ def _fetch_page(url: str, timeout: int) -> str:
         r = HTTP.get(url, headers=_UA, timeout=timeout, allow_redirects=False, stream=True)
         try:
             if r.is_redirect or r.status_code in (301, 302, 303, 307, 308):
-                nxt = r.headers.get("Location") or ""
-                url = requests.compat.urljoin(url, nxt)
+                url = requests.compat.urljoin(url, r.headers.get("Location") or "")
                 continue
             if not r.ok:
                 return ""
@@ -1227,9 +854,8 @@ def _fetch_page(url: str, timeout: int) -> str:
 
 def _apple_name(link: str, timeout: int) -> str:
     u = urlparse(link)
-    q = parse_qs(u.query)
     parts = [x for x in u.path.split("/") if x]
-    tid = (q.get("i") or [None])[0] or next((x for x in reversed(parts) if x.isdigit()), None)
+    tid = (parse_qs(u.query).get("i") or [None])[0] or next((x for x in reversed(parts) if x.isdigit()), None)
     if not tid:
         return ""
     cc = parts[0] if parts and re.fullmatch(r"[a-z]{2}", parts[0]) else "us"
@@ -1241,7 +867,7 @@ def _apple_name(link: str, timeout: int) -> str:
 
 
 def link_meta_name(link: str, timeout: int = 8) -> str:
-    """Artist - title for a streaming link without Odesli (iTunes lookup / og tags). '' if unknown."""
+    """'Artist - title' of a streaming link without Odesli (iTunes lookup / page tags). '' if unknown."""
     hit = _META.get(link)
     if hit and time.time() - hit[0] < 3600:
         return hit[1]
@@ -1250,9 +876,7 @@ def link_meta_name(link: str, timeout: int = 8) -> str:
     path = urlparse(link).path
     if host_in(link, ("spotify.com",)) and re.match(r"/(?:intl-[a-z]+/)?(?:artist|playlist|user|show|episode)/", path):
         return ""
-    name = ""
-    if host_in(link, ("music.apple.com", "itunes.apple.com")):
-        name = _apple_name(link, timeout)
+    name = _apple_name(link, timeout) if host_in(link, ("music.apple.com", "itunes.apple.com")) else ""
     if not name:
         tags = _meta_tags(_fetch_page(link, timeout))
         name = _clean_meta(tags.get("og:title") or tags.get("twitter:title") or tags.get("title"),
@@ -1265,7 +889,7 @@ def link_meta_name(link: str, timeout: int = 8) -> str:
 
 
 def link_to_youtube(link: str, timeout: int = 8):
-    """Odesli first; if it fails or finds nothing, fall back to reading the page. -> (yt_url|None, name|None)"""
+    """Odesli first; if it finds nothing, read the page itself. -> (yt_url | None, name | None)"""
     try:
         yt, name = odesli_to_youtube(link, timeout=timeout)
         if yt or name:
@@ -1279,15 +903,54 @@ def link_to_youtube(link: str, timeout: int = 8):
         return None, None
 
 
+def resolve(text: str):
+    """Typed text / link -> (download target, name). Raises ValueError for an unsupported link."""
+    url = first_url(text)
+    if not url:
+        return text, text
+    if host_in(url, CLIP_HOSTS) or host_in(url, ("soundcloud.com",)):
+        return url, None
+    yt, name = link_to_youtube(url, timeout=20)
+    if not yt and not name:
+        raise ValueError("unsupported link")
+    return (yt or f"ytsearch1:{name}"), name
+
+
 # ======================================================================================
-# Picking the ORIGINAL file on YouTube
+# YouTube: search, picking the ORIGINAL recording, downloading
 # ======================================================================================
+_YT_CACHE = {}
 _JUNK_YT_RE = re.compile(r"full\s+album|playlist|compilation|non-?stop|jukebox|\b\d+\s*hours?\b|"
                          r"1\s*hour|reaction|tutorial|how to play|instrumental|acoustic", re.I)
 
 
+def ydl_base():
+    o = {"quiet": True, "noplaylist": True, "concurrent_fragment_downloads": 8,
+         "http_chunk_size": 10 * 1024 * 1024, "socket_timeout": 20, "retries": 3, "fragment_retries": 3}
+    if os.path.exists(COOKIES):
+        o["cookiefile"] = COOKIES
+    return o
+
+
+def yt_search(query: str, n: int = 10):
+    key = (query.strip().lower(), n)
+    hit = _YT_CACHE.get(key)
+    if hit and time.time() - hit[0] < 300:
+        return hit[1]
+    with yt_dlp.YoutubeDL({**ydl_base(), "extract_flat": True, "skip_download": True}) as ydl:
+        items = ydl.extract_info(f"ytsearch{n}:{query}", download=False).get("entries") or []
+    if len(_YT_CACHE) > 300:
+        _YT_CACHE.clear()
+    _YT_CACHE[key] = (time.time(), items)
+    return items
+
+
+def clean_title(t: str) -> str:
+    return re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", t or "").strip()
+
+
 def _ck(s: str) -> str:
-    return re.sub(r"[\W_]+", "", _fold(s or ""))
+    return re.sub(r"[\W_]+", "", fold(s or ""))
 
 
 def yt_match_score(item: dict, song: dict) -> float:
@@ -1298,15 +961,12 @@ def yt_match_score(item: dict, song: dict) -> float:
     tc, chc = _ck(t), _ck(ch)
     s = 0.0
     want = _ck(clean_title(song.get("title")) or song.get("title"))
-    if want and want in tc:
-        s += 4
-    else:
-        s -= 3
-    arts = artist_set(song.get("artist"), song.get("title"))
+    s += 4 if want and want in tc else -3
+    arts = artist_set(song.get("artist"))
     if arts:
         hit = sum(1 for a in arts if a in tc or a in chc)
         s += (2 + 0.5 * min(hit - 1, 2)) if hit else -1.5
-    if _BAD_TITLE_RE.search(t) and not _BAD_TITLE_RE.search(song.get("title") or ""):
+    if is_variant(item) and not is_variant(song):
         s -= 6
     if _JUNK_YT_RE.search(t):
         s -= 5
@@ -1324,16 +984,14 @@ def yt_match_score(item: dict, song: dict) -> float:
     if d and v:
         diff = abs(float(v) - float(d))
         s += 3 if diff <= 3 else 1.5 if diff <= 8 else 0 if diff <= 20 else -3
-    elif v:
-        if v > 600 or v < 60:
-            s -= 3
+    elif v and (v > 600 or v < 60):
+        s -= 3
     return s
 
 
 def rank_youtube(song: dict, n: int = 8) -> list:
-    """[(score, video_id)] best first, for the original recording of this song."""
-    artist = (song.get("artist") or "")[:80]
-    q = f"{artist} - {song.get('title') or ''}".strip(" -")
+    """[(score, video_id)], best first, for the original recording of this song."""
+    q = f"{(song.get('artist') or '')[:80]} - {song.get('title') or ''}".strip(" -")
     ranked = []
     for query in (q, q + " official audio"):
         try:
@@ -1373,8 +1031,7 @@ def pick_targets(song: dict) -> list:
                 add(norm_url(yt))
         except Exception:
             pass
-    # without a known duration a direct id cannot be verified, so skip the extra search
-    if not out or song.get("dur"):
+    if not out or song.get("dur"):  # without a known duration a direct id cannot be verified: skip the search
         for score, vid in rank_youtube(song)[:3]:
             if score >= 2:
                 add(f"https://www.youtube.com/watch?v={vid}")
@@ -1382,14 +1039,8 @@ def pick_targets(song: dict) -> list:
     return out[:4]
 
 
-def ydl_base():
-    o = {"quiet": True, "noplaylist": True,
-         "concurrent_fragment_downloads": 8,
-         "http_chunk_size": 10 * 1024 * 1024,
-         "socket_timeout": 20, "retries": 3, "fragment_retries": 3}
-    if os.path.exists(COOKIES):
-        o["cookiefile"] = COOKIES
-    return o
+def _len_filter(max_sec: int):
+    return yt_dlp.utils.match_filter_func(f"duration <=? {int(max_sec)} & !is_live")
 
 
 def to_mp3(src: str) -> str:
@@ -1404,8 +1055,8 @@ def to_mp3(src: str) -> str:
 
 
 def download_audio(target: str, outdir: str, fallback=None):
+    """Max CLIP_MAX_SEC and 48 MB: anything longer can never be sent to Telegram anyway."""
     target = normalize_target(target)
-    # max 15 minutes and 48 MB: a 1-hour video can never be sent to Telegram anyway
     plain = {**ydl_base(), "format": "bestaudio[ext=m4a][abr<=130]/bestaudio[ext=m4a]/bestaudio/best",
              "outtmpl": f"{outdir}/%(id)s.%(ext)s", "max_filesize": AUDIO_MAX_BYTES,
              "match_filter": _len_filter(CLIP_MAX_SEC)}
@@ -1421,7 +1072,7 @@ def download_audio(target: str, outdir: str, fallback=None):
                 raise RuntimeError("rejected (too long / too big)")
             if "entries" in info:
                 if not info["entries"]:
-                    raise RuntimeError("track not found on SoundCloud (YouTube is blocked too, cookies needed)")
+                    raise RuntimeError("track not found")
                 info = info["entries"][0]
         return info
 
@@ -1452,15 +1103,14 @@ def download_audio(target: str, outdir: str, fallback=None):
     path = max(files, key=os.path.getmtime)
     if not path.lower().endswith((".m4a", ".mp3")):
         path = to_mp3(path)
-    vid = info.get("id") if info.get("extractor_key") == "Youtube" else None
     dur = info.get("duration")
-    return {"path": path, "title": info.get("title", "music"), "vid": vid,
-            "url": info.get("webpage_url"),
-            "duration": int(dur) if dur else None}
+    return {"path": path, "title": info.get("title", "music"),
+            "vid": info.get("id") if info.get("extractor_key") == "Youtube" else None,
+            "url": info.get("webpage_url"), "duration": int(dur) if dur else None}
 
 
 # ======================================================================================
-# Names written in the caption of a reel ("Song - Artist"), checked against iTunes / Deezer
+# Clips and the names that come with them
 # ======================================================================================
 _CAP_SEP = re.compile(r"\s+[-–—]\s+")
 
@@ -1470,7 +1120,7 @@ def _sim(a: str, b: str) -> float:
 
 
 def _caption_pair(info: dict):
-    """First line of the caption, 'A - B'. Returns (a, b) or None."""
+    """First line of the caption written as 'A - B' -> (a, b) or None."""
     text = info.get("description") or info.get("title") or ""
     for raw in text.splitlines():
         line = re.sub(r"https?://\S+", " ", raw)
@@ -1486,9 +1136,7 @@ def _caption_pair(info: dict):
         if len(parts) != 2:
             return None
         a, b = parts[0].strip(), parts[1].strip()
-        if 2 <= len(a) <= 70 and 2 <= len(b) <= 70:
-            return a, b
-        return None
+        return (a, b) if 2 <= len(a) <= 70 and 2 <= len(b) <= 70 else None
     return None
 
 
@@ -1497,15 +1145,12 @@ def _pair_score(claim_title: str, claim_artist: str, real_title: str, real_artis
     ca, ra = _ck(claim_artist), _ck(real_artist)
     if not ca or not ra:
         return 0.0
-    if len(ca) >= 4 and (ca in ra or ra in ca):
-        art = 1.0
-    else:
-        art = _sim(ca, ra)
+    art = 1.0 if len(ca) >= 4 and (ca in ra or ra in ca) else _sim(ca, ra)
     return min(ts, art)
 
 
 def _best_catalog_hit(results, a: str, b: str):
-    """results: [(title, artist)]. Both orders of 'a - b' are tried; the catalog tells which one is right."""
+    """results: [(title, artist)]. Both orders of 'a - b' are tried: the catalog tells which one is right."""
     best = None
     for t, ar in results:
         if not t or not ar:
@@ -1517,49 +1162,43 @@ def _best_catalog_hit(results, a: str, b: str):
     return {"title": best[1], "artist": best[2]} if best else None
 
 
-def _itunes_find(a: str, b: str):
+def _catalog_find(url: str, params: dict, parse, a: str, b: str):
     try:
-        r = HTTP.get("https://itunes.apple.com/search",
-                     params={"term": f"{a} {b}", "media": "music", "entity": "song", "limit": 8}, timeout=6)
-        data = r.json().get("results") or [] if r.ok else []
+        r = HTTP.get(url, params=params, timeout=6)
+        data = parse(r.json()) if r.ok else []
     except Exception as e:
-        log.warning("itunes search failed: %s", e)
+        log.warning("catalog search failed: %s", e)
         return None
-    return _best_catalog_hit([(x.get("trackName"), x.get("artistName")) for x in data], a, b)
-
-
-def _deezer_find(a: str, b: str):
-    try:
-        r = HTTP.get("https://api.deezer.com/search", params={"q": f"{a} {b}", "limit": 8}, timeout=6)
-        data = r.json().get("data") or [] if r.ok else []
-    except Exception as e:
-        log.warning("deezer search failed: %s", e)
-        return None
-    return _best_catalog_hit([(x.get("title"), (x.get("artist") or {}).get("name")) for x in data], a, b)
+    return _best_catalog_hit(data, a, b)
 
 
 def caption_meta(info: dict):
-    """Song named in the caption AND found in a real catalog -> verified meta, else None. Blocking (network)."""
+    """The song named in the caption AND found in a real catalog -> verified name, else None (blocking)."""
     pair = _caption_pair(info)
     if not pair:
         return None
     a, b = pair
-    hit = _itunes_find(a, b) or _deezer_find(a, b)
+    hit = _catalog_find("https://itunes.apple.com/search",
+                        {"term": f"{a} {b}", "media": "music", "entity": "song", "limit": 8},
+                        lambda j: [(x.get("trackName"), x.get("artistName")) for x in j.get("results") or []], a, b) \
+        or _catalog_find("https://api.deezer.com/search", {"q": f"{a} {b}", "limit": 8},
+                         lambda j: [(x.get("title"), (x.get("artist") or {}).get("name"))
+                                    for x in j.get("data") or []], a, b)
     if not hit:
         log.info("caption '%s' / '%s' is not a known track, ignored", a, b)
         return None
     log.info("caption song: %s - %s", hit["artist"], hit["title"])
-    return {"title": hit["title"], "artist": hit["artist"], "verified": True, "w": 0.95, "via": "caption"}
+    return {"title": hit["title"], "artist": hit["artist"], "verified": True}
 
 
-def _meta_from_info(info, caption: bool = False):
+def _meta_from_info(info):
     if not info:
         return None
     artist = info.get("artist") or ", ".join(info.get("artists") or [])
     track = info.get("track")
     if artist and track:
         return {"artist": artist.strip(), "title": track}
-    if caption and str(info.get("extractor_key") or "").lower().startswith("instagram"):
+    if str(info.get("extractor_key") or "").lower().startswith("instagram"):
         try:
             return caption_meta(info)
         except Exception as e:
@@ -1567,20 +1206,14 @@ def _meta_from_info(info, caption: bool = False):
     return None
 
 
-def _len_filter(max_sec: int):
-    return yt_dlp.utils.match_filter_func(f"duration <=? {int(max_sec)} & !is_live")
-
-
 def download_clip(url: str, outdir: str):
-    """Returns (path, title, meta). path is None when too long / too big."""
+    """-> (path, title, meta). path is None when the clip is too long / too big for Telegram."""
     if not host_in(url, CLIP_HOSTS):
         raise ValueError("unsupported link")
     opts = {**ydl_base(),
             "format": "bv*[height<=480][ext=mp4]+ba[ext=m4a]/b[height<=480][ext=mp4]/b[height<=480]/b",
-            "outtmpl": f"{outdir}/clip.%(ext)s",
-            "merge_output_format": "mp4",
-            "max_filesize": MAX_BYTES,
-            "match_filter": _len_filter(CLIP_MAX_SEC)}
+            "outtmpl": f"{outdir}/clip.%(ext)s", "merge_output_format": "mp4",
+            "max_filesize": MAX_BYTES, "match_filter": _len_filter(CLIP_MAX_SEC)}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         if info and "entries" in info:
@@ -1592,17 +1225,16 @@ def download_clip(url: str, outdir: str):
                 os.remove(f)
             except OSError:
                 pass
-        return None, (info or {}).get("title"), _meta_from_info(info, caption=True)
-    return files[0], info.get("title") or "clip", _meta_from_info(info, caption=True)
+        return None, (info or {}).get("title"), _meta_from_info(info)
+    return files[0], info.get("title") or "clip", _meta_from_info(info)
 
 
 def download_source_audio(url: str, outdir: str):
+    """Low-quality audio of a long source, for recognition only. -> (path, meta)"""
     if not host_in(url, CLIP_HOSTS):
         raise ValueError("unsupported link")
-    opts = {**ydl_base(),
-            "format": "bestaudio[abr<=70]/worstaudio/bestaudio/worst",
-            "outtmpl": f"{outdir}/src.%(ext)s",
-            "max_filesize": 250 * 1024 * 1024,
+    opts = {**ydl_base(), "format": "bestaudio[abr<=70]/worstaudio/bestaudio/worst",
+            "outtmpl": f"{outdir}/src.%(ext)s", "max_filesize": 250 * 1024 * 1024,
             "match_filter": _len_filter(MAX_SRC_SEC)}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -1611,12 +1243,10 @@ def download_source_audio(url: str, outdir: str):
     files = [f for f in glob.glob(f"{outdir}/src.*") if not f.endswith((".part", ".ytdl", ".aria2"))]
     if not info or not files:
         raise RuntimeError("source audio was not downloaded (too long / too big / unavailable)")
-    return files[0], _meta_from_info(info, caption=True)
+    return files[0], _meta_from_info(info)
 
 
-# ======================================================================================
-# Instagram photo / carousel posts
-# ======================================================================================
+# --- Instagram photo / carousel posts (needs a logged-in instagram.com cookie in cookies.txt) ---------
 IG_APP_ID = "936619743392459"
 IG_MOBILE_UA = ("Instagram 275.0.0.27.98 Android (33/13; 420dpi; 1080x2400; samsung; SM-S908B; "
                 "b0q; qcom; en_US; 458229237)")
@@ -1632,39 +1262,33 @@ def ig_media_id(code: str) -> int:
 
 
 def ig_post_audio(url: str, outdir: str, want_audio: bool = True):
-    """Returns {"path": audio file or None, "meta": {...} or None} or None.
-    Needs a logged-in instagram.com cookie in cookies.txt."""
+    """-> {"path": audio file or None, "meta": {...} or None} or None."""
     m = _IG_CODE_RE.search(url)
     if not m or not os.path.exists(COOKIES):
         return None
     try:
-        import http.cookiejar
         jar = http.cookiejar.MozillaCookieJar(COOKIES)
         jar.load(ignore_discard=True, ignore_expires=True)
+        if not any(c.name == "sessionid" and "instagram" in c.domain for c in jar):
+            log.warning("instagram: cookies.txt has no instagram.com sessionid cookie (login cookie needed)")
+            return None
         s = requests.Session()
         s.cookies = jar
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                           "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
             "X-IG-App-ID": IG_APP_ID, "X-Requested-With": "XMLHttpRequest", "Referer": url})
-        if not any(c.name == "sessionid" and "instagram" in c.domain for c in jar):
-            log.warning("instagram: cookies.txt has no instagram.com sessionid cookie (login cookie needed)")
-            return None
         csrf = next((c.value for c in jar if c.name == "csrftoken" and "instagram" in c.domain), "")
         mid = ig_media_id(m.group(1))
-        tries = [
-            (f"https://www.instagram.com/api/v1/media/{mid}/info/", {"X-CSRFToken": csrf}),
-            (f"https://i.instagram.com/api/v1/media/{mid}/info/", {"User-Agent": IG_MOBILE_UA}),
-        ]
         data = None
-        for u, hdr in tries:
+        for u, hdr in ((f"https://www.instagram.com/api/v1/media/{mid}/info/", {"X-CSRFToken": csrf}),
+                       (f"https://i.instagram.com/api/v1/media/{mid}/info/", {"User-Agent": IG_MOBILE_UA})):
             r = s.get(u, headers=hdr, timeout=20)
             try:
                 data = r.json()
                 break
             except ValueError:
-                log.warning("instagram info is not JSON: HTTP %s %s | %s", r.status_code, r.url[:90],
-                            r.text[:80].replace("\n", " "))
+                log.warning("instagram info is not JSON: HTTP %s | %s", r.status_code, r.text[:80].replace("\n", " "))
         items = (data or {}).get("items") or []
         if not items:
             log.warning("instagram info has no items: %s", str(data)[:120])
@@ -1673,18 +1297,15 @@ def ig_post_audio(url: str, outdir: str, want_audio: bool = True):
         cm = it.get("clips_metadata") or {}
         asset = (((it.get("music_metadata") or {}).get("music_info") or {}).get("music_asset_info")
                  or (cm.get("music_info") or {}).get("music_asset_info") or {})
-        audio_url = asset.get("progressive_download_url") or asset.get("fast_start_progressive_download_url")
         meta = None
-        if not asset:
-            log.info("instagram: this post has no music-library track (original sound or no music)")
-        if asset.get("title") and asset.get("display_artist"):
-            # the name of the track from Instagram's own music library: trusted
-            meta = {"title": asset["title"], "artist": asset["display_artist"], "link": None,
-                    "engine": "meta#0", "w": 0.95, "verified": True}
+        if asset.get("title") and asset.get("display_artist"):  # Instagram's own music library: trusted
+            meta = {"title": asset["title"], "artist": asset["display_artist"], "verified": True}
+        elif not asset:
+            log.info("instagram: no music-library track (original sound or no music)")
         if not want_audio:
             return {"path": None, "meta": meta}
-        if not audio_url:
-            audio_url = (cm.get("original_sound_info") or {}).get("progressive_download_url")
+        audio_url = (asset.get("progressive_download_url") or asset.get("fast_start_progressive_download_url")
+                     or (cm.get("original_sound_info") or {}).get("progressive_download_url"))
         if not audio_url:
             return None
         a = s.get(audio_url, timeout=60)
@@ -1700,40 +1321,31 @@ def ig_post_audio(url: str, outdir: str, want_audio: bool = True):
 
 
 # ======================================================================================
-# Audio sampling (ffmpeg)
+# Audio pieces (ffmpeg). The loudest piece comes FIRST: that is what the own DB is asked with
 # ======================================================================================
 def probe_duration(path: str) -> float:
     try:
-        out = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=nw=1:nk=1", path],
-            capture_output=True, text=True, timeout=30).stdout.strip()
+        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                              "-of", "default=nw=1:nk=1", path],
+                             capture_output=True, text=True, timeout=30).stdout.strip()
         return float(out)
     except Exception:
         return 0.0
 
 
-def cut_sample(src: str, out: str, start: float, dur: int, raw: bool = False) -> bool:
-    base = ["ffmpeg", "-y", "-ss", str(max(0, start)), "-i", src, "-t", str(dur),
-            "-vn", "-ac", "1", "-ar", "44100"]
-    filters = [[]] if raw else [["-af", "highpass=f=80,dynaudnorm=f=200:g=15"], []]
-    for af in filters:
-        try:
-            subprocess.run(base + af + ["-b:a", "128k", out],
-                           check=True, capture_output=True, timeout=120)
-            return True
-        except Exception:
-            continue
-    return False
-
-
-_ENERGY = {}         # (path, size, mtime, maxsec) -> loudness per second
-_ENERGY_LOCKS = {}   # the same key -> lock, so two threads never scan the same file twice
-_ENERGY_GUARD = threading.Lock()
+def cut_sample(src: str, out: str, start: float, dur: int) -> bool:
+    """RAW piece (no filters: they change the audio and hurt fingerprint matching)."""
+    cmd = ["ffmpeg", "-y", "-ss", str(max(0, start)), "-i", src, "-t", str(dur),
+           "-vn", "-ac", "1", "-ar", "44100", "-b:a", "128k", out]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=120)
+        return True
+    except Exception:
+        return False
 
 
 def _scan_energy(src: str, maxsec: int):
-    """Loudness (mean square) of every second of the audio, from a 2 kHz mono decode."""
+    """Loudness (mean square) of every second, from a 2 kHz mono decode."""
     sr = 2000
     out = subprocess.run(
         ["ffmpeg", "-v", "error", "-t", str(int(maxsec)), "-i", src, "-vn", "-ac", "1", "-ar", str(sr),
@@ -1741,56 +1353,29 @@ def _scan_energy(src: str, maxsec: int):
     if np is not None:
         pcm = np.frombuffer(out[:len(out) // 2 * 2], dtype=np.int16).astype(np.float32)
         secs = len(pcm) // sr
-        if secs < 1:
-            return []
-        return (pcm[:secs * sr].reshape(secs, sr) ** 2).mean(axis=1)
+        return (pcm[:secs * sr].reshape(secs, sr) ** 2).mean(axis=1) if secs else []
     pcm = array.array("h")
     pcm.frombytes(out[:len(out) // 2 * 2])
     secs = len(pcm) // sr
     return [sum(x * x for x in pcm[i * sr:(i + 1) * sr]) / sr for i in range(secs)]
 
 
-def energy_profile(src: str, maxsec: int):
-    """_scan_energy with a small cache: quick_local (12 s windows) and make_samples (15 s windows) look at
-    the same file at the same time, and the scan used to be done twice."""
-    try:
-        st = os.stat(src)
-        key = (src, st.st_size, int(st.st_mtime), int(maxsec))
-    except OSError:
-        return _scan_energy(src, maxsec)
-    with _ENERGY_GUARD:
-        if key in _ENERGY:
-            return _ENERGY[key]
-        lock = _ENERGY_LOCKS.setdefault(key, threading.Lock())
-    with lock:
-        with _ENERGY_GUARD:
-            if key in _ENERGY:
-                return _ENERGY[key]
-        prof = _scan_energy(src, maxsec)
-        with _ENERGY_GUARD:
-            _ENERGY[key] = prof
-            _ENERGY_LOCKS.pop(key, None)
-            while len(_ENERGY) > 32:
-                _ENERGY.pop(next(iter(_ENERGY)))
-        return prof
-
-
 def loud_offsets(src: str, win: int, n: int = 2, maxsec: int = 600) -> list:
+    """Start times of the n loudest non-overlapping windows (that is the music, not silence or talking)."""
     try:
-        energy = energy_profile(src, maxsec)
+        energy = _scan_energy(src, maxsec)
         secs = len(energy)
         if secs <= win + 2:
             return []
         if np is not None:
             pref = np.concatenate(([0.0], np.cumsum(energy, dtype=np.float64)))
-            window_sum = pref[win:] - pref[:len(pref) - win]
-            order = np.argsort(-window_sum)
-            ranked = [int(i) for i in order if i <= secs - win]
+            sums = pref[win:] - pref[:len(pref) - win]
+            ranked = [int(i) for i in np.argsort(-sums) if i <= secs - win]
         else:
             pref = [0.0]
             for v in energy:
                 pref.append(pref[-1] + v)
-            ranked = [i for _, i in sorted(((pref[i + win] - pref[i], i) for i in range(0, secs - win + 1)),
+            ranked = [i for _, i in sorted(((pref[i + win] - pref[i], i) for i in range(secs - win + 1)),
                                            reverse=True)]
         picks = []
         for i in ranked:
@@ -1805,15 +1390,13 @@ def loud_offsets(src: str, win: int, n: int = 2, maxsec: int = 600) -> list:
 
 
 def pick_offsets(src: str, d: float, win: int = 15) -> list:
-    """More pieces than before: accuracy matters more than speed."""
+    """Order matters: loudest, middle, 2nd loudest, then evenly spread. The own DB uses the first three."""
     if not d or d <= win + 3:
         return [0]
     n = 4 if d <= 60 else 6 if d <= 300 else 8
     loud = loud_offsets(src, win, 2, int(min(d, MAX_SRC_SEC)))
     even = [d * (k + 0.5) / n - win / 2 for k in range(n)]
-    mid = even[n // 2]
-    rest = [e for i, e in enumerate(even) if i != n // 2]
-    cand = loud[:1] + [mid] + loud[1:2] + rest
+    cand = loud[:1] + [even[n // 2]] + loud[1:2] + [e for i, e in enumerate(even) if i != n // 2]
     offs = []
     for o in cand:
         o = round(max(0, min(o, d - win)))
@@ -1823,58 +1406,32 @@ def pick_offsets(src: str, d: float, win: int = 15) -> list:
 
 
 def make_samples(src: str, sid: str) -> list:
-    d = probe_duration(src)
+    """Cuts the pieces (in parallel) -> list of file paths, in pick_offsets order."""
     win = 15
-    offs = pick_offsets(src, d, win)
-    # RAW pieces only: filters like dynaudnorm change the audio and hurt fingerprint matching
-    jobs = [(os.path.join(SAMPLES_DIR, f"{sid}_{i}.mp3"), o) for i, o in enumerate(offs)]
-    with ThreadPoolExecutor(max_workers=len(jobs)) as ex:
-        res = list(ex.map(lambda j: j[0] if cut_sample(src, j[0], j[1], win, True) else None, jobs))
-    return [r for r in res if r]
+    offs = pick_offsets(src, probe_duration(src), win)
+    outs = [os.path.join(SAMPLES_DIR, f"{sid}_{i}.mp3") for i in range(len(offs))]
+    threads, ok = [], [False] * len(offs)
 
+    def job(i):
+        ok[i] = cut_sample(src, outs[i], offs[i], win)
 
-def make_variants(src: str) -> list:
-    base = re.sub(r"_[^_/]*$", "", os.path.splitext(src)[0])
-    outs = []
-    for i, af in enumerate(("asetrate=44100*1.12,aresample=44100", "asetrate=44100*0.89,aresample=44100")):
-        out = f"{base}v{i}.mp3"
-        try:
-            subprocess.run(["ffmpeg", "-y", "-i", src, "-af", af, "-b:a", "128k", out],
-                           check=True, capture_output=True, timeout=60)
-            outs.append(out)
-        except Exception:
-            pass
-    return outs
+    for i in range(len(offs)):
+        t = threading.Thread(target=job, args=(i,))
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+    return [o for o, good in zip(outs, ok) if good]
 
 
 # ======================================================================================
-# YouTube search
+# Search results
 # ======================================================================================
-_YT_CACHE = {}
-
-
-def yt_search(query: str, n: int = 10):
-    key = (query.strip().lower(), n)
-    hit = _YT_CACHE.get(key)
-    if hit and time.time() - hit[0] < 300:
-        return hit[1]
-    opts = {**ydl_base(), "extract_flat": True, "skip_download": True}
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(f"ytsearch{n}:{query}", download=False)
-    items = info.get("entries") or []
-    if len(_YT_CACHE) > 300:
-        _YT_CACHE.clear()
-    _YT_CACHE[key] = (time.time(), items)
-    return items
-
-
 def search_tracks(query: str, n: int = 30):
     out, seen = [], set()
     for it in yt_search(query, n):
         vid, title, dur = it.get("id"), it.get("title"), it.get("duration")
-        if not vid or not title:
-            continue
-        if dur and not (60 <= dur <= 720):
+        if not vid or not title or (dur and not 60 <= dur <= 720):
             continue
         k = re.sub(r"\W+", "", title.lower())
         if k in seen:
@@ -1909,112 +1466,47 @@ async def send_results(msg, query: str, lang: str):
     await msg.reply_text(f"🔍 {query}", reply_markup=results_keyboard(sid, 0, lang))
 
 
-def resolve(text: str):
-    url = first_url(text)
-    if url:
-        if host_in(url, DIRECT_HOSTS) or host_in(url, ("soundcloud.com",)):
-            return url, None
-        yt, name = link_to_youtube(url, timeout=20)
-        if not yt and not name:
-            raise ValueError("unsupported link")
-        return (yt or f"ytsearch1:{name}"), name
-    return text, text
-
-
 # ======================================================================================
 # Lyrics
 # ======================================================================================
-def clean_title(t: str) -> str:
-    return re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", t or "").strip()
-
-
-def _lyr_keys(artist: str, title: str) -> list:
-    tk = title_key(title)
-    return [f"tk:{tk}|{a}" for a in sorted(artist_set(artist, title))[:4]]
-
-
-def _store_lyrics(artist: str, title: str, text: str):
-    with db() as c:
-        for k in _lyr_keys(artist, title):
-            c.execute("INSERT OR REPLACE INTO lyrics VALUES(?,?)", (k, text))
-
-
-def shazam_lyrics(artist: str, title: str):
-    try:
-        import shazamio  # noqa: F401
-    except Exception:
-        return None
-    if shazam_paused():
-        return None
-    tk = title_key(title)
-
-    async def go():
-        sh = _shazam_client()
-        res = await sh.search_track(query=f"{title} {first_artist(artist)}".strip(), limit=5)
-        for h in (((res or {}).get("tracks") or {}).get("hits") or []):
-            t = h.get("track") or {}
-            if title_key(t.get("title")) != tk or not t.get("key"):
-                continue
-            about = await sh.track_about(track_id=int(t["key"]))
-            about = (about or {}).get("track", about) or {}
-            lyr = _shazam_lyrics_text(about)
-            if lyr:
-                return lyr
-        return None
-
-    try:
-        return bg_loop().run(go(), timeout=30)
-    except Exception as e:
-        log.warning("shazam lyrics failed: %s", e)
-        return None
-
-
 def _lrclib_lyrics(artist: str, title: str):
     t = clean_title(title) or title
     a = first_artist(artist)
     want = {"title": title, "artist": artist}
-    tries = []
-    if a:
-        tries.append({"track_name": t, "artist_name": a})
-    tries.append({"q": f"{a} {t}".strip()})
+    tries = ([{"track_name": t, "artist_name": a}] if a else []) + [{"q": f"{a} {t}".strip()}]
     for params in tries:
         try:
             r = HTTP.get("https://lrclib.net/api/search", params=params, timeout=10)
+            items = r.json() if r.ok else []
         except Exception as e:
             log.warning("lrclib failed: %s", e)
             continue
-        if not r.ok:
-            continue
-        for it in r.json():
+        for it in items:
             got = {"title": it.get("trackName") or "", "artist": it.get("artistName") or ""}
             if it.get("plainLyrics") and same_song(got, want):
                 return it["plainLyrics"]
     return None
 
 
+def _ovh_lyrics(artist: str, title: str):
+    a, t = first_artist(artist), clean_title(title) or title
+    if not a:
+        return None
+    try:
+        r = HTTP.get(f"https://api.lyrics.ovh/v1/{quote(a, safe='')}/{quote(t, safe='')}", timeout=10)
+        return r.json().get("lyrics") if r.ok else None
+    except Exception as e:
+        log.warning("lyrics.ovh failed: %s", e)
+        return None
+
+
 def get_lyrics(artist: str, title: str):
     key = f"{artist}|{title}".lower()
     with db() as c:
         r = c.execute("SELECT text FROM lyrics WHERE key=?", (key,)).fetchone()
-        if not r:
-            for k in _lyr_keys(artist, title):
-                r = c.execute("SELECT text FROM lyrics WHERE key=?", (k,)).fetchone()
-                if r:
-                    break
     if r:
         return r[0]
-    text = _lrclib_lyrics(artist, title) or shazam_lyrics(artist, title)
-    if not text:
-        a = first_artist(artist)
-        t = clean_title(title) or title
-        if a:
-            try:
-                r = HTTP.get(
-                    f"https://api.lyrics.ovh/v1/{quote(a, safe='')}/{quote(t, safe='')}", timeout=10)
-                if r.ok:
-                    text = r.json().get("lyrics")
-            except Exception as e:
-                log.warning("lyrics.ovh failed: %s", e)
+    text = _lrclib_lyrics(artist, title) or _ovh_lyrics(artist, title)
     if text:
         with db() as c:
             c.execute("INSERT OR REPLACE INTO lyrics VALUES(?,?)", (key, text))
@@ -2033,189 +1525,25 @@ def split_text(t: str, n: int = 4000) -> list:
     return out
 
 
-# ======================================================================================
-# Recognition: ACRCloud + Shazam vote TOGETHER
-# ======================================================================================
-# lyrics weight is lower than ACR / Shazam: a text-only match must be confirmed by another vote
-ENGINE_W = {"acr": 1.0, "shazam": 1.0, "lyrics": 0.8}
-META_W = 0.6
-
-
-def _base(tag: str) -> str:
-    return (tag or "").split("#")[0]
-
-
-def _active_engines(skip, names=None) -> list:
-    with db() as c:
-        rows = c.execute("SELECT * FROM accounts WHERE enabled=1 ORDER BY id").fetchall()
-    jobs = []
-    for name in [n.strip() for n in ENGINE_ORDER]:
-        if names is not None and name not in names:
-            continue
-        if name == "shazam":
-            if "shazam#0" not in skip and not shazam_paused():
-                jobs.append(("shazam", []))
-        elif name in ENGINE_FN:
-            accs = [r for r in rows
-                    if r["type"] == name and f'{name}#{r["id"]}' not in skip and not cooling(r["id"])]
-            if accs:
-                jobs.append((name, accs))
-    return jobs
-
-
-def call_engine(name: str, accs, path: str):
-    if name == "shazam":
-        if shazam_paused():
-            return None
-        try:
-            res = shazam_identify(path)  # one try: a slow Shazam must not hold the answer back
-        except Exception as e:
-            _shazam_fail(e)
-            return None
-        _shazam_ok()
-        if res and res.get("title"):
-            res["engine"] = "shazam#0"
-            return res
-        return None
-    attempts = 2
-    for r in accs:
-        tag = f'{name}#{r["id"]}'
-        for attempt in range(1, attempts + 1):
-            try:
-                res = ENGINE_FN[name](path, r)
-                with db() as c:
-                    c.execute("UPDATE accounts SET uses=uses+1 WHERE id=?", (r["id"],))
-                if res and res.get("title"):
-                    res["engine"] = tag
-                    return res
-                return None
-            except QuotaError as e:
-                cool_down(r["id"], str(e))
-                with db() as c:
-                    c.execute("UPDATE accounts SET errors=errors+1 WHERE id=?", (r["id"],))
-                break
-            except Exception as e:
-                log.warning("account %s failed (try %s): %s", r["id"], attempt, e)
-                if attempt == attempts:
-                    with db() as c:
-                        c.execute("UPDATE accounts SET errors=errors+1 WHERE id=?", (r["id"],))
-    return None
-
-
-def _group(hits: list) -> list:
-    """Groups the answers of all engines / pieces by song. Votes of different engines add up, so when ACR and
-    Shazam agree the song wins clearly. Details (link, yt id, real duration) are merged from every engine.
-    A song is 'solid' when two different engines name it, or two different pieces of the audio name it with a
-    real (non-humming) match. A melody (humming) guess alone is never solid."""
-    clusters = []
-    for h in hits:
-        for cl in clusters:
-            if same_song(cl[0]["song"], h["song"]):
-                cl.append(h)
-                break
-        else:
-            clusters.append([h])
-    ranked = []
-    for hs in clusters:
-        best = max(hs, key=lambda h: h["w"])
-        song = dict(best["song"])
-        song.pop("alt", None)
-        song["artist"] = max((h["song"].get("artist") or "" for h in hs),
-                             key=lambda a: (len(artist_set(a)), len(a)))
-        for k in ("link", "yt", "dur"):
-            song[k] = next((h["song"].get(k) for h in hs if h["song"].get(k)), None)
-        per = {}
-        for h in hs:
-            per.setdefault(_base(h["engine"]), []).append(h["w"])
-        # a repeated answer adds half of ITS OWN weight (it used to add a flat 0.5, so a weak 2nd candidate that
-        # an engine repeated on every piece looked as strong as the real answer)
-        score = sum(max(v) + 0.5 * (sum(v) - max(v)) for v in per.values())
-        mult = title_penalty(song)
-        score *= mult
-        # A song that an engine only ever names as its 2nd / 3rd candidate ("alt": another version, a lookalike)
-        # is never "solid" by repeating itself on several pieces, and melody guesses ("hum") never are either.
-        # An alt candidate DOES count as a second confirmation when the same song was also a first answer on
-        # another piece. This is what stops "Song (Live)" lurking in the candidate lists from blocking the
-        # answer (and starting the slow stages), without losing real evidence.
-        first = [h for h in hs if not h["song"].get("hum") and not h["song"].get("alt")]
-        also = [h for h in hs if h["song"].get("alt") and not h["song"].get("hum")] if first else []
-        solid = len(per) >= 2 or len({h["sample"] for h in first + also}) >= 2
-        ranked.append({"song": song, "score": score, "solid": solid, "bad": mult < 1})
-    ranked.sort(key=lambda r: r["score"] + (1.0 if r["solid"] else 0.0), reverse=True)
-    return ranked
-
-
-def _confident(ranked: list) -> bool:
-    """Accuracy first. The top answer must be confirmed (two engines agree, or two different pieces of
-    the audio agree), must not look like a remix / mashup, and must have no close competitor.
-    A single answer from one engine on one piece is never enough."""
-    if not ranked or ranked[0]["bad"] or not ranked[0]["solid"]:
-        return False
-    if len(ranked) > 1:
-        second = ranked[1]
-        # 0.6 (was 0.7): measured on 1500 simulated requests per condition, a slightly stricter "close
-        # competitor" test removes early wrong answers without slowing down the clear cases
-        if second["solid"] or second["score"] >= ranked[0]["score"] * 0.6:
-            return False
-    return True
-
-
-# ---------- Last resort: what the singer says ----------
-_WHISPER = {"model": None}
-_WHISPER_LOCK = threading.Lock()
-
-
-def transcribe(path: str) -> str:
-    try:
-        from faster_whisper import WhisperModel
-    except Exception:
-        return ""
-    if not _WHISPER_LOCK.acquire(timeout=WHISPER_WAIT):
-        log.info("whisper busy, skipping the lyrics stage for this request")
-        return ""
-    try:
-        if _WHISPER["model"] is None:
-            _WHISPER["model"] = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
-        segs, _info = _WHISPER["model"].transcribe(
-            path, vad_filter=False, beam_size=3, temperature=0.0,
-            condition_on_previous_text=False, no_speech_threshold=0.4,
-            compression_ratio_threshold=2.2)
-        out, last = [], None
-        for sg in segs:
-            t = sg.text.strip()
-            if not t or sg.no_speech_prob > 0.6 or sg.avg_logprob < -1.0:
-                continue
-            if t != last:
-                out.append(t)
-            last = t
-        return " ".join(out).strip()
-    finally:
-        _WHISPER_LOCK.release()
-
-
 def lyric_overlap(words, lyrics: str) -> float:
-    ws = {_fold(w) for w in words if len(w) > 2}
+    ws = {fold(w) for w in words if len(w) > 2}
     if not ws:
         return 0.0
-    lw = set(re.findall(r"\w+", _fold(lyrics)))
-    return len(ws & lw) / len(ws)
+    return len(ws & set(re.findall(r"\w+", fold(lyrics)))) / len(ws)
 
 
 def _parse_yt_title(title: str, channel: str):
     t = re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", title or "")
-    t = re.sub(r"(?i)\b(official|lyrics?|lyric video|audio|music video|video|hd|4k)\b|متن( آهنگ)?|با متن",
-               " ", t)
+    t = re.sub(r"(?i)\b(official|lyrics?|lyric video|audio|music video|video|hd|4k)\b|متن( آهنگ)?|با متن", " ", t)
     parts = [p.strip() for p in re.split(r"\s+[-–—|]\s+", t) if p.strip()]
     if len(parts) >= 2:
         return parts[0], parts[1]
-    ch = re.sub(r"(?i)\s*-\s*topic$", "", channel or "").strip()
-    return ch, (parts[0] if parts else "")
+    return re.sub(r"(?i)\s*-\s*topic$", "", channel or "").strip(), (parts[0] if parts else "")
 
 
-def yt_lyrics_search(words):
-    slices = [words[:12]]
-    if len(words) >= 20:
-        slices.append(words[10:22])
+def find_song_by_words(words):
+    """A few words of the lyrics -> the song: YouTube search, then the lyrics of each result must contain the words."""
+    slices = [words[:12]] + ([words[10:22]] if len(words) >= 20 else [])
     seen = set()
     for sl in slices:
         try:
@@ -2242,190 +1570,8 @@ def yt_lyrics_search(words):
     return None
 
 
-def lyrics_identify(paths):
-    texts, empty = [], 0
-    for p in paths[:3]:
-        t = transcribe(p)
-        if t:
-            texts.append(t)
-        else:
-            empty += 1
-            if empty >= 2 and not texts:
-                return None
-    if not texts:
-        return None
-    words = re.findall(r"\w+", " ".join(texts).lower())
-    if len(words) < 6:
-        return None
-    best = max(texts, key=len)
-    return yt_lyrics_search(re.findall(r"\w+", best.lower()) or words)
-
-
-def find_song_by_words(words):
-    return yt_lyrics_search(words)
-
-
-def recognize(paths, skip=(), extra=None):
-    """Order (accuracy first, but fast):
-    0) own fingerprint DB (free): started together with step 1 and waited for together with it; if it finds
-       the song first, that answer is returned and the engines are cancelled
-    1) ACRCloud + Shazam on every piece AT THE SAME TIME, in waves (3, 3, 4 pieces). Answers are voted as they
-       arrive; the moment the vote is confirmed the answer is returned and the slow rest is ignored.
-       A new wave starts only while the answer is not confirmed yet
-    2) lyrics (what the singer says) as an extra vote, 3) slowed / sped-up copies as the last try.
-    The result has an "alts" list with the runner-up answers.
-    STRICT=1 (default): an unconfirmed answer is dropped ("not found") instead of being guessed."""
-    if isinstance(paths, str):
-        paths = [paths]
-    skip = tuple(skip)
-    rejected = {t[2:] for t in skip if t.startswith("k:")}
-
-    # The own DB (free) starts first but does NOT hold the engines back: its answer is waited for together with
-    # theirs, and if it comes first the engines are cancelled. Before, every song that was not in the DB first
-    # waited for 3 DB lookups one after another and only then reached ACRCloud / Shazam.
-    local = {"fut": None, "hit": None}
-    if fp_engine and paths and "local#0" not in skip:
-        local["fut"] = ENGINE_POOL.submit(local_identify, paths)
-
-    def take_local(block: float = 0.0) -> bool:
-        """Reads the own-DB answer once it is ready (waits up to `block` seconds). True = the DB found the song."""
-        f = local["fut"]
-        if f is None:
-            return False
-        if not f.done():
-            if block <= 0:
-                return False
-            try:
-                f.result(timeout=block)
-            except Exception:
-                pass
-            if not f.done():
-                return False
-        local["fut"] = None
-        try:
-            loc = f.result()
-        except Exception as e:
-            log.warning("local lookup failed: %s", e)
-            return False
-        if loc and title_key(loc["title"]) not in rejected:
-            local["hit"] = loc
-            return True
-        return False
-
-    def local_answer():
-        loc = local["hit"]
-        loc["alts"] = []
-        return loc
-
-    if LOCAL_FIRST and take_local(block=ENGINE_TIMEOUT * 2):
-        return local_answer()
-
-    primary = _active_engines(skip, PRIMARY_ENGINES)
-    order = {n.strip(): i for i, n in enumerate(ENGINE_ORDER)}
-    hits = []
-    if extra and extra.get("title") and "meta#0" not in skip and title_key(extra["title"]) not in rejected:
-        hits.append({"song": dict(extra, engine="meta#0"), "engine": "meta#0", "sample": 98,
-                     "w": extra.get("w", META_W)})
-
-    def absorb(name, idx, res):
-        if not res or title_key(res.get("title")) in rejected:
-            return
-        more = res.pop("more", [])
-        base_w = ENGINE_W.get(name, 0.8) - 0.01 * order.get(name, 0)
-        hits.append({"song": res, "engine": res["engine"], "sample": idx,
-                     "w": base_w * res.get("wmul", 1.0)})
-        for mo in more:
-            if title_key(mo.get("title")) in rejected:
-                continue
-            mo["engine"] = res["engine"]
-            mo["alt"] = True  # 2nd / 3rd candidate: it never confirms a song by itself (see _group)
-            hits.append({"song": mo, "engine": mo["engine"], "sample": idx,
-                         "w": base_w * mo.get("wmul", 0.5)})
-
-    def run_wave(batch, jobs) -> bool:
-        """Sends every piece of the wave to BOTH engines at once. Votes are counted as answers arrive and the
-        wave stops early as soon as the answer is confirmed. Returns True when confirmed."""
-        futs = {ENGINE_POOL.submit(call_engine, name, accs, p): (name, idx)
-                for idx, p in batch for name, accs in jobs}
-        lf = local["fut"]  # the own DB may still be running: it is waited for together with the engines
-        if not futs and lf is None:
-            return False
-        pending = set(futs)
-        if lf is not None:
-            pending.add(lf)
-        deadline = time.time() + ENGINE_TIMEOUT
-        confirmed = False
-        while pending and time.time() < deadline and not confirmed:
-            done, pending = wait(pending, timeout=min(max(deadline - time.time(), 0.05), 1.0),
-                                 return_when=FIRST_COMPLETED)
-            if lf is not None and lf in done and take_local():
-                confirmed = True  # the DB found it: stop here, the engine answers are not needed
-                break
-            for f in done:
-                if f is lf:
-                    continue
-                name, idx = futs[f]
-                try:
-                    absorb(name, idx, f.result())
-                except Exception as e:
-                    log.warning("engine %s crashed: %s", name, e)
-            if done and _confident(_group(hits)):
-                confirmed = True
-        for f in pending:
-            if f is not lf:
-                f.cancel()  # not started yet -> never sent to the engine, no quota used
-        return confirmed
-
-    pieces = list(enumerate(paths[:MAX_SAMPLES]))
-    pos = 0
-    for size in (3, 3, 4):
-        batch = pieces[pos:pos + size]
-        pos += size
-        if not batch:
-            break
-        if run_wave(batch, primary):
-            break
-        primary = _active_engines(skip, PRIMARY_ENGINES)  # Shazam may have been paused during this wave
-    if local["hit"]:
-        return local_answer()
-    ranked = _group(hits)
-    # the engines did not confirm anything: the own DB is the last free chance, wait for it if it is still running
-    if not _confident(ranked) and take_local(block=ENGINE_TIMEOUT):
-        return local_answer()
-
-    if LYRICS_ENGINE and "lyrics#0" not in skip and not _confident(ranked):
-        try:
-            ly = lyrics_identify(paths)
-            if ly and title_key(ly.get("title")) not in rejected:
-                ly["engine"] = "lyrics#0"
-                hits.append({"song": ly, "engine": "lyrics#0", "sample": 99, "w": ENGINE_W["lyrics"]})
-                ranked = _group(hits)
-        except Exception as e:
-            log.warning("lyrics stage failed: %s", e)
-
-    if not _confident(ranked) and paths and primary:
-        try:
-            vs = make_variants(paths[0])
-            if vs:
-                run_wave(list(enumerate(vs, start=50)), primary)
-                ranked = _group(hits)
-        except Exception as e:
-            log.warning("variant stage failed: %s", e)
-
-    if not ranked:
-        return None
-    log.info("recognize: %s", [(r["song"].get("title"), r["song"].get("artist"), round(r["score"], 2), r["solid"])
-                               for r in ranked[:3]])
-    if STRICT and not ranked[0]["solid"]:
-        log.info("recognize: best answer is not confirmed, STRICT is on -> not found")
-        return None
-    top = ranked[0]["song"]
-    top["alts"] = [r["song"] for r in ranked[1:4]]
-    return top
-
-
 # ======================================================================================
-# Captions & keyboards
+# Captions and keyboards
 # ======================================================================================
 def footer(src=None) -> str:
     f = f'<a href="https://t.me/{BOT_USERNAME}">{esc(BOT_USERNAME)}</a>'
@@ -2451,25 +1597,25 @@ def clip_keyboard(sid: str, lang: str):
     ])
 
 
-def result_keyboard(sid: str, song: dict, lang: str = "fa"):
+def result_keyboard(sid: str, song: dict, lang: str = "fa", wrong: bool = True):
     q = quote(f"{song['artist']} - {song['title']}")
     link = song.get("link") or ""
     sp = link if link.startswith("https://open.spotify.com") else f"https://open.spotify.com/search/{q}"
-    return Markup([
+    rows = [
         [Btn("Google", url=f"https://www.google.com/search?q={q}"),
          Btn("YouTube Music", url=f"https://music.youtube.com/search?q={q}"),
          Btn("Spotify", url=sp)],
         [Btn(f"🔍 {tr(lang, 'btn_artist')}", switch_inline_query_current_chat=first_artist(song["artist"]))],
-        [Btn(f"❌ {tr(lang, 'btn_wrong')} ❌", callback_data=f"bad:{sid}")],
-    ])
+    ]
+    if wrong:
+        rows.append([Btn(f"❌ {tr(lang, 'btn_wrong')} ❌", callback_data=f"bad:{sid}")])
+    return Markup(rows)
 
 
 def audio_keyboard(tid: str, song: dict, lang: str = "fa"):
     q = f"{song.get('artist', '')} {song.get('title', '')}".strip()[:200]
-    return Markup([[
-        Btn(f"{tr(lang, 'btn_lyrics')} 🔤", callback_data=f"lyr:{tid}"),
-        Btn("🔍", switch_inline_query_current_chat=q),
-    ]])
+    return Markup([[Btn(f"{tr(lang, 'btn_lyrics')} 🔤", callback_data=f"lyr:{tid}"),
+                    Btn("🔍", switch_inline_query_current_chat=q)]])
 
 
 # ======================================================================================
@@ -2477,10 +1623,8 @@ def audio_keyboard(tid: str, song: dict, lang: str = "fa"):
 # ======================================================================================
 def song_keys(song: dict) -> list:
     tk = title_key(song.get("title"))
-    arts = sorted(artist_set(song.get("artist"), song.get("title")))[:4] or [""]
-    keys = [f"s2:{tk}|{a}" for a in arts]
-    keys.append("s:" + f"{song.get('artist', '')}|{song.get('title', '')}".lower())
-    return keys
+    arts = sorted(artist_set(song.get("artist")))[:4] or [""]
+    return [f"s2:{tk}|{a}" for a in arts] + ["s:" + f"{song.get('artist', '')}|{song.get('title', '')}".lower()]
 
 
 def info_link(a: dict, song=None) -> str:
@@ -2495,17 +1639,14 @@ def info_link(a: dict, song=None) -> str:
 
 
 async def fetch_audio(target: str, song=None) -> dict:
+    """A cached Telegram file_id, or a fresh download (in its own temp folder)."""
     keys = [target] + (song_keys(song) if song else [])
     for k in keys:
         hit = await asyncio.to_thread(cache_get, k)
         if hit:
             return {"file_id": hit["file_id"], "title": hit["title"], "info": hit["info"]}
     tmp = tempfile.mkdtemp(dir=DL_DIR)
-    fb = None
-    if song:
-        fb = f"{song['artist']} - {song['title']}"
-    elif target.startswith("ytsearch1:"):
-        fb = target[10:]
+    fb = f"{song['artist']} - {song['title']}" if song else (target[10:] if target.startswith("ytsearch1:") else None)
     try:
         async with dl_sem():
             a = await asyncio.to_thread(download_audio, target, tmp, fb)
@@ -2518,8 +1659,8 @@ async def fetch_audio(target: str, song=None) -> dict:
 
 
 async def prepare_song_audio(song: dict) -> dict:
-    """Downloads the ORIGINAL recording. Candidates come from pick_targets (best first). If the downloaded
-    length is clearly different from the real song length, the next candidate is tried."""
+    """Downloads the ORIGINAL recording. If the downloaded length is clearly different from the real length of
+    the song, the next candidate is tried."""
     targets = await asyncio.to_thread(pick_targets, song)
     want = song.get("dur")
     err = None
@@ -2549,8 +1690,7 @@ async def deliver_audio(msg, a: dict, song=None, lang: str = "fa"):
     info = info_link(a, tsong)
     if "file_id" in a:
         return await msg.reply_audio(a["file_id"], title=title, performer=performer,
-                                     caption=audio_caption(info), parse_mode="HTML",
-                                     reply_markup=kb)
+                                     caption=audio_caption(info), parse_mode="HTML", reply_markup=kb)
     try:
         if os.path.getsize(a["path"]) > MAX_BYTES:
             raise RuntimeError("audio file is larger than Telegram's upload limit")
@@ -2565,14 +1705,35 @@ async def deliver_audio(msg, a: dict, song=None, lang: str = "fa"):
             await asyncio.to_thread(cache_put, k, sent.audio.file_id, title, info)
 
 
+async def send_audio_task(msg, task, song, lang: str):
+    """Waits for a prepare_song_audio() task and sends the mp3. Failures are reported to the user."""
+    try:
+        await deliver_audio(msg, await task, song, lang)
+    except Exception:
+        log.exception("mp3 failed")
+        await msg.reply_text(tr(lang, "err"))
+
+
+async def send_result(msg, song: dict, lang: str, sid: str, src=None, wrong: bool = True):
+    """Result message first (the song name appears at once), the mp3 follows when it is downloaded.
+    The download starts BEFORE the message is sent, so both happen at the same time."""
+    task = asyncio.create_task(prepare_song_audio(song))
+    try:
+        await msg.reply_text(result_caption(song, src), parse_mode="HTML",
+                             reply_markup=result_keyboard(sid, song, lang, wrong), **NO_PREVIEW)
+    except BaseException:
+        task.cancel()
+        raise
+    await send_audio_task(msg, task, song, lang)
+
+
 async def send_mp3(msg, target: str, title=None, performer=None, lang: str = "fa"):
     song = {"title": title, "artist": performer or ""} if title else None
-    a = await fetch_audio(normalize_target(target), song)
-    await deliver_audio(msg, a, song, lang)
+    await deliver_audio(msg, await fetch_audio(normalize_target(target), song), song, lang)
 
 
 # ======================================================================================
-# Clips
+# Clips and links
 # ======================================================================================
 async def upload_video(msg, path: str, caption: str, kb=None):
     with open(path, "rb") as f:
@@ -2580,57 +1741,35 @@ async def upload_video(msg, path: str, caption: str, kb=None):
                                      supports_streaming=True, read_timeout=300, write_timeout=300)
 
 
+def _video_file_id(sent):
+    for attr in ("video", "animation", "document"):
+        obj = getattr(sent, attr, None)
+        if obj:
+            return obj.file_id
+    return None
+
+
 async def identify_audio_and_reply(msg, src: str, audio_path: str, meta, lang: str):
+    """Links that are not sent as a clip (too big / blocked): the audio is recognized, the result is a message."""
     uid = msg.from_user.id
-    trusted = bool(meta) and (host_in(src, YT_HOSTS) or bool(meta.get("verified")))
     sid = uuid.uuid4().hex[:10]
-    charged = False
-    song = None
-    try:
-        if trusted:
-            song = {"title": meta["title"], "artist": meta["artist"],
-                    "link": src if host_in(src, YT_HOSTS) else None, "engine": "meta#0"}
-            with open(os.path.join(SAMPLES_DIR, sid + ".json"), "w", encoding="utf-8") as f:
-                json.dump(dict(song), f, ensure_ascii=False)
-            await asyncio.to_thread(add_sample, sid, "", src)
-        else:
-            await asyncio.to_thread(add_sample, sid, "", src)
-            # own DB first (no quota); the pieces for the engines are cut at the same time
-            quick_task = asyncio.create_task(asyncio.to_thread(quick_local, audio_path, sid))
-            samples_task = asyncio.create_task(asyncio.to_thread(make_samples, audio_path, sid))
-            try:
-                song = await quick_task
-                if not song:
-                    if not await asyncio.to_thread(use_quota, uid):
-                        return await msg.reply_text(tr(lang, "quota"))
-                    charged = True
-                    outs = await samples_task
-                    if not outs:
-                        await asyncio.to_thread(refund_quota, uid)
-                        return await msg.reply_text(tr(lang, "no_music"))
-                    song = await asyncio.to_thread(recognize, outs, (), meta)
-                    if not song:
-                        await asyncio.to_thread(refund_quota, uid)
-                        return await msg.reply_text(tr(lang, "not_found"))
-            finally:
-                # audio_path is in a temp folder that is deleted when the caller returns: cutting must be finished
-                await asyncio.gather(samples_task, return_exceptions=True)
-    except Exception:
-        if charged and not song:
-            await asyncio.to_thread(refund_quota, uid)
-        raise
+    await asyncio.to_thread(add_sample, sid, "", src)
+    meta_song = meta_to_song(meta, src)
+    if meta_is_trusted(meta, src):
+        song = meta_song
+    else:
+        outs = await asyncio.to_thread(make_samples, audio_path, sid)  # audio_path dies with the caller's folder
+        if not outs:
+            return await msg.reply_text(tr(lang, "no_music"))
+        song, why = await find_song(uid, outs, fallback=meta_song)
+        if not song:
+            return await msg.reply_text(tr(lang, WHY_KEY[why]))
+    if meta_song:
+        save_meta(sid, meta_song)
     remember_alts(sid, song)
     set_last(sid, song)
-    clip_set_song(src, song)
-    audio_task = asyncio.create_task(prepare_song_audio(song))
-    await msg.reply_text(result_caption(song, src), parse_mode="HTML",
-                         reply_markup=result_keyboard(sid, song, lang), **NO_PREVIEW)
-    try:
-        a = await audio_task
-        await deliver_audio(msg, a, song, lang)
-    except Exception:
-        log.exception("mp3 failed")
-        await msg.reply_text(tr(lang, "err"))
+    await asyncio.to_thread(clip_put, src, None, song)
+    await send_result(msg, song, lang, sid, src)
 
 
 async def do_ig_post(msg, src: str, tmp: str, lang: str):
@@ -2650,71 +1789,26 @@ async def do_audio_only(msg, src: str, tmp: str, lang: str, meta=None):
     await identify_audio_and_reply(msg, src, path, meta or meta2, lang)
 
 
-async def identify_clip(uid: int, sid: str, meta, src: str, samples_task, quick_task=None):
-    """Returns (song or None, quota_blocked). The own DB is checked first and costs no quota."""
-    charged = False
-    try:
-        meta_song = None
-        if meta:
-            meta_song = {"title": meta["title"], "artist": meta["artist"],
-                         "link": src if "youtu" in src else None, "engine": "meta#0",
-                         "w": meta.get("w", META_W)}
-            if host_in(src, YT_HOSTS):
-                meta["link"] = src
-                with open(os.path.join(SAMPLES_DIR, sid + ".json"), "w", encoding="utf-8") as f:
-                    json.dump(meta, f, ensure_ascii=False)
-                return meta_song, False
-            if meta.get("verified"):
-                # a name from the reel's caption (checked in iTunes / Deezer) or from Instagram's own
-                # music library: instant, no quota. The samples are still cut for the "wrong song" button.
-                with open(os.path.join(SAMPLES_DIR, sid + ".json"), "w", encoding="utf-8") as f:
-                    json.dump({"title": meta["title"], "artist": meta["artist"], "link": None}, f,
-                              ensure_ascii=False)
-                return meta_song, False
-        if quick_task:
-            try:
-                qs = await quick_task
-            except Exception:
-                qs = None
-            if qs:
-                return qs, False
-        if not await asyncio.to_thread(use_quota, uid):
-            if meta_song:
-                return meta_song, False
-            return None, True
-        charged = True
-        outs = await samples_task
-        if not outs:
-            if not meta_song:
-                await asyncio.to_thread(refund_quota, uid)
-            return meta_song, False
-        song = await asyncio.to_thread(recognize, outs, (), meta_song)
-        if not song:
-            await asyncio.to_thread(refund_quota, uid)
-        return song, False
-    except Exception:
-        log.exception("identify_clip failed")
-        if charged:
-            try:
-                await asyncio.to_thread(refund_quota, uid)
-            except Exception:
-                pass
-        return None, False
-
-
-async def prep_clip(uid: int, sid: str, meta, src: str, samples_task, quick_task=None) -> dict:
-    """Background job: recognize, then download the mp3. The song name is published in PREP[sid]["song"]
-    as soon as it is known, so the button does not wait for the mp3."""
+async def prep_clip(uid: int, sid: str, meta, src: str, samples_task) -> dict:
+    """Background job for a clip: find the song, then download its mp3. The song name is published in
+    PREP[sid]["song"] as soon as it is known, so the button does not wait for the mp3."""
     res = {"song": None, "audio": None, "blocked": False}
     try:
-        song, blocked = await identify_clip(uid, sid, meta, src, samples_task, quick_task)
-        res["song"], res["blocked"] = song, blocked
+        meta_song = meta_to_song(meta, src)
+        if meta_song:
+            save_meta(sid, meta_song)
+        if meta_is_trusted(meta, src):
+            song, why = meta_song, "ok"  # no recognition, no quota; the pieces are still cut for "wrong song"
+        else:
+            outs = await samples_task
+            song, why = await find_song(uid, outs, fallback=meta_song) if outs else (meta_song, "none")
+        res["song"], res["blocked"] = song, why == "quota"
         if song and sid in PREP:
             PREP[sid]["song"] = song
         if song:
             remember_alts(sid, song)
             set_last(sid, song)
-            clip_set_song(src, song)
+            await asyncio.to_thread(clip_put, src, None, song)
             try:
                 res["audio"] = await prepare_song_audio(song)
             except Exception:
@@ -2724,18 +1818,10 @@ async def prep_clip(uid: int, sid: str, meta, src: str, samples_task, quick_task
     return res
 
 
-def _msg_video_id(sent):
-    for attr in ("video", "animation", "document"):
-        obj = getattr(sent, attr, None)
-        if obj:
-            return obj.file_id
-    return None
-
-
 async def clip_from_cache(msg, src: str, hit, lang: str):
     song = json.loads(hit["song"])
     sid = uuid.uuid4().hex[:10]
-    add_sample(sid, "", src)
+    await asyncio.to_thread(add_sample, sid, "", src)
     set_last(sid, {**song, "engine": "cache#0"})
 
     async def prep():
@@ -2772,7 +1858,7 @@ async def do_clip(msg, url: str):
     with tempfile.TemporaryDirectory() as tmp:
         try:
             async with dl_sem():
-                path, title, meta = await asyncio.to_thread(download_clip, src, tmp)
+                path, _title, meta = await asyncio.to_thread(download_clip, src, tmp)
         except Exception as e:
             if "instagram.com" in src:
                 log.warning("instagram clip download failed (%s): trying it as a photo post", str(e)[:100])
@@ -2781,7 +1867,7 @@ async def do_clip(msg, url: str):
             return await do_audio_only(msg, src, tmp, lang)
         if not path:
             return await do_audio_only(msg, src, tmp, lang, meta)
-        if not meta and "instagram.com" in src:
+        if not meta and "instagram.com" in src:  # the music name of a reel from Instagram's own data
             try:
                 got = await asyncio.to_thread(ig_post_audio, src, tmp, False)
                 meta = (got or {}).get("meta")
@@ -2790,54 +1876,50 @@ async def do_clip(msg, url: str):
         sid = uuid.uuid4().hex[:10]
         await asyncio.to_thread(add_sample, sid, "", src)
 
-        # background: quick own-DB check + cut samples run side by side, then recognize + mp3
-        quick_task = asyncio.create_task(asyncio.to_thread(quick_local, path, sid))
+        # background: cut the pieces, find the song, download the mp3. The clip is sent meanwhile
         samples_task = asyncio.create_task(asyncio.to_thread(make_samples, path, sid))
-        prep_task = asyncio.create_task(prep_clip(uid, sid, meta, src, samples_task, quick_task))
+        prep_task = asyncio.create_task(prep_clip(uid, sid, meta, src, samples_task))
         PREP[sid] = {"task": prep_task, "src": src, "created": time.time(), "used": False,
                      "busy": False, "song": None}
         try:
             sent = await upload_video(msg, path, footer(src), clip_keyboard(sid, lang))
-            fid = _msg_video_id(sent)
+            fid = _video_file_id(sent)
             if fid:
                 await asyncio.to_thread(clip_put, src, fid)
         except Exception:
             drop_entry(sid)
             raise
         finally:
-            # the clip file lives in tmp: sample cutting must finish before we leave
-            await asyncio.gather(samples_task, quick_task, return_exceptions=True)
+            await asyncio.gather(samples_task, return_exceptions=True)  # the clip file lives in tmp
 
 
 async def show_prepared(q, sid: str, entry: dict, lang: str):
-    """The user tapped 'identify'. The ONLY progress indicator is the status at the top of the chat; the button
-    under the clip is left untouched. The result appears as soon as the name is known."""
+    """The user tapped 'identify'. The only progress indicator is the status at the top of the chat; the result
+    appears as soon as the name is known."""
     if entry.get("used") or entry.get("busy"):
         return await q.answer()
     entry["busy"] = True
-    await q.answer()  # clears the button spinner, no text
+    await q.answer()
     task = entry["task"]
     t0 = time.time()
-    async with chat_action(q.get_bot(), q.message.chat_id):  # top-of-chat status stays on until found
+    async with chat_action(q.get_bot(), q.message.chat_id):
         while not (entry.get("song") or task.done()) and time.time() - t0 < 240:
             await asyncio.sleep(0.3)
     res = task.result() if task.done() and not task.cancelled() else {}
     song = entry.get("song") or res.get("song")
     if not song:
         drop_entry(sid)  # the next tap recognizes again
-        key = "quota_short" if res.get("blocked") else "not_found"
-        return await q.message.reply_text(tr(lang, key))
+        return await q.message.reply_text(tr(lang, "quota_short" if res.get("blocked") else "not_found"))
     if entry.get("used"):
         return
     entry["used"] = True
-    src = entry["src"]
     try:
-        await q.edit_message_caption(caption=result_caption(song, src), parse_mode="HTML",
+        await q.edit_message_caption(caption=result_caption(song, entry["src"]), parse_mode="HTML",
                                      reply_markup=result_keyboard(sid, song, lang))
     except Exception:
         log.warning("edit caption failed", exc_info=True)
     try:
-        async with chat_action(q.get_bot(), q.message.chat_id):  # keep the status while the mp3 is prepared
+        async with chat_action(q.get_bot(), q.message.chat_id):  # the status stays on while the mp3 is prepared
             r2 = await asyncio.wait_for(asyncio.shield(task), timeout=240)
             a = (r2 or {}).get("audio") or await prepare_song_audio(song)
         await deliver_audio(q.message, a, song, lang)
@@ -2848,100 +1930,49 @@ async def show_prepared(q, sid: str, entry: dict, lang: str):
 
 
 # ======================================================================================
-# Voice / audio / typed text from the user
+# Voice / audio / typed text
 # ======================================================================================
 async def handle_media(msg, media, lang: str):
-    """Voice / audio / video note. No status message is posted: handle() keeps the top-of-chat status on
-    until the song is found."""
+    """Voice / audio / video note. No status message: handle() keeps the top-of-chat status on."""
     uid = msg.from_user.id
     fid = media.file_unique_id
     sid = uuid.uuid4().hex[:10]
     song = await asyncio.to_thread(media_cache_get, fid)
-    charged = False
-    try:
-        if song:
-            await asyncio.to_thread(add_sample, sid, "")
-            set_last(sid, {**song, "engine": "cache#0"})
-        else:
-            size = getattr(media, "file_size", 0) or 0
-            if size > 20 * 1024 * 1024:
-                return await msg.reply_text(tr(lang, "err"))
-            if not await asyncio.to_thread(use_quota, uid):
-                return await msg.reply_text(tr(lang, "quota"))
-            charged = True
-            raw = os.path.join(SAMPLES_DIR, sid + ".raw")
-            await (await media.get_file()).download_to_drive(raw)
-
-            # 1) own database first: usually under a second, costs no quota. The pieces for the engines are cut
-            #    at the same time, so a miss does not wait for them afterwards
-            quick_task = asyncio.create_task(asyncio.to_thread(quick_local, raw, sid))
-            samples_task = asyncio.create_task(asyncio.to_thread(make_samples, raw, sid))
+    if song:
+        await asyncio.to_thread(add_sample, sid, "")
+        set_last(sid, {**song, "engine": "cache#0"})
+    else:
+        if (getattr(media, "file_size", 0) or 0) > 20 * 1024 * 1024:
+            return await msg.reply_text(tr(lang, "err"))
+        raw = os.path.join(SAMPLES_DIR, sid + ".raw")
+        await (await media.get_file()).download_to_drive(raw)
+        try:
+            outs = await asyncio.to_thread(make_samples, raw, sid)
+            if not outs:  # ffmpeg could not cut it: use the file as it is
+                fallback = os.path.join(SAMPLES_DIR, f"{sid}_0.ogg")
+                shutil.copyfile(raw, fallback)
+                outs = [fallback]
+        finally:
             try:
-                song = await quick_task
-            except Exception:
-                await asyncio.gather(samples_task, return_exceptions=True)
-                raise
-            if song:
-                # the pieces are kept: if the user taps "wrong song", the engines can still be asked
-                await asyncio.gather(samples_task, return_exceptions=True)
-                await asyncio.to_thread(refund_quota, uid)
-                charged = False
-                song["alts"] = []
-                try:
-                    os.remove(raw)
-                except OSError:
-                    pass
-                await asyncio.to_thread(add_sample, sid, "")
-                remember_alts(sid, song)
-                set_last(sid, song)
-            else:
-                # 2) full recognition (ACR + Shazam together)
-                outs = await samples_task
-                if outs:
-                    os.remove(raw)
-                else:
-                    fallback = os.path.join(SAMPLES_DIR, f"{sid}_0.ogg")
-                    os.replace(raw, fallback)
-                    outs = [fallback]
-                await asyncio.to_thread(add_sample, sid, outs[0])
-                song = await asyncio.to_thread(recognize, outs)
-                if not song:
-                    await asyncio.to_thread(refund_quota, uid)
-                    charged = False
-                    return await msg.reply_text(tr(lang, "not_found"))
-                charged = False
-                remember_alts(sid, song)
-                set_last(sid, song)
-    except Exception:
-        if charged:
-            await asyncio.to_thread(refund_quota, uid)
-        raise
+                os.remove(raw)
+            except OSError:
+                pass
+        await asyncio.to_thread(add_sample, sid, outs[0])
+        song, why = await find_song(uid, outs)
+        if not song:
+            return await msg.reply_text(tr(lang, WHY_KEY[why]))
+        remember_alts(sid, song)
+        set_last(sid, song)
     await asyncio.to_thread(media_cache_put, fid, song, sid)
-    audio_task = asyncio.create_task(prepare_song_audio(song))
-    await msg.reply_text(result_caption(song), parse_mode="HTML",
-                         reply_markup=result_keyboard(sid, song, lang), **NO_PREVIEW)
-    try:
-        a = await audio_task
-        await deliver_audio(msg, a, song, lang)
-    except Exception:
-        log.exception("mp3 failed")
-        await msg.reply_text(tr(lang, "err"))
+    await send_result(msg, song, lang, sid)
 
 
 async def try_lyrics_search(msg, text: str, lang: str) -> bool:
-    words = re.findall(r"\w+", _fold(text))
+    words = re.findall(r"\w+", fold(text))
     song = await asyncio.to_thread(find_song_by_words, words)
     if not song:
         return False
-    audio_task = asyncio.create_task(prepare_song_audio(song))
-    kb = Markup(result_keyboard("x", song, lang).inline_keyboard[:-1])
-    await msg.reply_text(result_caption(song), parse_mode="HTML", reply_markup=kb, **NO_PREVIEW)
-    try:
-        a = await audio_task
-        await deliver_audio(msg, a, song, lang)
-    except Exception:
-        log.exception("mp3 failed")
-        await msg.reply_text(tr(lang, "err"))
+    await send_result(msg, song, lang, "x", wrong=False)
     return True
 
 
@@ -2956,12 +1987,13 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await msg.reply_text(tr(lang, "slow"))
     media = msg.voice or msg.audio or msg.video_note
     text = (msg.text or "").strip()
+    if not media and not text:
+        return
     url = first_url(text)
     is_clip = bool(url and host_in(url, CLIP_HOSTS) and host_of(url) != "music.youtube.com")
     action = ChatAction.UPLOAD_VIDEO if is_clip else ChatAction.RECORD_VOICE
     try:
-        # the status at the top of the chat stays on for the WHOLE request (voice, clip link, lyrics text,
-        # song name) until the answer is sent
+        # the status at the top of the chat stays on for the WHOLE request until the answer is sent
         async with chat_action(ctx.bot, msg.chat_id, action):
             if media:
                 await handle_media(msg, media, lang)
@@ -2972,9 +2004,9 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             elif url:
                 target, _ = await asyncio.to_thread(resolve, text)
                 await send_mp3(msg, target, lang=lang)
+            elif len(re.findall(r"\w+", text)) >= 5 and await try_lyrics_search(msg, text, lang):
+                return
             else:
-                if len(re.findall(r"\w+", text)) >= 5 and await try_lyrics_search(msg, text, lang):
-                    return
                 await send_results(msg, text, lang)
     except Exception:
         log.exception("handle failed")
@@ -2984,78 +2016,64 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ======================================================================================
 # Buttons
 # ======================================================================================
-async def on_rec(q, data: str):
-    action, sid = data.split(":", 1)
+async def reidentify(q, sid: str, wrong: bool):
+    """'wrong song' (wrong=True) or 'identify' for a sample that is no longer in memory (wrong=False).
+    The wrong answer is rejected, then: other answers already known -> the name from the post -> ask again."""
     uid = q.from_user.id
     lang = await asyncio.to_thread(get_lang, uid)
-
-    if action == "rec":
-        entry = PREP.get(sid)
-        if entry:
-            return await show_prepared(q, sid, entry, lang)
-    else:
+    if wrong:
         drop_entry(sid)
         await asyncio.to_thread(media_cache_drop, sid)
-
     with db() as c:
         row = c.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
-    if row and action == "bad" and row["src"]:
+    if row and wrong and row["src"]:
         await asyncio.to_thread(clip_delete, row["src"])
     paths = sorted(glob.glob(os.path.join(SAMPLES_DIR, f"{sid}_*")))
     mpath = os.path.join(SAMPLES_DIR, f"{sid}.json")
     if not row or not (paths or os.path.exists(mpath) or CANDS.get(sid)):
         return await q.answer(tr(lang, "expired"), show_alert=True)
-    tried = [t for t in (row["tried"] or "").split(",") if t]
-    if action == "bad" and row["last"]:
-        eng, _, key = row["last"].partition("||")
-        if key:
-            tried.append("k:" + key)
-        if eng and (not key or eng in ("meta#0", "lyrics#0", "cache#0", "local#0")):
-            tried.append(eng)
-        with db() as c:
-            c.execute("UPDATE samples SET tried=? WHERE id=?", (",".join(tried), sid))
-    rejected = {t[2:] for t in tried if t.startswith("k:")}
+
+    rejected = {t[2:] for t in (row["tried"] or "").split(",") if t.startswith("k:")}
+    if wrong and row["last"]:
+        key = row["last"].partition("||")[2]
+        if key and key not in rejected:
+            rejected.add(key)
+            with db() as c:
+                c.execute("UPDATE samples SET tried=? WHERE id=?", (",".join("k:" + k for k in rejected), sid))
+
     song = None
-    if action == "bad":
+    if wrong:
         alts = (CANDS.get(sid) or {}).get("alts") or []
-        while alts:
-            c_ = alts.pop(0)
-            if title_key(c_.get("title")) not in rejected:
-                song = c_
-                break
-    if not song and "meta#0" not in tried and os.path.exists(mpath):
+        while alts and not song:
+            cand = alts.pop(0)
+            if title_key(cand.get("title")) not in rejected:
+                song = cand
+    if not song and os.path.exists(mpath):
         try:
             with open(mpath, encoding="utf-8") as f:
                 m = json.load(f)
-            song = {"title": m["title"], "artist": m["artist"], "link": m.get("link"), "engine": "meta#0"}
+            if title_key(m["title"]) not in rejected:
+                song = {"title": m["title"], "artist": m["artist"], "link": m.get("link"), "engine": "meta#0"}
         except Exception:
             song = None
+
     if song:
         await q.answer()
     else:
         if not paths:
             return await q.answer(tr(lang, "no_result"), show_alert=True)
-        if not await asyncio.to_thread(use_quota, uid):
-            return await q.answer(tr(lang, "quota_short"), show_alert=True)
         await q.answer()  # no text: the status at the top of the chat shows the progress
-        try:
-            async with chat_action(q.get_bot(), q.message.chat_id):
-                song = await asyncio.to_thread(recognize, paths, tuple(tried))
-        except Exception:
-            await asyncio.to_thread(refund_quota, uid)
-            raise
-        if song:
-            remember_alts(sid, song)
-        else:
-            await asyncio.to_thread(refund_quota, uid)
-    if not song:
-        txt = tr(lang, "not_found") if not tried else tr(lang, "no_more")
-        return await q.message.reply_text(txt)
+        async with chat_action(q.get_bot(), q.message.chat_id):
+            song, why = await find_song(uid, paths, rejected=rejected)
+        if not song:
+            key = {"quota": "quota_short", "busy": "err", "none": "no_more" if rejected else "not_found"}[why]
+            return await q.message.reply_text(tr(lang, key))
+        remember_alts(sid, song)
+
     set_last(sid, song)
     src = row["src"]
-    kb = result_keyboard(sid, song, lang)
-    cap = result_caption(song, src)
-    audio_task = asyncio.create_task(prepare_song_audio(song))
+    cap, kb = result_caption(song, src), result_keyboard(sid, song, lang)
+    task = asyncio.create_task(prepare_song_audio(song))
     try:
         if q.message.text:
             await q.edit_message_text(cap, parse_mode="HTML", reply_markup=kb, **NO_PREVIEW)
@@ -3064,17 +2082,19 @@ async def on_rec(q, data: str):
     except Exception:
         await q.message.reply_text(cap, parse_mode="HTML", reply_markup=kb, **NO_PREVIEW)
     if src:
-        await asyncio.to_thread(clip_set_song, src, song)
-        vid = getattr(q.message, "video", None)
-        if vid:
-            await asyncio.to_thread(clip_put, src, vid.file_id, song)
-    try:
-        async with chat_action(q.get_bot(), q.message.chat_id):
-            a = await audio_task
-        await deliver_audio(q.message, a, song, lang)
-    except Exception:
-        log.exception("mp3 failed")
-        await q.message.reply_text(tr(lang, "err"))
+        video = getattr(q.message, "video", None)
+        await asyncio.to_thread(clip_put, src, video.file_id if video else None, song)
+    async with chat_action(q.get_bot(), q.message.chat_id):
+        await send_audio_task(q.message, task, song, lang)
+
+
+async def on_rec(q, data: str):
+    action, sid = data.split(":", 1)
+    if action == "rec":
+        entry = PREP.get(sid)
+        if entry:
+            return await show_prepared(q, sid, entry, await asyncio.to_thread(get_lang, q.from_user.id))
+    await reidentify(q, sid, wrong=(action == "bad"))
 
 
 async def on_lyrics(q, data: str):
@@ -3084,7 +2104,7 @@ async def on_lyrics(q, data: str):
         row = c.execute("SELECT * FROM tracks WHERE id=?", (tid,)).fetchone()
     if not row:
         return await q.answer(tr(lang, "track_missing"), show_alert=True)
-    await q.answer()  # no text: the status at the top of the chat shows the progress
+    await q.answer()
     async with chat_action(q.get_bot(), q.message.chat_id, ChatAction.TYPING):
         text = await asyncio.to_thread(get_lyrics, row["artist"], row["title"])
     if not text:
@@ -3129,8 +2149,7 @@ async def on_lang_button(q, data: str):
     if code not in LANGS:
         return await q.answer()
     await asyncio.to_thread(set_lang, q.from_user.id, code)
-    toast = tr(code, "lang_set") if code in STR else "✅ " + LANGS[code]
-    await q.answer(toast)
+    await q.answer(tr(code, "lang_set") if code in STR else "✅ " + LANGS[code])
     text = tr(code, "welcome").rsplit("\n\n", 1)[0] + "\n\n🌐 /lang"
     try:
         await q.edit_message_text(text, parse_mode="HTML", reply_markup=None, **NO_PREVIEW)
@@ -3142,17 +2161,24 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     data = q.data or ""
     await asyncio.to_thread(touch_user, q.from_user)
-    if data.startswith(("rec:", "bad:")):
-        return await on_rec(q, data)
-    if data.startswith("pick:"):
-        return await on_pick(q, ctx, data)
-    if data.startswith("more:"):
-        return await on_more(q, data)
-    if data.startswith("lyr:"):
-        return await on_lyrics(q, data)
-    if data.startswith("lang:"):
-        return await on_lang_button(q, data)
-    await q.answer()
+    try:
+        if data.startswith(("rec:", "bad:")):
+            return await on_rec(q, data)
+        if data.startswith("pick:"):
+            return await on_pick(q, ctx, data)
+        if data.startswith("more:"):
+            return await on_more(q, data)
+        if data.startswith("lyr:"):
+            return await on_lyrics(q, data)
+        if data.startswith("lang:"):
+            return await on_lang_button(q, data)
+        await q.answer()
+    except Exception:
+        log.exception("button %s failed", data[:20])
+        try:
+            await q.message.reply_text(tr(await asyncio.to_thread(get_lang, q.from_user.id), "err"))
+        except Exception:
+            pass
 
 
 # ======================================================================================
@@ -3173,16 +2199,14 @@ async def on_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         vid = it.get("id")
         if not vid:
             continue
-        title = it.get("title") or vid
-        dur = it.get("duration")
         desc = it.get("channel") or it.get("uploader") or ""
-        if dur:
-            desc += f" • {int(dur) // 60}:{int(dur) % 60:02d}"
+        if it.get("duration"):
+            d = int(it["duration"])
+            desc += f" • {d // 60}:{d % 60:02d}"
         results.append(InlineQueryResultArticle(
-            id=vid, title=title[:100], description=desc,
+            id=vid, title=(it.get("title") or vid)[:100], description=desc,
             thumbnail_url=f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg",
-            input_message_content=InputTextMessageContent(f"{MP3_PREFIX}https://www.youtube.com/watch?v={vid}"),
-        ))
+            input_message_content=InputTextMessageContent(f"{MP3_PREFIX}https://www.youtube.com/watch?v={vid}")))
     await q.answer(results, cache_time=60)
 
 
@@ -3190,11 +2214,6 @@ async def on_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # Commands / lifecycle
 # ======================================================================================
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await asyncio.to_thread(touch_user, update.effective_user)
-    await update.message.reply_text(LANG_PROMPT, reply_markup=lang_keyboard())
-
-
-async def cmd_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await asyncio.to_thread(touch_user, update.effective_user)
     await update.message.reply_text(LANG_PROMPT, reply_markup=lang_keyboard())
 
@@ -3213,25 +2232,33 @@ async def post_shutdown(app: Application):
         t.cancel()
     for sid in list(PREP):
         drop_entry(sid)
-    ENGINE_POOL.shutdown(wait=False, cancel_futures=True)
-    LOCAL_POOL.shutdown(wait=False, cancel_futures=True)
-    if _BG:
-        _BG.stop()
+
+
+def _fp_function():
+    """The identify function of fp_engine, found by name."""
+    if fp_engine:
+        for name in ("identify", "recognize", "match", "lookup", "query"):
+            f = getattr(fp_engine, name, None)
+            if callable(f):
+                log.info("fp_engine: using fp_engine.%s()", name)
+                return f
+        log.warning("fp_engine has no identify/recognize/match/lookup/query function: local database is off")
+    return None
 
 
 def main():
     migrate()
-    seed_from_env()
+    seed_accounts()
+    recognition.init(load_accounts, local_fn=_fp_function())
+    if not load_accounts():
+        log.warning("no ACRCloud account in the accounts table: only the local database can recognize songs")
     app = (Application.builder().token(BOT_TOKEN).concurrent_updates(True)
            .post_init(post_init).post_shutdown(post_shutdown).build())
-    for name, fn in [("start", cmd_start), ("lang", cmd_lang)]:
-        app.add_handler(CommandHandler(name, fn))
+    app.add_handler(CommandHandler(["start", "lang"], cmd_start))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(InlineQueryHandler(on_inline))
     app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND | filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE,
-        handle,
-    ))
+        filters.TEXT & ~filters.COMMAND | filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE, handle))
     app.add_error_handler(on_error)
     try:
         from admin import register as register_admin
