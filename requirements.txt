@@ -1,3 +1,8 @@
 python-telegram-bot>=21
 yt-dlp
 requests
+numpy
+scipy
+shazamio
+# optional: the "what the singer says" stage (heavy, CPU). Without it set LYRICS_ENGINE=0
+# faster-whisper
