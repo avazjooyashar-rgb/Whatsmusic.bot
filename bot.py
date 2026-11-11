@@ -3,9 +3,9 @@ Music recognition Telegram bot - v10 (clean)
 
 Recognition (see recognition.py):
   1) own fingerprint DB (fp_engine): free, fast, knows remixes and special versions
-  2) ACRCloud, with several accounts in priority order: when one is out of quota the next one is used, and
-     the first one is used again as soon as its quota is open
-No Shazam, no whisper, no voting between engines.
+  2) ACRCloud + Shazam vote together (several ACR accounts in priority order, Shazam with a circuit breaker);
+     a song confirmed by two engines is learned by the own DB, so the next time it is answered for free
+Last resort when nothing is confirmed: lyrics (faster-whisper, optional) and cleaned / tempo-shifted audio.
 
 Sources: Instagram / YouTube links (clip + one tap to identify), voice / audio / video notes, streaming links
 (Spotify, Apple Music...), song names (search), pieces of lyrics (find the song by its words).
@@ -694,15 +694,36 @@ async def maintenance_loop():
 
 
 # ======================================================================================
-# Recognition glue: own DB first (free), then ACRCloud (1 quota)
+# Recognition glue: own DB first (free), then ACRCloud + Shazam together (1 quota)
 # ======================================================================================
 class OutOfQuota(Exception):
     """The user's daily recognition limit is used up."""
 
 
+def _learn_async(paths, song):
+    """A song confirmed by TWO engines (ACR and Shazam agree) is added to the own DB in the background, so the
+    next time it is answered at once and for free. One engine alone is never learned (a wrong name would poison
+    the DB)."""
+    if not fp_engine or not {"acr", "shazam"} <= set((song.get("engine") or "").split("+")) or not paths:
+        return
+    title, artist = song.get("title"), song.get("artist")
+    path = song.get("piece_path") or paths[0]
+    if not title or not artist:
+        return
+
+    def run():
+        try:
+            if fp_engine._thread_engine().learn(path, title, artist, source="api"):
+                log.info("learned: %s - %s", artist, title)
+        except Exception as e:  # learning must never break an answer
+            log.warning("learn failed: %s", e)
+
+    threading.Thread(target=run, daemon=True, name="learn").start()
+
+
 async def identify(uid: int, paths, rejected=()):
-    """Own DB first: no quota. ACRCloud only when the DB does not know the song: costs 1 quota, refunded when
-    nothing is found or something breaks. -> song dict or None. Raises OutOfQuota / NoAccounts."""
+    """Own DB first: no quota. ACRCloud + Shazam only when the DB does not know the song: costs 1 quota, refunded
+    when nothing is found or something breaks. -> song dict or None. Raises OutOfQuota / NoAccounts."""
     rejected = set(rejected)
     song = await asyncio.to_thread(recognition.ask_local, paths, rejected)
     if song:
@@ -711,10 +732,12 @@ async def identify(uid: int, paths, rejected=()):
         raise OutOfQuota()
     song = None
     try:
-        song = await asyncio.to_thread(recognition.ask_acr, paths, rejected)
+        song = await asyncio.to_thread(recognition.ask_engines, paths, rejected)
     finally:
         if not song:  # not found, no account answered, or cancelled: the user did not get anything
             await asyncio.to_thread(refund_quota, uid)
+    if song:
+        _learn_async(paths, song)
     return song
 
 
@@ -729,7 +752,7 @@ async def find_song(uid: int, paths, fallback=None, rejected=()):
     except OutOfQuota:
         why = "quota"
     except recognition.NoAccounts:
-        log.error("no ACRCloud account could answer")
+        log.error("no recognition engine could answer")
         why = "busy"
     if fallback:
         return dict(fallback), "ok"
@@ -2249,11 +2272,16 @@ def _fp_function():
 def main():
     migrate()
     seed_accounts()
-    recognition.init(load_accounts, local_fn=_fp_function())
+    recognition.init(load_accounts, local_fn=_fp_function(), words_fn=find_song_by_words)
     if not load_accounts():
-        log.warning("no ACRCloud account in the accounts table: only the local database can recognize songs")
+        log.warning("no ACRCloud account in the accounts table: only the local database and Shazam can recognize songs")
     app = (Application.builder().token(BOT_TOKEN).concurrent_updates(True)
            .post_init(post_init).post_shutdown(post_shutdown).build())
+    try:  # teach the bot songs by forwarding them to its private chat (learn_forward.py, hashes only)
+        import learn_forward
+        learn_forward.register(app)
+    except Exception:
+        log.exception("learn_forward not loaded - forwarding songs to teach the bot is off")
     app.add_handler(CommandHandler(["start", "lang"], cmd_start))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(InlineQueryHandler(on_inline))
