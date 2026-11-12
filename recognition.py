@@ -405,7 +405,7 @@ class AccountPool:
     def pause(self, acc: dict, seconds: int, why: str, quota: bool = False):
         with self._lock:
             i = acc["id"]
-            self._until[i] = time.time() + seconds
+            self._until[i] = max(self._until.get(i, 0), time.time() + seconds)
             self._half.add(i)
             self._probing.pop(i, None)
             (self._quota_paused.add if quota else self._quota_paused.discard)(i)
@@ -414,6 +414,8 @@ class AccountPool:
 
     def quota(self, acc: dict):
         with self._lock:
+            if self._until.get(acc["id"], 0) > time.time():
+                return                    # another piece of the same burst already paused it: no extra backoff
             n = self._quota_hits[acc["id"]] = self._quota_hits.get(acc["id"], 0) + 1
         _count("acr_quota")
         self.pause(acc, min(QUOTA_RETRY * 2 ** (n - 1), QUOTA_MAX), "quota exhausted", quota=True)
