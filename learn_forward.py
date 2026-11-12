@@ -3,8 +3,13 @@ learn_forward.py - teach the bot songs by forwarding them to its private chat (h
 
 Usage in Telegram (only the owner):
     /learn on    -> every audio you send/forward is fingerprinted and learned (not recognised)
-    /learn off   -> normal behaviour again
-A summary with the learned names is sent after you stop forwarding.
+    /learn off   -> normal behaviour again (files already forwarded are STILL learned to the end)
+A summary with the learned names is sent after the whole queue is finished.
+
+HOW IT WORKS (this version):
+  on_audio only checks the learn mode at the moment the file ARRIVES and puts it into a queue, then returns at once.
+  Background workers do the slow part (download, Shazam, fingerprint). So /learn off is handled immediately and
+  only affects NEW files; everything that was already forwarded keeps being processed.
 
 NAMES: channel tags are often broken ("To Aziz Delami To Chesmat ~ UpMusic", artist "@musyone"), so
   * @handles and t.me links are removed from tags,
@@ -23,6 +28,7 @@ Hook it into bot.py (apply_learn_patch.py does it):
 Who may teach the bot: LEARN_OWNER_ID (comma separated ids) if set, otherwise ADMIN_IDS from the env.
 Bots cannot download files bigger than 20 MB: those are reported as failed.
 Files shorter than LEARN_MIN_SEC (default 60) or longer than LEARN_MAX_SEC (default 720) are skipped.
+LEARN_WORKERS (default 2) = how many files are processed at the same time.
 """
 import asyncio
 import logging
@@ -54,7 +60,8 @@ DB = os.environ.get("FP_DB", "fingerprints.db")
 MIN_SEC = int(os.environ.get("LEARN_MIN_SEC", "60"))
 MAX_SEC = int(os.environ.get("LEARN_MAX_SEC", "720"))
 USE_SHAZAM = os.environ.get("LEARN_USE_SHAZAM", "1") == "1"
-SUMMARY_DELAY = 8  # seconds of silence before the summary is sent
+WORKERS = max(1, int(os.environ.get("LEARN_WORKERS", "2")))
+SUMMARY_DELAY = 8  # seconds after the queue became empty before the summary is sent
 MAX_NAMES = 25     # names listed in one summary
 
 # versions the owner put in the channel on purpose: keep their tag name, Shazam would name the original
@@ -64,7 +71,11 @@ _HANDLE = re.compile(r"@\w+|(?:https?://)?t\.me/\S+", re.I)
 _eng = None
 _sh = None
 _DB_LOCK = threading.Lock()  # one SQLite connection: never use it from two threads at once
-_SEM = asyncio.Semaphore(2)  # bot.py runs with concurrent_updates: never process 50 forwards at once
+
+# queue of forwarded files; created lazily inside the running event loop
+_QUEUE = None
+_WORKER_TASKS = []
+_PENDING = 0  # files that are in the queue or being processed right now
 
 
 def _tidy(s: str) -> str:
@@ -203,18 +214,64 @@ async def _send_summary(bot, chat_id: int, stats: dict):
     await bot.send_message(chat_id, text[:4000])
 
 
+async def _worker():
+    """Takes forwarded files from the queue one by one. Never looks at learn_mode: a file that was
+    accepted while the mode was ON is always finished, even after /learn off."""
+    global _PENDING
+    while True:
+        att, file_id, chat_id, stats, bot, bot_data = await _QUEUE.get()
+        tmp = tempfile.mkdtemp(prefix="fwd_")
+        try:
+            kind, label = await _process(att, tmp, file_id)
+        except Exception as e:
+            kind, label = "failed", ""
+            stats["errors"].append(f"{getattr(att, 'file_name', '') or '?'}: {str(e)[:80]}")
+            log.warning("learn_forward failed: %s", e)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        stats[kind] += 1
+        if label and kind in ("added", "had"):
+            stats["names"].append(label)
+        _PENDING -= 1
+        _QUEUE.task_done()
+        if _PENDING <= 0:  # the whole queue is finished: now send the summary
+            _PENDING = 0
+            old = bot_data.get("learn_task")
+            if old and not old.done():
+                old.cancel()
+            bot_data["learn_task"] = asyncio.create_task(_send_summary(bot, chat_id, stats))
+
+
+def _ensure_workers():
+    global _QUEUE
+    if _QUEUE is None:
+        _QUEUE = asyncio.Queue()
+    _WORKER_TASKS[:] = [t for t in _WORKER_TASKS if not t.done()]
+    while len(_WORKER_TASKS) < WORKERS:
+        _WORKER_TASKS.append(asyncio.create_task(_worker()))
+
+
 async def cmd_learn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     arg = (context.args[0].lower() if context.args else "")
     if arg not in ("on", "off"):
         state = "روشن" if context.bot_data.get("learn_mode") else "خاموش"
-        await update.effective_message.reply_text(f"حالت یادگیری: {state}\n/learn on  یا  /learn off")
+        text = f"حالت یادگیری: {state}\n/learn on  یا  /learn off"
+        if _PENDING:
+            text += f"\n⏳ در حال پردازش: {_PENDING} فایل"
+        await update.effective_message.reply_text(text)
         return
     context.bot_data["learn_mode"] = arg == "on"
-    await update.effective_message.reply_text(
-        "حالت یادگیری روشن شد. آهنگ‌ها رو فوروارد کن." if arg == "on" else "حالت یادگیری خاموش شد.")
+    if arg == "on":
+        text = "حالت یادگیری روشن شد. آهنگ‌ها رو فوروارد کن."
+    else:
+        text = "حالت یادگیری خاموش شد."
+        if _PENDING:
+            text += f"\n⏳ {_PENDING} فایلی که قبلاً فرستادی هنوز در حال یادگیریه و تا آخر ادامه پیدا می‌کنه."
+    await update.effective_message.reply_text(text)
 
 
 async def on_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global _PENDING
     if not context.bot_data.get("learn_mode"):
         return  # normal recognition flow continues
     msg = update.effective_message
@@ -222,24 +279,12 @@ async def on_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_id = msg.audio.file_id if msg.audio else None   # only audio file_ids can be re-sent as audio
     stats = context.bot_data.setdefault(
         "learn_stats", {"added": 0, "had": 0, "skipped": 0, "failed": 0, "names": [], "errors": []})
-    tmp = tempfile.mkdtemp(prefix="fwd_")
-    try:
-        async with _SEM:
-            kind, label = await _process(att, tmp, file_id)
-    except Exception as e:
-        kind, label = "failed", ""
-        stats["errors"].append(f"{getattr(att, 'file_name', '') or msg.message_id}: {str(e)[:80]}")
-        log.warning("learn_forward failed: %s", e)
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-    stats[kind] += 1
-    if label and kind in ("added", "had"):
-        stats["names"].append(label)
+    _ensure_workers()
     task = context.bot_data.get("learn_task")
     if task and not task.done():
-        task.cancel()
-    context.bot_data["learn_task"] = asyncio.create_task(
-        _send_summary(context.bot, msg.chat_id, stats))
+        task.cancel()  # a new file arrived: the summary has to wait for it
+    _PENDING += 1
+    _QUEUE.put_nowait((att, file_id, msg.chat_id, stats, context.bot, context.bot_data))
     raise ApplicationHandlerStop  # never run normal recognition on a file sent in learn mode
 
 
