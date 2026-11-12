@@ -5,12 +5,16 @@ recognition.py - music recognition core (the ONLY file that knows how a song is 
   2) ACRCloud + Shazam   every piece goes to BOTH engines at the same time, the votes are combined
        - ACR accounts are tried in PRIORITY order; an exhausted account is paused (backoff) and the next one is
          used at once. A paused account comes back through ONE probe request only, and pauses survive a restart.
-       - Shazam has a half-open circuit breaker (one probe after a pause), several event loops, no client race
-  3) nothing confirmed -> lyrics (one more vote), then the best piece again, cleaned (noise filter) and
-     tempo-shifted (sped-up / slowed remixes) into the SAME votes; near-silent pieces are never sent;
-     the same audio is answered from a cache (negative answers are cached for a short time too)
+       - Shazam has a half-open circuit breaker (one probe after a pause), several event loops, no client race.
+         If Shazam fails twice inside ONE request it is dropped for the rest of that request (no more waiting).
+  3) nothing confirmed -> lyrics (what the singer says: each piece is searched on its own, and two different
+     pieces that lead to the same song CONFIRM it, so a cover sung by somebody else is found), then the best
+     piece again, cleaned (noise filter) and tempo-shifted (sped-up / slowed remixes) into the SAME votes;
+     near-silent pieces are never sent; the same audio is answered from a cache
   4) an answer is accepted only when it is CONFIRMED: two engines agree, or two different pieces agree
-     (a single-piece clip is accepted when one engine is very sure; lyrics alone never confirm anything)
+     (a single-piece clip is accepted when one engine is very sure). NEW: two different pieces that ACR
+     recognised by HUMMING / melody also confirm, and two different pieces whose lyrics point to the same song too.
+     Optional GUESS=1: an unconfirmed best answer is returned with "guess": True instead of "not found".
 
   The own DB runs at the same time as the engines (LOCAL_FIRST=0, default). A strong DB answer is returned at
   once and the engines are cancelled. A weak DB answer (one piece, low score) becomes one more VOTE for the engines.
@@ -97,11 +101,14 @@ STRICT = _flag("STRICT", True)                                  # unconfirmed an
 SOLO_ACCEPT = _flag("SOLO_ACCEPT", True)                        # 1-piece clip: one very sure engine is enough
 SOLO_W = _env(float, 0.95, "SOLO_W")
 LOCAL_FIRST = _flag("LOCAL_FIRST", False)
+GUESS = _flag("GUESS", False)                                   # STRICT + unconfirmed: return a flagged guess
+GUESS_MIN = _env(float, 0.8, "GUESS_MIN")                       # ... only when its score is at least this
 
 SHAZAM_TIMEOUT = _env(int, 10, "SHAZAM_TIMEOUT")
 SHAZAM_MAX_FAILS = _env(int, 3, "SHAZAM_MAX_FAILS")
 SHAZAM_PAUSE = _env(int, 300, "SHAZAM_PAUSE")
 SHAZAM_THREADS = max(_env(int, 3, "SHAZAM_THREADS"), 1)         # parallel Shazam requests (one event loop each)
+SHAZAM_DROP_AFTER = _env(int, 2, "SHAZAM_DROP_AFTER")           # fails inside ONE request before it stops waiting
 
 
 def _parse_engines(s) -> tuple:
@@ -118,7 +125,7 @@ LYRICS_JOIN = _env(int, 25, "LYRICS_JOIN")                      # how long the e
 LOCAL_HEAD_START = _env(float, 1.0, "LOCAL_HEAD_START")        # recognize(): the free DB gets this head start
 SILENT_DB = _env(float, -48.0, "SILENT_DB")                     # pieces quieter than this are not sent
 CACHE_TTL = _env(int, 3 * 86400, "RECOG_CACHE_TTL")
-NEG_TTL = _env(int, 600, "RECOG_NEG_TTL")                       # "not found" is remembered this long
+NEG_TTL = _env(int, 90, "RECOG_NEG_TTL")                        # "not found" is remembered this long (was 600)
 CACHE_MAX = _env(int, 2000, "RECOG_CACHE_MAX")
 FFMPEG = shutil.which("ffmpeg")
 
@@ -134,6 +141,7 @@ QUOTA_RETRY = _env(int, 600, "ACR_QUOTA_RETRY")                 # first probe of
 QUOTA_MAX = _env(int, 1800, "ACR_QUOTA_MAX")                    # the pause doubles up to this
 RESET_HOUR = _env(float, None, "ACR_RESET_UTC_HOUR")            # optional: daily quota reset hour (UTC)
 BALANCE = _flag("ACR_BALANCE", False)                           # rotate accounts instead of strict priority
+CLEAR_STATE = _flag("ACR_CLEAR_STATE", False)                   # 1 = forget saved pauses at start (after topping up)
 STATE_FILE = os.environ.get("ACR_STATE_FILE",
                             os.path.join(os.path.dirname(os.path.abspath(__file__)), ".acr_state.json"))
 # per-account counters of the admin panel (accounts.uses / accounts.errors in the bot's SQLite DB)
@@ -335,6 +343,13 @@ class AccountPool:
         self._rr = 0
         self._reset_day = None
         self._lock = threading.RLock()
+        if CLEAR_STATE:
+            try:
+                if STATE_FILE and os.path.exists(STATE_FILE):
+                    os.remove(STATE_FILE)
+                    log.info("ACR_CLEAR_STATE=1: saved account pauses forgotten")
+            except OSError:
+                pass
         self._load_state()
 
     # persistence
@@ -512,7 +527,7 @@ def _hum_score(h: dict) -> float:
 
 def _parse(md: dict) -> list:
     """ACR answer -> candidates. "w" = vote weight: ACR's score, 2nd / 3rd candidates count half; a humming
-    (melody) guess weighs less and can never confirm a song by itself."""
+    (melody) guess weighs less; it confirms a song only when TWO different pieces name it."""
     cands = []
     for m in (md.get("music") or [])[:3]:
         if not m.get("title"):
@@ -704,16 +719,21 @@ def shazam_piece(path: str, stop=None):
 
 
 # --- voting
-_PSEUDO = 90        # piece ids from 90 up are not real audio pieces (own DB = 98, lyrics = 99)
+_PSEUDO = 90        # piece ids from 90 up are not real audio pieces (lyrics = 90..92, own DB = 98)
 
 
 def _rank(hits: list, solo: bool = False) -> list:
     """hits: [{"piece": int, "song": {...}}] -> clusters of the same song, best first.
     Votes of different engines add up; a repeated answer of one engine adds half of ITS OWN weight.
-    A song is 'solid' when two different engines name it, or two different REAL pieces name it with a real
-    (non-humming) match; with solo=True (a clip with only one piece) one very sure first answer is enough.
-    Lyrics count as an engine only when another engine named the song with weight >= 0.8; a melody (humming)
-    guess alone is never solid."""
+    A song is 'solid' when
+      - two different engines name it, or
+      - two different REAL pieces name it with a real (non-humming) match, or
+      - two different REAL pieces were recognised by ACR's melody (humming) match, or
+      - two different pieces' LYRICS lead to it (the singer's words found it twice), or
+      - with solo=True (a clip with only one piece) one very sure first answer, or
+      - the own DB matched it with a high score.
+    Lyrics count as an engine only when another engine named the song with weight >= 0.8; lyrics from ONE
+    piece alone, or one melody guess alone, never confirm."""
     clusters = []
     for h in hits:
         for c in clusters:
@@ -736,10 +756,14 @@ def _rank(hits: list, solo: bool = False) -> list:
         other_best = max((max(v) for e, v in per.items() if e != "lyrics"), default=0.0)
         voting = engs - {"lyrics"} if ("lyrics" in engs and other_best < 0.8) else engs
         real_pieces = {h["piece"] for h in first + also if h["piece"] < _PSEUDO}
+        hum_pieces = {h["piece"] for h in hs
+                      if h["song"].get("hum") and h["song"]["rank"] == 0 and h["piece"] < _PSEUDO}
+        lyr_pieces = {h["piece"] for h in hs if h["song"].get("engine") == "lyrics"}
         sure_solo = SOLO_ACCEPT and solo and any(h["song"]["w"] >= SOLO_W and h["piece"] < _PSEUDO for h in first)
         c["engines"] = engs
         sure_local = any(h["song"].get("strong") for h in hs)       # own DB matched with a high score
-        c["solid"] = len(voting) >= 2 or len(real_pieces) >= 2 or sure_solo or sure_local
+        c["solid"] = (len(voting) >= 2 or len(real_pieces) >= 2 or sure_solo or sure_local
+                      or len(hum_pieces) >= 2 or len(lyr_pieces) >= 2)
         c["n_pieces"] = len(real_pieces)
         c["score"] = score * mult
         c["bad"] = mult < 1
@@ -965,25 +989,43 @@ def transcribe(path: str, cancel=None) -> str:
         _WHISPER_LOCK.release()
 
 
-def _lyrics_identify(paths: list, cancel=None):
-    texts, empty = [], 0
-    for p in paths[:3]:
+def _lyrics_identify(paths: list, cancel=None, emit=None):
+    """Each of up to 3 pieces is transcribed and searched ON ITS OWN; emit(index, song) is called for every piece
+    that leads to a song, so two different pieces pointing to the same song confirm it (see _rank). If no single
+    piece had enough words, the words of all pieces together are tried once."""
+    texts, empty, found = [], 0, 0
+    for idx, p in enumerate(paths[:3]):
         if cancel is not None and cancel.is_set():
-            return None
+            return
         t = transcribe(p, cancel)
-        if t:
-            texts.append(t)
-        else:
+        if not t:
             empty += 1
             if empty >= 2 and not texts:
-                return None
-    if not texts:
-        return None
-    words = re.findall(r"\w+", " ".join(texts).lower())
-    if len(words) < 6:
-        return None
-    best = max(texts, key=len)
-    return _words_fn(re.findall(r"\w+", best.lower()) or words)
+                return
+            continue
+        texts.append(t)
+        words = re.findall(r"\w+", t.lower())
+        if len(words) < 5:
+            continue
+        try:
+            res = _words_fn(words)
+        except Exception as e:
+            log.warning("lyrics search failed: %s", e)
+            res = None
+        if res and res.get("title"):
+            found += 1
+            if emit:
+                emit(idx, res)
+    if not found and texts:
+        words = re.findall(r"\w+", " ".join(texts).lower())
+        if len(words) >= 6:
+            try:
+                res = _words_fn(words)
+            except Exception as e:
+                log.warning("lyrics search failed: %s", e)
+                res = None
+            if res and res.get("title") and emit:
+                emit(0, res)
 
 
 # --- the engines round
@@ -1033,7 +1075,8 @@ def _ask_engines_core(paths, rejected, cancel, engines, full, extra, meta):
                stage 1, more raw pieces are NOT sent to ACR (they would only burn quota).
       stage 3  the last pieces
     `extra` is a live list of votes from elsewhere (the weak answer of the own DB). `cancel` stops everything.
-    STRICT=1 (default): at the end the best answer must be 'solid' (confirmed), otherwise "not found"."""
+    STRICT=1 (default): at the end the best answer must be 'solid' (confirmed), otherwise "not found"
+    (or a flagged guess when GUESS=1)."""
     deadline = time.time() + TOTAL_TIMEOUT
     hits, lyr_hits = [], []
     st = {e: {"answered": 0, "failed": 0} for e in ("acr", "shazam", "local")}
@@ -1054,6 +1097,10 @@ def _ask_engines_core(paths, rejected, cancel, engines, full, extra, meta):
     def answered() -> int:
         return st["acr"]["answered"] + st["shazam"]["answered"]
 
+    def shazam_dead() -> bool:
+        """Shazam failed again and again inside THIS request and never answered: stop waiting for it."""
+        return st["shazam"]["failed"] >= SHAZAM_DROP_AFTER and st["shazam"]["answered"] == 0
+
     def run_wave(batch) -> bool:
         """batch: [(path, piece_id, engines)] -> True = confirmed."""
         stop = threading.Event()
@@ -1063,7 +1110,7 @@ def _ask_engines_core(paths, rejected, cancel, engines, full, extra, meta):
                 budget["acr"] -= 1
                 box = {"t": None, "sub": time.time()}
                 futs[_ACR_EXEC.submit(_timed, box, identify_piece, p, stop)] = (gid, "acr", box)
-            if "shazam" in engs and "shazam" in engines and not shazam_paused():
+            if "shazam" in engs and "shazam" in engines and not shazam_paused() and not shazam_dead():
                 box = {"t": None, "sub": time.time()}
                 futs[_SH_EXEC.submit(_timed, box, shazam_piece, p, stop)] = (gid, "shazam", box)
             if "local" in engs and _local_fn:
@@ -1100,6 +1147,11 @@ def _ask_engines_core(paths, rejected, cancel, engines, full, extra, meta):
                     hits.extend({"piece": gid, "song": s} for s in res if not is_rejected(s, rejected))
                 if _confident(ranked_now()):
                     confirmed = True
+                elif shazam_dead():                          # do not make the user wait for a dead Shazam
+                    for f in list(pending):
+                        if futs[f][1] == "shazam":
+                            pending.discard(f)
+                            f.cancel()
         finally:
             stop.set()                       # queued work is dropped, running requests send nothing more
             for f in pending:
@@ -1112,13 +1164,16 @@ def _ask_engines_core(paths, rejected, cancel, engines, full, extra, meta):
         return [(p, i, engs) for i, p in enumerate(paths) if lo <= i < hi]
 
     def start_lyrics():
+        def emit(idx, res):
+            if is_rejected(res, rejected):
+                return
+            lyr_hits.append({"piece": 90 + min(idx, 2), "song": {
+                "title": res["title"], "artist": res.get("artist") or "", "link": res.get("link"),
+                "yt": None, "dur": None, "w": 0.7, "rank": 0, "engine": "lyrics"}})
+
         def job():
             try:
-                res = _lyrics_identify(paths, ly["cancel"])
-                if res and res.get("title") and not is_rejected(res, rejected):
-                    lyr_hits.append({"piece": 99, "song": {
-                        "title": res["title"], "artist": res.get("artist") or "", "link": res.get("link"),
-                        "yt": None, "dur": None, "w": 0.7, "rank": 0, "engine": "lyrics"}})
+                _lyrics_identify(paths, ly["cancel"], emit)
             except Exception as e:
                 log.warning("lyrics stage failed: %s", e)
             finally:
@@ -1149,7 +1204,8 @@ def _ask_engines_core(paths, rejected, cancel, engines, full, extra, meta):
             if full and var["thread"] is not None and (answered() > 0 or _local_fn):
                 var["done"].wait(timeout=4)
                 for name, gid, out in var["files"]:
-                    engs = (("acr",) if name in VAR_ACR else ()) + (("shazam",) if name in VAR_SHAZAM else ()) \
+                    engs = (("acr",) if name in VAR_ACR else ()) + \
+                           (("shazam",) if name in VAR_SHAZAM and not shazam_dead() else ()) \
                         + (("local",) if name in VAR_LOCAL and _local_fn else ())
                     if engs:
                         batch.append((out, gid, engs))
@@ -1183,15 +1239,23 @@ def _ask_engines_core(paths, rejected, cancel, engines, full, extra, meta):
             return None
         log.info("recognize: %s", [(c["song"].get("title"), c["song"].get("artist"), round(c["score"], 2),
                                    c["solid"], sorted(e for e in c["engines"] if e)) for c in ranked[:3]])
+        guess = False
         if STRICT and not ranked[0]["solid"]:
-            log.info("recognize: best answer is not confirmed, STRICT is on -> not found")
-            _count("unconfirmed")
-            return None
+            if GUESS and not ranked[0]["bad"] and ranked[0]["score"] >= GUESS_MIN:
+                guess = True
+                log.info("recognize: not confirmed, GUESS is on -> returning a flagged guess")
+                _count("guess")
+            else:
+                log.info("recognize: best answer is not confirmed, STRICT is on -> not found")
+                _count("unconfirmed")
+                return None
         _count("found")
         drop = ("rank", "w", "hum", "score", "strong")
         top = {k: v for k, v in ranked[0]["song"].items() if k not in drop}
         top["engine"] = "+".join(sorted(e for e in ranked[0]["engines"] if e)) or top.get("engine")
         top["n_pieces"] = ranked[0]["n_pieces"]          # how many different pieces named it (bot.py: learn if >= 2)
+        if guess:
+            top["guess"] = True
         own = [h["piece"] for h in (ranked[0]["first"] or ranked[0]["hits"]) if h["piece"] < len(paths)]
         top["piece_path"] = paths[min(own) if own else 0]
         top["alts"] = [{k: v for k, v in c["song"].items() if k not in drop} for c in ranked[1:4]]
@@ -1239,7 +1303,7 @@ def _engines_entry(paths, rejected, cancel, user_id, extra, pre_ordered):
     meta = {}
     res = _ask_engines(ordered, rejected, cancel, full=True, extra=extra, meta=meta)
     if key:
-        if res and "local" not in (res.get("engine") or ""):
+        if res and "local" not in (res.get("engine") or "") and not res.get("guess"):
             _cache_put(key, res)
         elif res is None and meta.get("clean") and not extra and not (cancel is not None and cancel.is_set()):
             _cache_put(key, None)
@@ -1321,7 +1385,7 @@ def accounts_status() -> list:
 
 
 def stats() -> dict:
-    """Counters since start (found / not_found / unconfirmed / cache_hit / acr_calls / acr_quota ...)."""
+    """Counters since start (found / not_found / unconfirmed / guess / cache_hit / acr_calls / acr_quota ...)."""
     with _CACHE_LOCK:
         size = len(_CACHE)
     return {"counters": dict(_STAT), "cache_size": size, "shazam": shazam_status(), "acr": accounts_status()}
@@ -1347,9 +1411,9 @@ def _selftest():
     assert _confident(_rank([{"piece": 0, "song": S("A Long Song", "X", "acr", 0.99)}], solo=True))
     two = one + [{"piece": 0, "song": S("A Long Song", "X", "shazam", 0.99)}]
     assert _confident(_rank(two))                                       # two engines agree
-    lyr = [{"piece": 0, "song": S("A Long Song", "X", "acr", 0.6)}, {"piece": 99, "song": S("A Long Song", "X", "lyrics", 0.7)}]
+    lyr = [{"piece": 0, "song": S("A Long Song", "X", "acr", 0.6)}, {"piece": 90, "song": S("A Long Song", "X", "lyrics", 0.7)}]
     assert not _confident(_rank(lyr))                                   # lyrics + a weak hit never confirm
-    lyr2 = [{"piece": 0, "song": S("A Long Song", "X", "acr", 0.9)}, {"piece": 99, "song": S("A Long Song", "X", "lyrics", 0.7)}]
+    lyr2 = [{"piece": 0, "song": S("A Long Song", "X", "acr", 0.9)}, {"piece": 90, "song": S("A Long Song", "X", "lyrics", 0.7)}]
     assert _confident(_rank(lyr2))
     rival = two + [{"piece": 1, "song": S("Other Thing", "Y", "acr", 0.9)}, {"piece": 2, "song": S("Other Thing", "Y", "acr", 0.9)}]
     assert not _confident(_rank(rival))                                 # a confirmed rival blocks
@@ -1362,6 +1426,21 @@ def _selftest():
     weak_db = [{"piece": 0, "song": S("A Long Song", "X", "local", 0.7, strong=False)}]
     assert not _confident(_rank(weak_db))
     assert _confident(_rank(weak_db + [{"piece": 1, "song": S("A Long Song", "X", "acr", 0.9)}]))
+    # NEW: humming / melody
+    hum1 = [{"piece": 0, "song": S("Hummed Tune", "Z", "acr", 0.7, hum=True)}]
+    assert not _confident(_rank(hum1))                                  # one melody guess alone: never
+    hum2 = hum1 + [{"piece": 1, "song": S("Hummed Tune", "Z", "acr", 0.7, hum=True)}]
+    assert _confident(_rank(hum2))                                      # two different pieces: confirmed
+    hum_same = hum1 + [{"piece": 0, "song": S("Hummed Tune", "Z", "acr", 0.7, hum=True)}]
+    assert not _confident(_rank(hum_same))                              # the SAME piece twice (variants): no
+    # NEW: lyrics from two different pieces
+    ly1 = [{"piece": 90, "song": S("Words Song", "W", "lyrics", 0.7)}]
+    assert not _confident(_rank(ly1))                                   # one piece of lyrics: never
+    ly2 = ly1 + [{"piece": 91, "song": S("Words Song", "W", "lyrics", 0.7)}]
+    assert _confident(_rank(ly2))                                       # two pieces lead to the same song
+    # a rival that is not confirmed does not block a confirmed hum answer unless it is nearly as strong
+    mixed = hum2 + [{"piece": 2, "song": S("Totally Else", "Q", "acr", 0.5, hum=True, **{})}]
+    assert _confident(_rank(mixed))
     print("selftest ok")
 
 
