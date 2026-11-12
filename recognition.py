@@ -3,39 +3,44 @@ recognition.py - music recognition core (the ONLY file that knows how a song is 
 
   1) own fingerprint DB  (free, fast, knows remixes / special versions)
   2) ACRCloud + Shazam   every piece goes to BOTH engines at the same time, the votes are combined
-       - ACR accounts are tried in PRIORITY order, an exhausted account is paused and the next one is used
-       - Shazam has a circuit breaker: after a few failures in a row it is skipped for a while, so a slow or
-         blocked Shazam never holds the answer back
-  3) nothing confirmed -> lyrics (what the singer says) as one more vote, then the loudest pieces again, cleaned
-     (noise filter) and tempo-shifted (sped-up / slowed remixes) into the SAME votes; near-silent pieces are
-     never sent; the same audio is answered from a cache
-  4) an answer is accepted only when it is CONFIRMED:
-       two engines agree, or two different pieces of the audio agree (never one answer of one engine)
+       - ACR accounts are tried in PRIORITY order; an exhausted account is paused (backoff) and the next one is
+         used at once. A paused account comes back through ONE probe request only, and pauses survive a restart.
+       - Shazam has a half-open circuit breaker (one probe after a pause), several event loops, no client race
+  3) nothing confirmed -> lyrics (one more vote), then the best piece again, cleaned (noise filter) and
+     tempo-shifted (sped-up / slowed remixes) into the SAME votes; near-silent pieces are never sent;
+     the same audio is answered from a cache (negative answers are cached for a short time too)
+  4) an answer is accepted only when it is CONFIRMED: two engines agree, or two different pieces agree
+     (a single-piece clip is accepted when one engine is very sure; lyrics alone never confirm anything)
 
-  The own DB runs at the same time as the engines (LOCAL_FIRST=0, default). If the DB knows the song, its answer
-  is returned at once and the engines are cancelled. LOCAL_FIRST=1 -> wait for the DB first (saves quota).
+  The own DB runs at the same time as the engines (LOCAL_FIRST=0, default). A strong DB answer is returned at
+  once and the engines are cancelled. A weak DB answer (one piece, low score) becomes one more VOTE for the engines.
+  LOCAL_FIRST=1 -> wait for the DB first (saves quota).
 
-bot.py only uses this small interface:
+bot.py uses this interface (all unchanged; new things are optional keyword arguments):
 
-    init(load_accounts, local_fn, words_fn)  once at start. load_accounts() -> [{"id","host","key","secret"}]
-                                       local_fn(path) -> {"title","artist"[,"link","yt"]} or None
-    ask_local(paths, rejected)         own DB only (free)             -> song dict or None
-    ask_acr(paths, rejected)           ACRCloud only (costs quota)    -> song dict or None, raises NoAccounts
-    ask_engines(paths, rejected)       ACR + Shazam + second chance   -> song dict or None, raises NoAccounts
-    ask_shazam(paths, rejected)        Shazam only                    -> song dict or None
-    ask_engines(paths, rejected)       ACRCloud + Shazam voting       -> song dict or None, raises NoAccounts
-    recognize(paths, rejected)         DB + ACRCloud + Shazam together
-    accounts_status()                  ACR accounts for the admin panel
-    shazam_status()                    {"paused_for": seconds, "fails": n}
-    NoAccounts                         raised when no engine could answer
-    title_key, artist_set, same_song, is_variant, fold, first_artist     small text helpers
+    init(load_accounts, local_fn, words_fn)   once at start. load_accounts() -> [{"id","host","key","secret"}]
+                                        local_fn(path) -> {"title","artist"[,"link","yt","score"]} or None
+                                        (give "score" if the DB has one: strong scores are answered at once)
+    ask_local(paths, rejected)          own DB only (free)             -> song dict or None
+    ask_acr(paths, rejected)            ACRCloud only (costs quota)    -> song dict or None, raises NoAccounts
+    ask_shazam(paths, rejected)         Shazam only                    -> song dict or None
+    ask_engines(paths, rejected, cancel=None, user_id=None)  ACR + Shazam voting -> song dict or None, raises NoAccounts
+    recognize(paths, rejected, user_id=None)                 DB + ACRCloud + Shazam together
+    accounts_status() / shazam_status() / stats()
+    NoAccounts                          no engine could answer (accounts paused / unreachable, Shazam down, busy)
+    RateLimited                         ONLY raised when user_id is passed and USER_LIMIT is exceeded (.retry_after)
+    title_key, artist_set, same_song, is_variant, fold, first_artist, reject_key, is_rejected   text helpers
 
-A song dict: {"title","artist","link","yt","dur","engine","alts"}; "rejected" = set of title_key()s.
+A song dict: {"title","artist","link","yt","dur","engine","alts","piece_path"}.
+"rejected" = set of title_key()s (or reject_key()s = "titlekey::artistkey", stricter: only that artist's song).
+Self test (offline):  python recognition.py --selftest
 """
 import asyncio
 import base64
 import hashlib
 import hmac
+import itertools
+import json
 import logging
 import os
 import re
@@ -45,55 +50,111 @@ import tempfile
 import threading
 import time
 import unicodedata
-from collections import OrderedDict
+from collections import Counter, OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 import requests
 
 log = logging.getLogger("recognition")
 
-# --- config
-MAX_PIECES = int(os.environ.get("MAX_SAMPLES", "10"))
-WAVES = (3, 3, 4)                                             # pieces sent per wave
-ACR_TIMEOUT = int(os.environ.get("ACR_TIMEOUT") or os.environ.get("ENGINE_TIMEOUT") or 15)        # one request
-WAVE_TIMEOUT = int(os.environ.get("WAVE_TIMEOUT", "12"))      # one wave
-ACR_THREADS = int(os.environ.get("ACR_THREADS") or os.environ.get("ENGINE_THREADS") or 16)
-LOCAL_TIMEOUT = int(os.environ.get("LOCAL_TIMEOUT", "8"))
-LOCAL_MIN_AGREE = int(os.environ.get("LOCAL_MIN_AGREE", "2"))  # own DB: pieces that must agree
-LYRICS_ENGINE = os.environ.get("LYRICS_ENGINE", "1") == "1"    # last resort: what the singer says (needs faster-whisper)
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")
-WHISPER_WAIT = int(os.environ.get("WHISPER_WAIT", "25"))
-HUM_MIN_SCORE = int(os.environ.get("HUM_MIN_SCORE", "30"))      # ACR humming guesses below this are ignored
-STRICT = os.environ.get("STRICT", "1") == "1"                  # unconfirmed answer -> None
-LOCAL_FIRST = os.environ.get("LOCAL_FIRST", "0") == "1"
 
-SHAZAM_TIMEOUT = int(os.environ.get("SHAZAM_TIMEOUT", "10"))   # one Shazam request
-SHAZAM_MAX_FAILS = int(os.environ.get("SHAZAM_MAX_FAILS", "3"))
-SHAZAM_PAUSE = int(os.environ.get("SHAZAM_PAUSE", "300"))
-SHAZAM_THREADS = int(os.environ.get("SHAZAM_THREADS", "3"))    # parallel Shazam requests
+# --- config (a bad value in .env never crashes the import: it is logged and the default is used)
+def _env(cast, default, *names):
+    for n in names:
+        v = os.environ.get(n)
+        if v is not None and v.strip() != "":
+            try:
+                return cast(v.strip())
+            except (TypeError, ValueError):
+                log.warning("bad value for %s=%r -> using %r", n, v, default)
+    return default
 
-# which engines vote (ENGINES from .env may also contain names this file does not know, e.g. audd -> ignored)
-_ENG = tuple(e.strip() for e in os.environ.get("ENGINES", "acr,shazam").split(",")
-             if e.strip() in ("acr", "shazam")) or ("acr", "shazam")
-ENGINES = _ENG
 
-SECOND_CHANCE = os.environ.get("SECOND_CHANCE", "1") == "1"   # nothing confirmed -> retry with filtered audio
-SILENT_DB = float(os.environ.get("SILENT_DB", "-48"))          # pieces quieter than this are not sent
-CACHE_TTL = int(os.environ.get("RECOG_CACHE_TTL", str(3 * 86400)))
-CACHE_MAX = int(os.environ.get("RECOG_CACHE_MAX", "2000"))
+def _flag(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    return default if v is None else v.strip().lower() in ("1", "true", "yes", "on")
+
+
+MAX_PIECES = _env(int, 10, "MAX_SAMPLES")
+WAVES = (3, 3, 4)                                               # pieces sent per wave
+ACR_TIMEOUT = _env(int, 10, "ACR_TIMEOUT", "ENGINE_TIMEOUT")    # one request
+WAVE_TIMEOUT = _env(int, 12, "WAVE_TIMEOUT")                    # one piece, counted from when it STARTS
+QUEUE_TIMEOUT = _env(int, 30, "QUEUE_TIMEOUT")                  # a piece that never got a free thread
+ACR_THREADS = _env(int, 32, "ACR_THREADS", "ENGINE_THREADS")
+ACR_BUDGET = _env(int, 12, "ACR_BUDGET")                        # max ACR pieces (= quota) per request
+LOCAL_TIMEOUT = _env(int, 8, "LOCAL_TIMEOUT")
+LOCAL_MIN_AGREE = _env(int, 2, "LOCAL_MIN_AGREE")               # own DB: pieces that must agree
+LOCAL_SOLO_SCORE = _env(float, 40.0, "LOCAL_SOLO_SCORE")        # own DB: one piece is enough above this score
+LOCAL_WEAK_W = _env(float, 0.7, "LOCAL_WEAK_W")                 # vote weight of a weak DB answer
+LYRICS_ENGINE = _flag("LYRICS_ENGINE", True)                    # needs faster-whisper
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")        # "small" is much better for singing / Persian
+WHISPER_LANG = os.environ.get("WHISPER_LANG", "").strip() or None   # e.g. fa / en; empty = auto detect
+WHISPER_WAIT = _env(int, 25, "WHISPER_WAIT")
+WHISPER_THREADS = _env(int, 4, "WHISPER_THREADS")
+HUM_MIN_SCORE = _env(int, 30, "HUM_MIN_SCORE")                  # ACR humming guesses below this are ignored
+STRICT = _flag("STRICT", True)                                  # unconfirmed answer -> None
+SOLO_ACCEPT = _flag("SOLO_ACCEPT", True)                        # 1-piece clip: one very sure engine is enough
+SOLO_W = _env(float, 0.95, "SOLO_W")
+LOCAL_FIRST = _flag("LOCAL_FIRST", False)
+
+SHAZAM_TIMEOUT = _env(int, 10, "SHAZAM_TIMEOUT")
+SHAZAM_MAX_FAILS = _env(int, 3, "SHAZAM_MAX_FAILS")
+SHAZAM_PAUSE = _env(int, 300, "SHAZAM_PAUSE")
+SHAZAM_THREADS = max(_env(int, 3, "SHAZAM_THREADS"), 1)         # parallel Shazam requests (one event loop each)
+
+
+def _parse_engines(s) -> tuple:
+    e = tuple(x.strip() for x in (s or "").split(",") if x.strip() in ("acr", "shazam"))
+    return e or ("acr", "shazam")        # names this file does not know (e.g. audd) are ignored
+
+
+ENGINES = _parse_engines(os.environ.get("ENGINES", "acr,shazam"))
+
+SECOND_CHANCE = _flag("SECOND_CHANCE", True)                    # nothing confirmed -> retry with filtered audio
+SECOND_PIECES = _env(int, 1, "SECOND_CHANCE_PIECES")            # how many pieces get filtered variants
+SILENT_DB = _env(float, -48.0, "SILENT_DB")                     # pieces quieter than this are not sent
+CACHE_TTL = _env(int, 3 * 86400, "RECOG_CACHE_TTL")
+NEG_TTL = _env(int, 600, "RECOG_NEG_TTL")                       # "not found" is remembered this long
+CACHE_MAX = _env(int, 2000, "RECOG_CACHE_MAX")
 FFMPEG = shutil.which("ffmpeg")
 
-QUOTA_CODES = {3003}                 # limit exceeded
+MAX_ROUNDS = _env(int, 12, "MAX_ROUNDS")                        # engine rounds at the same time
+ROUND_WAIT = _env(int, 30, "ROUND_WAIT")
+USER_LIMIT = _env(int, 6, "USER_LIMIT")                         # only when user_id is passed; 0 = off
+USER_WINDOW = _env(int, 60, "USER_WINDOW")
+
+QUOTA_CODES = {3003} | set(_env(lambda s: {int(x) for x in s.split(",") if x.strip()}, set(), "ACR_QUOTA_CODES"))
 AUTH_CODES = {3001, 3014}            # bad key / signature
 NO_MATCH_CODES = {1001, 2004}        # "nothing found": a real answer, other accounts would say the same
-QUOTA_RETRY = int(os.environ.get("ACR_QUOTA_RETRY", "600"))    # probe an exhausted account again after 10 min
+QUOTA_RETRY = _env(int, 600, "ACR_QUOTA_RETRY")                 # first probe of an exhausted account (10 min)
+QUOTA_MAX = _env(int, 1800, "ACR_QUOTA_MAX")                    # the pause doubles up to this
+RESET_HOUR = _env(float, None, "ACR_RESET_UTC_HOUR")            # optional: daily quota reset hour (UTC)
+BALANCE = _flag("ACR_BALANCE", False)                           # rotate accounts instead of strict priority
+STATE_FILE = os.environ.get("ACR_STATE_FILE",
+                            os.path.join(os.path.dirname(os.path.abspath(__file__)), ".acr_state.json"))
 AUTH_PAUSE = 6 * 3600
-ERROR_PAUSE = 60                     # after 3 network errors in a row
+ERROR_PAUSE = 60                     # after 3 network errors in a row (1 when the account is being probed)
 ERROR_LIMIT = 3
+RATE_PAUSE = 20                      # HTTP 429 / 503
+PROBE_WAIT = 6                       # seconds a request waits for the single probe of a paused account
+
+_STAT = Counter()
+
+
+def _count(name: str, n: int = 1):
+    _STAT[name] += n
 
 
 class NoAccounts(Exception):
-    """No engine could answer (ACR accounts all paused / unreachable and Shazam failed)."""
+    """No engine could answer (ACR accounts all paused / unreachable and Shazam failed, or the server is busy)."""
+
+
+class RateLimited(Exception):
+    """Only raised when the caller passes user_id and the user is over USER_LIMIT per USER_WINDOW."""
+
+    def __init__(self, retry_after: int = 0):
+        super().__init__(f"rate limited, retry in {retry_after}s")
+        self.retry_after = retry_after
 
 
 # --- song matching
@@ -107,22 +168,41 @@ def _fold(s: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
 
 
-def title_key(title: str) -> str:
-    t = re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", title or "")
-    t = re.split(r"\s+[-–—]\s+", t)[0]
-    return re.sub(r"[\W_]+", "", _fold(t))
-
-
-def artist_set(artist: str) -> set:
-    return {k for k in (re.sub(r"[\W_]+", "", _fold(p)) for p in _SPLIT.split(artist or "")) if k}
+def _key(s: str) -> str:
+    return re.sub(r"[\W_]+", "", _fold(s))
 
 
 fold = _fold
 
+# names that contain a separator and must never be split ("AC/DC", "Florence and the Machine"...)
+_NOSPLIT = {"acdc", "florenceandthemachine", "earthwindandfire", "earthwindfire", "simonandgarfunkel",
+            "hallandoates", "mumfordandsons", "kooldanthegang", "tinaturnerandike"}
+_NOSPLIT |= {_key(x) for x in os.environ.get("NOSPLIT_ARTISTS", "").split(",") if x.strip()}
+
+
+def title_key(title: str) -> str:
+    t = title or ""
+    stripped = re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", t)
+    stripped = re.split(r"\s+[-–—]\s+", stripped)[0]
+    return _key(stripped) or _key(t)          # a title that is ONLY "(Intro)" keeps its words
+
+
+def artist_set(artist: str) -> set:
+    """Keys of every artist in the string PLUS the key of the whole string, so a name containing 'and' / '/'
+    still matches itself and its parts match a feat. credit."""
+    out = {k for k in (_key(p) for p in _SPLIT.split(artist or "")) if k}
+    full = _key(artist)
+    if full:
+        out.add(full)
+    return out
+
 
 def first_artist(artist: str) -> str:
-    parts = [p.strip() for p in _SPLIT.split(artist or "") if p and p.strip()]
-    return parts[0] if parts else (artist or "").strip()
+    a = (artist or "").strip()
+    if _key(a) in _NOSPLIT:
+        return a
+    parts = [p.strip() for p in _SPLIT.split(a) if p and p.strip()]
+    return parts[0] if parts else a
 
 
 def is_variant(song: dict) -> bool:
@@ -135,19 +215,32 @@ def same_song(a: dict, b: dict) -> bool:
         return False
     if ta != tb:
         short, long_ = sorted((ta, tb), key=len)
-        if not (len(short) >= 6 and long_.startswith(short)):
+        if not (len(short) >= 8 and long_.startswith(short) and len(long_) - len(short) <= len(short)):
             return False
     sa, sb = artist_set(a.get("artist")), artist_set(b.get("artist"))
-    if not sa or not sb or sa & sb:
+    if not sa or not sb:                         # an artist is missing: only a long, identical title is trusted
+        return ta == tb and len(ta) >= 7
+    if sa & sb:
         return True
-    return any(x in y or y in x for x in sa for y in sb if len(x) >= 4 and len(y) >= 4)
+    return any(x in y or y in x for x in sa for y in sb if len(x) >= 5 and len(y) >= 5)
+
+
+def reject_key(song: dict) -> str:
+    """Strict 'wrong song' key: this title by this artist (other artists' songs of the same name stay allowed)."""
+    return f"{title_key(song.get('title'))}::{_key(first_artist(song.get('artist')))}"
+
+
+def is_rejected(song: dict, rejected) -> bool:
+    if not rejected:
+        return False
+    return title_key(song.get("title")) in rejected or reject_key(song) in rejected
 
 
 # --- own DB
 _local_fn = None
-_LOCAL_POOL = ThreadPoolExecutor(max_workers=int(os.environ.get("LOCAL_THREADS", "4")),
-                                 thread_name_prefix="local")
-_MAIN_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="recog")   # runs DB and engines side by side
+_LOCAL_POOL = ThreadPoolExecutor(max_workers=_env(int, 6, "LOCAL_THREADS"), thread_name_prefix="local")
+_AUDIO_POOL = ThreadPoolExecutor(max_workers=_env(int, 6, "AUDIO_THREADS"), thread_name_prefix="audio")  # ffmpeg
+_MAIN_POOL = ThreadPoolExecutor(max_workers=_env(int, 32, "MAIN_THREADS"), thread_name_prefix="recog")
 
 
 def _local_one(path: str):
@@ -157,38 +250,103 @@ def _local_one(path: str):
         log.warning("local DB failed: %s", e)
         return None
     if r and r.get("title"):
+        try:
+            score = float(r["score"]) if r.get("score") is not None else None
+        except (TypeError, ValueError):
+            score = None
         return {"title": r["title"], "artist": r.get("artist") or "", "link": r.get("link"),
                 "yt": r.get("yt"), "dur": r.get("dur") or r.get("duration"), "engine": "local",
-                "track_id": r.get("track_id")}
+                "track_id": r.get("track_id"), "score": score, "piece_path": path}
     return None
 
 
-def _ask_local(paths: list, rejected: set):
-    """Own DB on up to 3 pieces in parallel. Accepted when LOCAL_MIN_AGREE pieces name the same song."""
-    if not _local_fn:
-        return None
+def _local_scan(paths: list, rejected: set):
+    """Own DB on up to 3 pieces in parallel -> (strong, weak).
+    strong: LOCAL_MIN_AGREE pieces name the same song, or the DB score is high (>= LOCAL_SOLO_SCORE), or the DB
+            gives no score at all and only one piece exists -> answered at once.
+    weak:   anything else the DB found -> goes into the engine vote as one more (lower weight) voter."""
+    if not _local_fn or not paths:
+        return None, None
     use = paths[:3]
     done, _ = wait([_LOCAL_POOL.submit(_local_one, p) for p in use], timeout=LOCAL_TIMEOUT)
-    found = [s for s in (f.result() for f in done) if s and title_key(s["title"]) not in rejected]
+    found = [s for s in (f.result() for f in done) if s and not is_rejected(s, rejected)]
+    if not found:
+        return None, None
     need = min(LOCAL_MIN_AGREE, len(use))
+    best, best_key = None, None
     for s in found:
-        if sum(same_song(s, g) for g in found) >= need:
-            s["alts"] = []
-            return s
-    return None
+        group = [g for g in found if same_song(s, g)]
+        scores = [g["score"] for g in group if g["score"] is not None]
+        top_score = max(scores) if scores else None
+        strong = (len(group) >= max(need, 2) if len(use) > 1 else False) \
+            or (top_score is not None and top_score >= LOCAL_SOLO_SCORE) \
+            or (top_score is None and len(group) >= need)
+        rank_key = (strong, len(group), top_score or 0)
+        if best_key is None or rank_key > best_key:
+            best, best_key = s, rank_key
+    if best_key[0]:
+        out = {k: v for k, v in best.items() if k != "score"}
+        out["alts"] = []
+        out["score"] = best.get("score")
+        _count("local_strong")
+        return out, None
+    weak = dict(best)
+    weak.update({"w": LOCAL_WEAK_W, "rank": 0})
+    _count("local_weak")
+    return None, weak
 
 
 # --- ACRCloud accounts
 class AccountPool:
-    """Priority list. available() always returns the accounts in priority order, minus the paused ones, so an
-    account whose pause is over is automatically the first choice again."""
+    """Priority list. available() returns the accounts in priority order, minus the paused ones. An account whose
+    pause is over is "half open": ONE request probes it, everybody else keeps using the other accounts until the
+    probe says it works. Quota pauses double (backoff) up to QUOTA_MAX. Pauses are saved to STATE_FILE."""
 
     def __init__(self):
         self._loader = None
         self._cache = (0.0, [])
-        self._until = {}      # account id -> paused until
-        self._fails = {}      # account id -> network errors in a row
-        self._lock = threading.Lock()
+        self._until = {}        # account id -> paused until
+        self._fails = {}        # account id -> network errors in a row
+        self._quota_hits = {}   # account id -> quota pauses in a row
+        self._quota_paused = set()
+        self._half = set()      # pause expired, waiting for a successful probe
+        self._probing = {}      # account id -> time the probe started
+        self._rr = 0
+        self._reset_day = None
+        self._lock = threading.RLock()
+        self._load_state()
+
+    # persistence
+    def _load_state(self):
+        if not STATE_FILE:
+            return
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            now = time.time()
+            for i, until in d.get("until", []):
+                if until > now:
+                    self._until[i] = until
+                self._half.add(i)
+            self._quota_paused = {i for i in d.get("quota", [])}
+            self._quota_hits = {int(k) if str(k).lstrip("-").isdigit() else k: v
+                                for k, v in (d.get("hits") or {}).items()}
+        except (OSError, ValueError, TypeError):
+            pass
+
+    def _save_state(self):
+        if not STATE_FILE:
+            return
+        try:
+            with self._lock:
+                d = {"until": [[i, u] for i, u in self._until.items()], "quota": list(self._quota_paused),
+                     "hits": dict(self._quota_hits)}
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(d, f)
+            os.replace(tmp, STATE_FILE)
+        except OSError as e:
+            log.debug("could not save ACR state: %s", e)
 
     def set_loader(self, loader):
         self._loader = loader
@@ -196,45 +354,107 @@ class AccountPool:
 
     def _accounts(self) -> list:
         ts, accs = self._cache
-        if time.time() - ts > 30:                      # accounts added in the DB are picked up within 30 s
-            accs = sorted(self._loader(), key=lambda a: a["id"])
+        if self._loader and time.time() - ts > 30:        # accounts added in the DB are picked up within 30 s
+            try:
+                accs = sorted(self._loader(), key=lambda a: a["id"])
+            except Exception as e:
+                log.warning("ACR account loader failed (keeping the old list): %s", e)
             self._cache = (time.time(), accs)
         return accs
+
+    def _maybe_daily_reset(self, now: float):
+        if RESET_HOUR is None:
+            return
+        day = int((now - RESET_HOUR * 3600) // 86400)
+        if self._reset_day is None:
+            self._reset_day = day
+        elif day != self._reset_day:
+            self._reset_day = day
+            for i in list(self._quota_paused):
+                self._until.pop(i, None)
+                self._quota_hits.pop(i, None)
+            self._quota_paused.clear()
+            log.info("ACR quota reset time passed: quota pauses cleared")
 
     def available(self) -> list:
         now = time.time()
         with self._lock:
-            return [a for a in self._accounts() if self._until.get(a["id"], 0) <= now]
+            self._maybe_daily_reset(now)
+            out = []
+            for a in self._accounts():
+                i = a["id"]
+                if self._until.get(i, 0) > now:
+                    continue
+                if i in self._half:
+                    t = self._probing.get(i)
+                    if t and now - t < ACR_TIMEOUT + 5:   # somebody is already probing it
+                        continue
+                    self._probing[i] = now                # this caller becomes the probe
+                out.append(a)
+            if BALANCE and len(out) > 1:
+                self._rr += 1
+                k = self._rr % len(out)
+                out = out[k:] + out[:k]
+            return out
 
-    def pause(self, acc: dict, seconds: int, why: str):
+    def any_probing(self) -> bool:
+        now = time.time()
         with self._lock:
-            self._until[acc["id"]] = time.time() + seconds
+            return any(now - t < ACR_TIMEOUT + 5 for t in self._probing.values())
+
+    def pause(self, acc: dict, seconds: int, why: str, quota: bool = False):
+        with self._lock:
+            i = acc["id"]
+            self._until[i] = time.time() + seconds
+            self._half.add(i)
+            self._probing.pop(i, None)
+            (self._quota_paused.add if quota else self._quota_paused.discard)(i)
         log.warning("ACR account #%s paused %d s: %s", acc["id"], seconds, why)
+        self._save_state()
+
+    def quota(self, acc: dict):
+        with self._lock:
+            n = self._quota_hits[acc["id"]] = self._quota_hits.get(acc["id"], 0) + 1
+        _count("acr_quota")
+        self.pause(acc, min(QUOTA_RETRY * 2 ** (n - 1), QUOTA_MAX), "quota exhausted", quota=True)
 
     def ok(self, acc: dict):
         with self._lock:
-            self._fails[acc["id"]] = 0
-            self._until.pop(acc["id"], None)
+            i = acc["id"]
+            changed = i in self._until or i in self._half or i in self._quota_hits
+            self._fails[i] = 0
+            self._until.pop(i, None)
+            self._half.discard(i)
+            self._probing.pop(i, None)
+            self._quota_hits.pop(i, None)
+            self._quota_paused.discard(i)
+        if changed:
+            self._save_state()
 
     def fail(self, acc: dict, why: str):
+        _count("acr_errors")
         with self._lock:
-            n = self._fails[acc["id"]] = self._fails.get(acc["id"], 0) + 1
-            if n >= ERROR_LIMIT:
-                self._fails[acc["id"]] = 0
-        if n >= ERROR_LIMIT:
+            i = acc["id"]
+            n = self._fails[i] = self._fails.get(i, 0) + 1
+            trip = n >= (1 if i in self._half else ERROR_LIMIT)      # a failed probe pauses at once
+            if trip:
+                self._fails[i] = 0
+        if trip:
             self.pause(acc, ERROR_PAUSE, why)
 
     def status(self) -> list:
         now = time.time()
         with self._lock:
             return [{"id": a["id"], "host": a["host"],
-                     "paused_for": max(0, int(self._until.get(a["id"], 0) - now))}
+                     "paused_for": max(0, int(self._until.get(a["id"], 0) - now)),
+                     "quota": a["id"] in self._quota_paused,
+                     "probing": a["id"] in self._probing and now - self._probing[a["id"]] < ACR_TIMEOUT + 5}
                     for a in self._accounts()]
 
 
 POOL = AccountPool()
 _ACR_EXEC = ThreadPoolExecutor(max_workers=ACR_THREADS, thread_name_prefix="acr")
-_SH_EXEC = ThreadPoolExecutor(max_workers=max(SHAZAM_THREADS, 1), thread_name_prefix="shazam")
+_SH_EXEC = ThreadPoolExecutor(max_workers=max(SHAZAM_THREADS * 2, 2), thread_name_prefix="shazam")
 _HTTP = requests.Session()
 _HTTP.mount("https://", requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=ACR_THREADS * 2))
 
@@ -245,10 +465,13 @@ def _acr_post(path: str, acc: dict):
     sig = base64.b64encode(hmac.new(acc["secret"].encode(), to_sign.encode(), hashlib.sha1).digest()).decode()
     with open(path, "rb") as f:
         data = f.read()
+    _count("acr_calls")
     r = _HTTP.post(f"https://{acc['host']}/v1/identify",
                    data={"access_key": acc["key"], "data_type": "audio", "signature_version": "1",
                          "signature": sig, "sample_bytes": len(data), "timestamp": ts},
                    files={"sample": data}, timeout=ACR_TIMEOUT)
+    if r.status_code in (429, 503):
+        return "RATE", {}
     j = r.json()
     return (j.get("status") or {}).get("code"), (j.get("metadata") or {})
 
@@ -262,8 +485,8 @@ def _hum_score(h: dict) -> float:
 
 
 def _parse(md: dict) -> list:
-    """ACR answer -> candidates. "w" = vote weight (as in the old bot): ACR's score, 2nd / 3rd candidates count
-    half; a humming (melody) guess weighs less and can never confirm a song by itself."""
+    """ACR answer -> candidates. "w" = vote weight: ACR's score, 2nd / 3rd candidates count half; a humming
+    (melody) guess weighs less and can never confirm a song by itself."""
     cands = []
     for m in (md.get("music") or [])[:3]:
         if not m.get("title"):
@@ -309,93 +532,129 @@ def _parse(md: dict) -> list:
     return good
 
 
-def identify_piece(path: str):
+def identify_piece(path: str, stop=None):
     """ONE piece against ACRCloud, walking through the accounts in priority order.
-    -> list of candidates ([] = ACR heard it but knows no song) or None (no account could answer)."""
-    for acc in POOL.available():
+    -> list of candidates ([] = ACR heard it but knows no song) or None (no account could answer).
+    `stop` (threading.Event): the round is over, do not spend quota any more."""
+    stopped = lambda: stop is not None and stop.is_set()
+    accs = POOL.available()
+    deadline = time.time() + PROBE_WAIT
+    while not accs and POOL.any_probing() and time.time() < deadline and not stopped():
+        time.sleep(0.2)                                  # a paused account is being probed: wait for the verdict
+        accs = POOL.available()
+    for acc in accs:
+        if stopped():
+            return None
         try:
             code, md = _acr_post(path, acc)
-        except (requests.RequestException, ValueError) as e:
-            POOL.fail(acc, f"{type(e).__name__}")
+        except (requests.RequestException, ValueError, OSError) as e:
+            POOL.fail(acc, type(e).__name__)
             continue
         if code in QUOTA_CODES:
-            POOL.pause(acc, QUOTA_RETRY, f"quota ({code})")
+            POOL.quota(acc)
             continue
         if code in AUTH_CODES:
             POOL.pause(acc, AUTH_PAUSE, f"key rejected ({code})")
             continue
-        POOL.ok(acc)
+        if code == "RATE":
+            POOL.pause(acc, RATE_PAUSE, "rate limited (HTTP 429/503)")
+            continue
         if code == 0:
+            POOL.ok(acc)
             return _parse(md)
-        if code not in NO_MATCH_CODES:
-            log.info("ACR #%s status %s", acc["id"], code)
-        return []
+        if code in NO_MATCH_CODES:
+            POOL.ok(acc)
+            return []
+        log.info("ACR #%s unknown status %s -> trying the next account", acc["id"], code)
+        POOL.fail(acc, f"status {code}")                  # server trouble: NOT "song not found"
     return None
 
 
-# --- Shazam (shazamio) with a circuit breaker
-_SH = {"client": None, "loop": None, "missing": False}
-_SH_STATE = {"fails": 0, "until": 0.0}
+# --- Shazam (shazamio): several event loops, a half-open circuit breaker
+_SH = {"loops": [], "clients": {}, "missing": False}
+_SH_STATE = {"fails": 0, "until": 0.0, "half": False, "probing": 0.0}
 _SH_LOCK = threading.Lock()
-_SH_SEM = threading.Semaphore(max(SHAZAM_THREADS, 1))
+_SH_SEM = threading.Semaphore(SHAZAM_THREADS)
+_SH_NEXT = itertools.count()
+_SH_BAD_PIECE = ("ffmpeg", "decode", "could not read", "no audio", "invalid data", "too short")
 
 
 def _sh_loop():
-    """One persistent background event loop for all Shazam requests."""
+    """SHAZAM_THREADS background event loops (the audio decoding of one request does not block the others)."""
     with _SH_LOCK:
-        if _SH["loop"] is None:
-            loop = asyncio.new_event_loop()
-            threading.Thread(target=loop.run_forever, name="shazam-loop", daemon=True).start()
-            _SH["loop"] = loop
-        return _SH["loop"]
+        if not _SH["loops"]:
+            for i in range(SHAZAM_THREADS):
+                loop = asyncio.new_event_loop()
+                threading.Thread(target=loop.run_forever, name=f"shazam-loop-{i}", daemon=True).start()
+                _SH["loops"].append(loop)
+        return _SH["loops"][next(_SH_NEXT) % len(_SH["loops"])]
 
 
 def shazam_paused() -> bool:
-    return _SH["missing"] or time.time() < _SH_STATE["until"]
+    if _SH["missing"]:
+        return True
+    now = time.time()
+    if now < _SH_STATE["until"]:
+        return True
+    return _SH_STATE["half"] and now - _SH_STATE["probing"] < SHAZAM_TIMEOUT + 5    # the probe is in flight
 
 
 def shazam_status() -> dict:
     return {"paused_for": max(0, int(_SH_STATE["until"] - time.time())), "fails": _SH_STATE["fails"],
-            "installed": not _SH["missing"]}
+            "installed": not _SH["missing"], "half_open": _SH_STATE["half"]}
 
 
 def _sh_ok():
     with _SH_LOCK:
-        _SH_STATE["fails"] = 0
+        _SH_STATE.update(fails=0, half=False, probing=0.0)
 
 
 def _sh_fail(e: Exception):
     msg = str(e) or type(e).__name__
     low = msg.lower()
-    if any(w in low for w in ("ffmpeg", "decode", "could not read", "no audio", "invalid data")):
-        log.warning("shazam could not read this piece: %s", msg[:100])   # a bad piece, not an outage
-        return
     with _SH_LOCK:
+        _SH_STATE["probing"] = 0.0
+        if any(w in low for w in _SH_BAD_PIECE):
+            log.warning("shazam could not read this piece: %s", msg[:100])   # a bad piece, not an outage
+            return
         _SH_STATE["fails"] += 1
         n = _SH_STATE["fails"]
+        _count("shazam_errors")
         log.warning("shazam failed (%d in a row): %s %s", n, type(e).__name__, msg[:100])
-        if n >= SHAZAM_MAX_FAILS:
+        if n >= SHAZAM_MAX_FAILS or _SH_STATE["half"]:        # a failed probe pauses again at once
             _SH_STATE["fails"] = 0
+            _SH_STATE["half"] = True
             _SH_STATE["until"] = time.time() + SHAZAM_PAUSE
-            log.warning("shazam paused for %d s (too many failures in a row)", SHAZAM_PAUSE)
+            log.warning("shazam paused for %d s", SHAZAM_PAUSE)
 
 
 def _sh_call(path: str) -> dict:
     from shazamio import Shazam
-    if _SH["client"] is None:
-        _SH["client"] = Shazam()
-    client = _SH["client"]
-    fn = getattr(client, "recognize", None) or getattr(client, "recognize_song")
+    loop = _sh_loop()
 
     async def go():
+        cl = _SH["clients"].get(id(loop))          # created INSIDE its own loop (one thread: no race)
+        if cl is None:
+            cl = _SH["clients"][id(loop)] = Shazam()
+        fn = getattr(cl, "recognize", None) or getattr(cl, "recognize_song")
         return await asyncio.wait_for(fn(path), SHAZAM_TIMEOUT)
 
-    return asyncio.run_coroutine_threadsafe(go(), _sh_loop()).result(timeout=SHAZAM_TIMEOUT + 3)
+    return asyncio.run_coroutine_threadsafe(go(), loop).result(timeout=SHAZAM_TIMEOUT + 3)
 
 
-def shazam_piece(path: str):
+def shazam_piece(path: str, stop=None):
     """ONE piece against Shazam -> list of candidates ([] = nothing found) or None (could not answer)."""
-    if shazam_paused():
+    if _SH["missing"]:
+        return None
+    with _SH_LOCK:
+        now = time.time()
+        if now < _SH_STATE["until"]:
+            return None
+        if _SH_STATE["half"]:
+            if now - _SH_STATE["probing"] < SHAZAM_TIMEOUT + 5:
+                return None                         # only ONE probe after a pause
+            _SH_STATE["probing"] = now
+    if stop is not None and stop.is_set():
         return None
     with _SH_SEM:
         try:
@@ -416,12 +675,17 @@ def shazam_piece(path: str):
              "dur": None, "w": 0.99, "rank": 0, "engine": "shazam"}]
 
 
-# --- voting (same rules as the old bot)
-def _rank(hits: list) -> list:
+# --- voting
+_PSEUDO = 90        # piece ids from 90 up are not real audio pieces (own DB = 98, lyrics = 99)
+
+
+def _rank(hits: list, solo: bool = False) -> list:
     """hits: [{"piece": int, "song": {...}}] -> clusters of the same song, best first.
     Votes of different engines add up; a repeated answer of one engine adds half of ITS OWN weight.
-    A song is 'solid' when two different engines name it, or two different pieces name it with a real
-    (non-humming) match. A melody (humming) guess alone is never solid."""
+    A song is 'solid' when two different engines name it, or two different REAL pieces name it with a real
+    (non-humming) match; with solo=True (a clip with only one piece) one very sure first answer is enough.
+    Lyrics count as an engine only when another engine named the song with weight >= 0.8; a melody (humming)
+    guess alone is never solid."""
     clusters = []
     for h in hits:
         for c in clusters:
@@ -440,8 +704,13 @@ def _rank(hits: list) -> list:
         first = [h for h in hs if not h["song"].get("hum") and h["song"]["rank"] == 0]
         # a 2nd / 3rd candidate counts as a second confirmation only when the same song was also a first answer
         also = [h for h in hs if not h["song"].get("hum") and h["song"]["rank"] > 0] if first else []
-        c["engines"] = set(per)
-        c["solid"] = len(per) >= 2 or len({h["piece"] for h in first + also}) >= 2
+        engs = set(per)
+        other_best = max((max(v) for e, v in per.items() if e != "lyrics"), default=0.0)
+        voting = engs - {"lyrics"} if ("lyrics" in engs and other_best < 0.8) else engs
+        real_pieces = {h["piece"] for h in first + also if h["piece"] < _PSEUDO}
+        sure_solo = SOLO_ACCEPT and solo and any(h["song"]["w"] >= SOLO_W and h["piece"] < _PSEUDO for h in first)
+        c["engines"] = engs
+        c["solid"] = len(voting) >= 2 or len(real_pieces) >= 2 or sure_solo
         c["score"] = score * mult
         c["bad"] = mult < 1
         c["first"] = first
@@ -457,14 +726,18 @@ def _rank(hits: list) -> list:
 
 
 def _confident(ranked: list) -> bool:
-    """Accuracy first. The top answer must be confirmed (two engines agree, or two different pieces of the audio
-    agree), must not look like a remix / mashup, and must have no close competitor. A single answer from one
-    engine on one piece is never enough."""
+    """Accuracy first. The top answer must be confirmed, must not look like a remix / mashup, and must have no
+    real competitor. A remix / live / cover that came up beside the original is NOT a competitor; a rival song
+    blocks only when it is confirmed too (and not far weaker) or nearly as strong."""
     if not ranked or ranked[0]["bad"] or not ranked[0]["solid"]:
         return False
-    if len(ranked) > 1:
-        second = ranked[1]
-        if second["solid"] or second["score"] >= ranked[0]["score"] * 0.6:
+    top = ranked[0]
+    for other in ranked[1:]:
+        if other["bad"] and not other["solid"]:
+            continue
+        if other["solid"] and top["score"] >= other["score"] * 1.5:
+            continue
+        if other["solid"] or other["score"] >= top["score"] * 0.75:
             return False
     return True
 
@@ -487,22 +760,37 @@ def _mean_db(path: str):
         return None
 
 
+def _spread(loudest_first: list, index: dict) -> list:
+    """The first wave gets the loudest piece plus pieces from OTHER moments of the clip, so one noisy part of
+    the audio cannot sink the whole first wave."""
+    head, rest = loudest_first[:6], loudest_first[6:]
+    if not head:
+        return []
+    pick, pool = [head[0]], head[1:]
+    while pool and len(pick) < 3:
+        nxt = max(pool, key=lambda p: min(abs(index[p] - index[q]) for q in pick))
+        pick.append(nxt)
+        pool.remove(nxt)
+    return pick + pool + rest
+
+
 def _order_pieces(paths: list) -> list:
     """Loudest first, near-silent pieces dropped (never fewer than 3): no quota is wasted on silence."""
     if not FFMPEG or len(paths) < 2:
         return list(paths)
-    dbs = list(_LOCAL_POOL.map(_mean_db, paths))
+    index = {p: i for i, p in enumerate(paths)}
+    dbs = list(_AUDIO_POOL.map(_mean_db, paths))
     scored = sorted(zip(paths, dbs), key=lambda x: (x[1] is None, -(x[1] if x[1] is not None else 0.0)))
     keep = [p for p, d in scored if d is None or d > SILENT_DB]
     if len(keep) < min(3, len(paths)):
         keep = [p for p, _ in scored][:min(3, len(paths))]
-    return keep
+    return _spread(keep, index)
 
 
 def _make_variants(paths: list, tmp: str):
     jobs = []
-    for name, flt in _VARIANTS:                       # interleaved: the first wave already mixes sources
-        for gi, p in enumerate(paths[:3]):
+    for name, flt in _VARIANTS:
+        for gi, p in enumerate(paths):
             jobs.append((gi, p, os.path.join(tmp, f"v{gi}_{name}.wav"), flt))
 
     def run(j):
@@ -514,19 +802,21 @@ def _make_variants(paths: list, tmp: str):
         except Exception:
             return None
 
-    done = [r for r in _LOCAL_POOL.map(run, jobs) if r]
+    done = [r for r in _AUDIO_POOL.map(run, jobs) if r]
     return [o for _, o in done], [g for g, _ in done]
 
 
 # --- result cache (engine answers only: the own DB can change when a song is deleted / re-learned)
 _CACHE = OrderedDict()
 _CACHE_LOCK = threading.Lock()
+_MISS = object()
 
 
 def _cache_key(paths: list):
     try:
         h = hashlib.sha1()
         for p in paths[:2]:
+            h.update(str(os.path.getsize(p)).encode())
             with open(p, "rb") as f:
                 h.update(f.read(200000))
         return h.hexdigest()
@@ -535,32 +825,62 @@ def _cache_key(paths: list):
 
 
 def _cache_get(key, rejected: set):
+    """-> _MISS, None (a remembered "not found") or a song dict (alts the user rejected are removed)."""
     with _CACHE_LOCK:
         item = _CACHE.get(key)
         if not item:
-            return None
+            return _MISS
         ts, song = item
-        if time.time() - ts > CACHE_TTL or (rejected and title_key(song["title"]) in rejected):
+        if time.time() - ts > (CACHE_TTL if song else NEG_TTL) or (song and is_rejected(song, rejected)):
             _CACHE.pop(key, None)                    # expired, or the user said "wrong song"
-            return None
+            return _MISS
         _CACHE.move_to_end(key)
-        return dict(song)
+        if song is None:
+            return None
+        out = dict(song)
+        out["alts"] = [a for a in (out.get("alts") or []) if not is_rejected(a, rejected)]
+        return out
 
 
-def _cache_put(key, song: dict):
+def _cache_put(key, song):
     with _CACHE_LOCK:
-        _CACHE[key] = (time.time(), dict(song))
+        if song is not None:
+            song = {k: v for k, v in song.items() if k != "piece_path"}     # the temp file is gone later
+        _CACHE[key] = (time.time(), song)
+        _CACHE.move_to_end(key)
         while len(_CACHE) > CACHE_MAX:
             _CACHE.popitem(last=False)
 
 
-# --- last resort: what the singer says (same as the old bot; needs faster-whisper and the bot's words_fn)
+# --- limits: engine rounds at the same time, per-user rate limit (only when user_id is given)
+_ROUNDS = threading.BoundedSemaphore(MAX_ROUNDS)
+_USER_HITS = {}
+_USER_LOCK = threading.Lock()
+
+
+def _check_user(user_id):
+    if user_id is None or USER_LIMIT <= 0:
+        return
+    now = time.time()
+    with _USER_LOCK:
+        dq = _USER_HITS.setdefault(user_id, deque())
+        while dq and now - dq[0] > USER_WINDOW:
+            dq.popleft()
+        if len(dq) >= USER_LIMIT:
+            raise RateLimited(int(USER_WINDOW - (now - dq[0])) + 1)
+        dq.append(now)
+        if len(_USER_HITS) > 5000:
+            for k in [k for k, v in _USER_HITS.items() if not v or now - v[-1] > USER_WINDOW]:
+                _USER_HITS.pop(k, None)
+
+
+# --- last resort: what the singer says (needs faster-whisper and the bot's words_fn)
 _words_fn = None
 _WHISPER = {"model": None}
 _WHISPER_LOCK = threading.Lock()
 
 
-def transcribe(path: str) -> str:
+def transcribe(path: str, cancel=None) -> str:
     try:
         from faster_whisper import WhisperModel
     except Exception:
@@ -569,29 +889,43 @@ def transcribe(path: str) -> str:
         log.info("whisper busy, skipping the lyrics stage for this request")
         return ""
     try:
+        if cancel is not None and cancel.is_set():
+            return ""
         if _WHISPER["model"] is None:
-            _WHISPER["model"] = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
-        segs, _info = _WHISPER["model"].transcribe(
-            path, vad_filter=False, beam_size=3, temperature=0.0,
-            condition_on_previous_text=False, no_speech_threshold=0.4,
-            compression_ratio_threshold=2.2)
+            _WHISPER["model"] = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8",
+                                             cpu_threads=WHISPER_THREADS)
+        kw = dict(vad_filter=False, beam_size=3, temperature=0.0, condition_on_previous_text=False,
+                  no_speech_threshold=0.4, compression_ratio_threshold=2.2)
+        if WHISPER_LANG:
+            kw["language"] = WHISPER_LANG
+        segs, info = _WHISPER["model"].transcribe(path, **kw)
+        if not WHISPER_LANG and (getattr(info, "language_probability", 1.0) or 0) < 0.45:
+            return ""                                   # unsure about the language = it is not really speech
         out, last = [], None
         for sg in segs:
+            if cancel is not None and cancel.is_set():
+                break
             t = sg.text.strip()
             if not t or sg.no_speech_prob > 0.6 or sg.avg_logprob < -1.0:
                 continue
             if t != last:
                 out.append(t)
             last = t
-        return " ".join(out).strip()
+        text = " ".join(out).strip()
+        words = re.findall(r"\w+", text.lower())
+        if len(set(words)) < 4:                          # "la la la la" / looping hallucination
+            return ""
+        return text
     finally:
         _WHISPER_LOCK.release()
 
 
-def _lyrics_identify(paths: list):
+def _lyrics_identify(paths: list, cancel=None):
     texts, empty = [], 0
     for p in paths[:3]:
-        t = transcribe(p)
+        if cancel is not None and cancel.is_set():
+            return None
+        t = transcribe(p, cancel)
         if t:
             texts.append(t)
         else:
@@ -608,48 +942,87 @@ def _lyrics_identify(paths: list):
 
 
 # --- the engines round
-def _ask_engines(paths: list, rejected: set, cancel=None, engines=ENGINES, full=False):
+def _timed(box: dict, fn, *args):
+    box["t"] = time.time()                  # the timeout counts from the START of the request, not the queue
+    return fn(*args)
+
+
+def _ask_engines(paths: list, rejected: set, cancel=None, engines=None, full=False, extra=None, meta=None):
+    if not _ROUNDS.acquire(timeout=ROUND_WAIT):
+        _count("busy")
+        raise NoAccounts("server busy")
+    try:
+        return _ask_engines_core(paths, rejected, cancel, engines or ENGINES, full, extra, meta)
+    finally:
+        _ROUNDS.release()
+
+
+def _ask_engines_core(paths, rejected, cancel, engines, full, extra, meta):
     """ACR + Shazam on every piece AT THE SAME TIME, in waves (3, 3, 4 pieces). Votes are counted as answers
     arrive and the round stops the moment the answer is confirmed. With full=True and nothing confirmed:
       2) lyrics (what the singer says) as one more vote
-      3) the best pieces again, cleaned (noise filter) and tempo-shifted (sped-up / slowed remixes), added to the
-         SAME votes (variants of one piece count as ONE piece, so a wrong match can not confirm itself)
-    STRICT=1 (default): at the end the best answer must be 'solid' (confirmed), otherwise "not found".
-    `cancel` (threading.Event) stops everything when the own DB already answered."""
-    hits, st = [], {"answered": 0, "failed": 0}
+      3) the best piece again, cleaned and tempo-shifted, added to the SAME votes (variants of one piece count
+         as ONE piece, so a wrong match can not confirm itself)
+    `extra` is a live list of votes from elsewhere (the weak answer of the own DB). `cancel` stops everything.
+    STRICT=1 (default): at the end the best answer must be 'solid' (confirmed), otherwise "not found"."""
+    hits = []
+    st = {"acr": {"answered": 0, "failed": 0}, "shazam": {"answered": 0, "failed": 0}}
+    budget = {"acr": ACR_BUDGET}
+    solo = len(paths) == 1
 
     def cancelled() -> bool:
         return cancel is not None and cancel.is_set()
 
+    def ranked_now() -> list:
+        return _rank(hits + (list(extra) if extra else []), solo)
+
     def run_wave(batch) -> bool:
         """batch: [(path, piece_id)] -> every piece goes to every engine. True = confirmed."""
+        stop = threading.Event()
         futs = {}
         for p, gid in batch:
-            if "acr" in engines:
-                futs[_ACR_EXEC.submit(identify_piece, p)] = gid
+            if "acr" in engines and budget["acr"] > 0:
+                budget["acr"] -= 1
+                box = {"t": None, "sub": time.time()}
+                futs[_ACR_EXEC.submit(_timed, box, identify_piece, p, stop)] = (gid, "acr", box)
             if "shazam" in engines and not shazam_paused():
-                futs[_SH_EXEC.submit(shazam_piece, p)] = gid
+                box = {"t": None, "sub": time.time()}
+                futs[_SH_EXEC.submit(_timed, box, shazam_piece, p, stop)] = (gid, "shazam", box)
         if not futs:
             return False
-        pending, deadline, confirmed = set(futs), time.time() + WAVE_TIMEOUT, False
-        while pending and time.time() < deadline and not confirmed and not cancelled():
-            done, pending = wait(pending, timeout=max(min(deadline - time.time(), 0.3), 0.05),
-                                 return_when=FIRST_COMPLETED)
-            for f in done:
-                try:
-                    res = f.result()
-                except Exception as e:
-                    log.warning("engine piece crashed: %s", e)
-                    res = None
-                if res is None:
-                    st["failed"] += 1
-                    continue
-                st["answered"] += 1
-                hits.extend({"piece": futs[f], "song": s} for s in res if title_key(s["title"]) not in rejected)
-            if done and _confident(_rank(hits)):
-                confirmed = True
-        for f in pending:
-            f.cancel()                       # not sent yet -> no quota used
+        pending, confirmed = set(futs), False
+        try:
+            while pending and not confirmed and not cancelled():
+                now = time.time()
+                for f in list(pending):                      # too slow: stop waiting for it
+                    gid, eng, box = futs[f]
+                    t = box["t"]
+                    if (t is not None and now - t > WAVE_TIMEOUT) or (t is None and now - box["sub"] > QUEUE_TIMEOUT):
+                        pending.discard(f)
+                        f.cancel()
+                        st[eng]["failed"] += 1
+                        _count("piece_timeout")
+                if not pending:
+                    break
+                done, pending = wait(pending, timeout=0.3, return_when=FIRST_COMPLETED)
+                for f in done:
+                    gid, eng, _ = futs[f]
+                    try:
+                        res = f.result()
+                    except Exception as e:
+                        log.warning("engine piece crashed: %s", e)
+                        res = None
+                    if res is None:
+                        st[eng]["failed"] += 1
+                        continue
+                    st[eng]["answered"] += 1
+                    hits.extend({"piece": gid, "song": s} for s in res if not is_rejected(s, rejected))
+                if _confident(ranked_now()):
+                    confirmed = True
+        finally:
+            stop.set()                       # queued work is dropped, running requests send nothing more
+            for f in pending:
+                f.cancel()
         return confirmed
 
     pos = 0
@@ -662,47 +1035,57 @@ def _ask_engines(paths: list, rejected: set, cancel=None, engines=ENGINES, full=
             break
         if run_wave(batch):
             break
-    ranked = _rank(hits)
+    ranked = ranked_now()
+
+    def answered() -> int:
+        return st["acr"]["answered"] + st["shazam"]["answered"]
 
     if full and not _confident(ranked) and LYRICS_ENGINE and _words_fn and not cancelled():
         try:
-            ly = _lyrics_identify(paths)
-            if ly and title_key(ly.get("title")) not in rejected:
+            ly = _lyrics_identify(paths, cancel)
+            if ly and not is_rejected(ly, rejected):
                 hits.append({"piece": 99, "song": {"title": ly["title"], "artist": ly.get("artist") or "",
                                                    "link": ly.get("link"), "yt": None, "dur": None,
-                                                   "w": 0.8, "rank": 0, "engine": "lyrics"}})
-                ranked = _rank(hits)
+                                                   "w": 0.7, "rank": 0, "engine": "lyrics"}})
+                ranked = ranked_now()
         except Exception as e:
             log.warning("lyrics stage failed: %s", e)
 
-    if full and not _confident(ranked) and SECOND_CHANCE and FFMPEG and not cancelled() \
-            and ("acr" in engines or "shazam" in engines):
+    if full and not _confident(ranked) and SECOND_CHANCE and FFMPEG and not cancelled() and answered() > 0:
         tmp = tempfile.mkdtemp(prefix="recog_")
         try:
-            vp, vg = _make_variants(paths[:2], tmp)
+            vp, vg = _make_variants(paths[:max(SECOND_PIECES, 1)], tmp)
             if vp:
                 log.info("second chance: %d filtered variants", len(vp))
             for i in range(0, len(vp), 3):
                 if cancelled() or run_wave(list(zip(vp[i:i + 3], vg[i:i + 3]))):
                     break
-            ranked = _rank(hits)
+            ranked = ranked_now()
         except Exception as e:
             log.warning("variant stage failed: %s", e)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    failed = st["acr"]["failed"] + st["shazam"]["failed"]
+    if meta is not None:
+        meta["clean"] = answered() > 0 and failed == 0         # a real "not found", not an outage
     if cancelled():
         return None
     if not ranked:
-        if not st["answered"] and st["failed"]:
+        acr_down = "acr" in engines and st["acr"]["answered"] == 0 and st["acr"]["failed"] > 0
+        if acr_down or (answered() == 0 and failed > 0):
+            _count("no_accounts")
             raise NoAccounts("no engine could answer")
         log.info("recognize: nothing")
+        _count("not_found")
         return None
     log.info("recognize: %s", [(c["song"].get("title"), c["song"].get("artist"), round(c["score"], 2), c["solid"],
-                               sorted(c["engines"])) for c in ranked[:3]])
+                               sorted(e for e in c["engines"] if e)) for c in ranked[:3]])
     if STRICT and not ranked[0]["solid"]:
         log.info("recognize: best answer is not confirmed, STRICT is on -> not found")
+        _count("unconfirmed")
         return None
+    _count("found")
     drop = ("rank", "w", "hum", "score")
     top = {k: v for k, v in ranked[0]["song"].items() if k not in drop}
     top["engine"] = "+".join(sorted(e for e in ranked[0]["engines"] if e)) or top.get("engine")
@@ -712,12 +1095,11 @@ def _ask_engines(paths: list, rejected: set, cancel=None, engines=ENGINES, full=
     return top
 
 
-def _engines_full(paths: list, rejected: set, cancel=None):
-    return _ask_engines(paths, rejected, cancel, full=True)
-
-
 # --- public API
-ask_local = _ask_local   # own DB only (free)
+def ask_local(paths: list, rejected: set = frozenset()):
+    """Own DB only (free). Returns the answer only when it is strong (see _local_scan)."""
+    strong, _ = _local_scan(list(paths), set(rejected))
+    return strong
 
 
 def ask_acr(paths: list, rejected: set = frozenset()):
@@ -730,24 +1112,40 @@ def ask_shazam(paths: list, rejected: set = frozenset()):
     return _ask_engines(list(paths), set(rejected), engines=("shazam",))
 
 
-def ask_engines(paths: list, rejected: set = frozenset(), cancel=None):
-    """ACRCloud + Shazam voting WITHOUT the own DB (costs quota): loudest pieces first, silence dropped; when
-    nothing is confirmed: lyrics, then cleaned / tempo-shifted audio. Raises NoAccounts.
-    The answer has "engine" ("acr", "shazam", "acr+shazam"...) and "piece_path" (the piece that gave it).
-    The same audio asked again is answered from a cache ("wrong song" evicts the rejected answer)."""
-    rejected = set(rejected)
+def _engines_entry(paths, rejected, cancel, user_id, extra, pre_ordered):
     paths = list(paths)[:MAX_PIECES]
+    if not paths:
+        return None
     key = _cache_key(paths)
     if key:
         hit = _cache_get(key, rejected)
-        if hit:
+        if hit is not _MISS:
+            if hit is None:
+                log.info("recognize: cached 'not found'")
+                _count("cache_neg")
+                return None
+            hit["piece_path"] = paths[0]                  # a path that exists NOW (the cached one is long gone)
             log.info("recognize: cache hit %s", hit["title"])
+            _count("cache_hit")
             return hit
-    ordered = _order_pieces(paths)
-    res = _engines_full(ordered, rejected, cancel)
-    if res and key:
-        _cache_put(key, res)
+    _check_user(user_id)
+    ordered = paths if pre_ordered else _order_pieces(paths)
+    meta = {}
+    res = _ask_engines(ordered, rejected, cancel, full=True, extra=extra, meta=meta)
+    if key:
+        if res and "local" not in (res.get("engine") or ""):
+            _cache_put(key, res)
+        elif res is None and meta.get("clean") and not extra and not (cancel is not None and cancel.is_set()):
+            _cache_put(key, None)
     return res
+
+
+def ask_engines(paths: list, rejected: set = frozenset(), cancel=None, user_id=None):
+    """ACRCloud + Shazam voting WITHOUT the own DB (costs quota): loudest pieces first, silence dropped; when
+    nothing is confirmed: lyrics, then cleaned / tempo-shifted audio. Raises NoAccounts (and RateLimited when
+    user_id is given). The answer has "engine" ("acr", "shazam", "acr+shazam"...) and "piece_path".
+    The same audio asked again is answered from a cache ("wrong song" evicts the rejected answer)."""
+    return _engines_entry(paths, set(rejected), cancel, user_id, None, False)
 
 
 def init(load_accounts, local_fn=None, words_fn=None):
@@ -759,19 +1157,31 @@ def init(load_accounts, local_fn=None, words_fn=None):
     _words_fn = words_fn
 
 
-def recognize(paths, rejected=frozenset()):
-    """paths: audio pieces. rejected: title_key()s the user already marked as wrong.
-    Own DB + ACRCloud + Shazam. The DB runs at the same time as the engines: if it knows the song first, that
-    answer is returned at once and the engines are cancelled (LOCAL_FIRST=1: DB alone first)."""
+def _local_job(paths, rejected, extra):
+    strong, weak = _local_scan(paths, rejected)
+    if strong:
+        return strong
+    if weak:
+        extra.append({"piece": 98, "song": weak})      # one more voter for the engines round
+    return None
+
+
+def recognize(paths, rejected=frozenset(), user_id=None):
+    """paths: audio pieces. rejected: title_key()s (or reject_key()s) the user already marked as wrong.
+    Own DB + ACRCloud + Shazam. The DB runs at the same time as the engines: a strong DB answer is returned at
+    once and the engines are cancelled; a weak one becomes a vote. (LOCAL_FIRST=1: DB alone first.)"""
     paths = [paths] if isinstance(paths, str) else list(paths)[:MAX_PIECES]
     if not paths:
         return None
     rejected = set(rejected)
+    ordered = _order_pieces(paths)
+    extra = []
     if LOCAL_FIRST or not _local_fn:
-        return ask_local(paths, rejected) or ask_engines(paths, rejected)
+        res = _local_job(ordered, rejected, extra) if _local_fn else None
+        return res or _engines_entry(ordered, rejected, None, user_id, extra, True)
     cancel = threading.Event()
-    local_fut = _MAIN_POOL.submit(ask_local, paths, rejected)
-    eng_fut = _MAIN_POOL.submit(ask_engines, paths, rejected, cancel)
+    local_fut = _MAIN_POOL.submit(_local_job, ordered, rejected, extra)
+    eng_fut = _MAIN_POOL.submit(_engines_entry, ordered, rejected, cancel, user_id, extra, True)
     try:
         res = local_fut.result()
     except Exception as e:
@@ -780,8 +1190,53 @@ def recognize(paths, rejected=frozenset()):
     if res:
         cancel.set()
         return res
-    return eng_fut.result()          # may raise NoAccounts
+    return eng_fut.result()          # may raise NoAccounts / RateLimited
 
 
 def accounts_status() -> list:
     return POOL.status()
+
+
+def stats() -> dict:
+    """Counters since start (found / not_found / unconfirmed / cache_hit / acr_calls / acr_quota ...)."""
+    with _CACHE_LOCK:
+        size = len(_CACHE)
+    return {"counters": dict(_STAT), "cache_size": size, "shazam": shazam_status(), "acr": accounts_status()}
+
+
+# --- offline self test:  python recognition.py --selftest
+def _selftest():
+    S = lambda t, a, e, w, rank=0, **k: {"title": t, "artist": a, "w": w, "rank": rank, "engine": e, **k}
+    assert title_key("(Intro)") == "intro"
+    assert title_key("Song (feat. X) - Remastered 2011") == "song"
+    assert same_song({"title": "Back in Black", "artist": "AC/DC"}, {"title": "Back In Black", "artist": "ACDC"})
+    assert same_song({"title": "Some Song", "artist": "Florence and the Machine"},
+                     {"title": "Some Song", "artist": "Florence + The Machine"})
+    assert first_artist("AC/DC") == "AC/DC" and first_artist("Drake feat. Rihanna") == "Drake"
+    assert not same_song({"title": "Home", "artist": ""}, {"title": "Homeless", "artist": "X"})
+    assert not same_song({"title": "Love", "artist": ""}, {"title": "Love", "artist": "X"})      # short + no artist
+    assert not same_song({"title": "Song", "artist": "A"}, {"title": "Song (Remix)", "artist": "A"})
+    assert is_rejected({"title": "Crazy", "artist": "Gnarls Barkley"}, {"crazy"})
+    assert is_rejected({"title": "Crazy", "artist": "Gnarls Barkley"}, {reject_key({"title": "Crazy", "artist": "Gnarls Barkley"})})
+    assert not is_rejected({"title": "Crazy", "artist": "Patsy Cline"}, {reject_key({"title": "Crazy", "artist": "Gnarls Barkley"})})
+    one = [{"piece": 0, "song": S("A Long Song", "X", "acr", 0.9)}]
+    assert not _confident(_rank(one))                                   # one engine, one piece: not enough
+    assert _confident(_rank([{"piece": 0, "song": S("A Long Song", "X", "acr", 0.99)}], solo=True))
+    two = one + [{"piece": 0, "song": S("A Long Song", "X", "shazam", 0.99)}]
+    assert _confident(_rank(two))                                       # two engines agree
+    lyr = [{"piece": 0, "song": S("A Long Song", "X", "acr", 0.6)}, {"piece": 99, "song": S("A Long Song", "X", "lyrics", 0.7)}]
+    assert not _confident(_rank(lyr))                                   # lyrics + a weak hit never confirm
+    lyr2 = [{"piece": 0, "song": S("A Long Song", "X", "acr", 0.9)}, {"piece": 99, "song": S("A Long Song", "X", "lyrics", 0.7)}]
+    assert _confident(_rank(lyr2))
+    rival = two + [{"piece": 1, "song": S("Other Thing", "Y", "acr", 0.9)}, {"piece": 2, "song": S("Other Thing", "Y", "acr", 0.9)}]
+    assert not _confident(_rank(rival))                                 # a confirmed rival blocks
+    remix = two + [{"piece": 1, "song": S("A Long Song (Remix)", "X", "acr", 0.9)}]
+    assert _confident(_rank(remix))                                     # a remix beside the original does not
+    assert _check_user(None) is None
+    print("selftest ok")
+
+
+if __name__ == "__main__":
+    import sys
+    if "--selftest" in sys.argv:
+        _selftest()
