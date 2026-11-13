@@ -1,5 +1,5 @@
 """
-recognition.py - music recognition core (the ONLY file that knows how a song is recognized).
+recognition.py - music recognition core (the ONLY file that knows how a song is recognized).  v11
 
   1) own fingerprint DB  (free, fast, knows remixes / special versions)
   2) ACRCloud + Shazam (+ AudD when AUDD_TOKEN is set) - every piece goes to ALL engines at the same time
@@ -9,43 +9,36 @@ recognition.py - music recognition core (the ONLY file that knows how a song is 
          used at once; a paused account comes back through ONE probe request; pauses survive a restart
        - Shazam runs in ONE event loop (concurrent requests inside it) with a half-open circuit breaker
   3) not confirmed after the first seconds -> the best piece is also tried as: denoised, speed-corrected
-     (sped-up / slowed remixes are resampled, not only time-stretched) and tempo-shifted. These variants are
-     prepared in the background while the first round is still running. The own DB is asked with ALL of them too
-     (free, no quota). Lyrics (what the singer says) run in parallel (LYRICS_ENGINE, on by default).
-  4) an answer is accepted when it is CONFIRMED:
-       - two engines agree, or two different pieces agree, or
-       - ONE engine is extremely sure (score >= SINGLE_W) and nothing competes with it, or
-       - ACR names the same song at least twice as its first answer (clip + its variants), or
-       - ACR melody (humming) matches: two different pieces (weight >= 0.75) or three matches (weight >= 0.85)
-     ... or, when SOFT_ACCEPT is on (default), when it is NOT confirmed but good enough:
-       - a normal ACR / Shazam match with weight >= SOFT_W and no real rival -> answered right after the first
-         round (no second chance needed), or
-       - a melody-only guess with weight >= SOFT_HUM_W and no real rival -> answered after the second chance.
-     ... or, when GUESS_MODE is on (default) and nothing above applies, the BEST plausible candidate is still
-     returned with song["guess"] = True (the bot shows "this is a guess" and the "wrong song" button walks
-     through the other candidates). A guess is never learned by the own DB and never cached.
-     Remixes / covers are never accepted by SOFT_ACCEPT. Lyrics alone never confirm anything.
+     and tempo-shifted variants. The own DB is asked with ALL of them too (free). Lyrics run in parallel.
+  4) an answer is accepted when it is CONFIRMED (two engines agree / two pieces agree / one engine extremely
+     sure / ACR repeats itself / melody matches), or SOFT_ACCEPT, or GUESS_MODE (returned with guess=True).
 
-  A strong DB answer is returned at once (the engines are cancelled). A weak DB answer is one more VOTE.
+  v11 changes (why the bot stayed silent while other bots answered):
+    * Shazam was only given SHAZAM_GRACE (3 s) as soon as ACR had nothing to say - e.g. when the ACR quota is
+      used up or ACR does not know the song. Shazam needs 3-8 s, so its answer arrived AFTER the round gave
+      up. Now the short grace applies only when ACR already gave an answer to fall back on; if there is
+      nothing yet, Shazam is waited for until the round timeout.
+    * ROUND_TIMEOUT 15 -> 20 s, SHAZAM_TIMEOUT 10 -> 12 s.
+    * The Shazam circuit breaker was too nervous (4 timeouts = 2 min pause for everybody): now 6 fails = 45 s.
+    * "No engine could answer" (-> the generic error text) is only raised when really NO engine answered; when
+      Shazam answered "not found" while ACR is down, the user gets "not found".
+    * Every engine answer is logged (engine, piece, seconds, titles): journalctl shows exactly who said what.
+    * Queued Shazam pieces are dropped when the round is already over (no useless requests).
 
-bot.py uses this interface (unchanged; new things are optional):
+bot.py uses this interface (unchanged):
 
-    init(load_accounts, local_fn, words_fn)   once at start. load_accounts() -> [{"id","host","key","secret"}]
-                                        local_fn(path) -> {"title","artist"[,"link","yt","score"]} or None
-                                        words_fn(words) -> {"title","artist"[,"loose"]} or None
+    init(load_accounts, local_fn, words_fn)
     ask_local(paths, rejected)          own DB only (free)             -> song dict or None
     ask_local_full(paths, rejected)     own DB only                    -> (song or None, [weak vote])
-    ask_acr(paths, rejected)            ACRCloud only (costs quota)    -> song dict or None, raises NoAccounts
-    ask_shazam(paths, rejected)         Shazam only                    -> song dict or None
+    ask_acr(paths, rejected)            ACRCloud only (costs quota)
+    ask_shazam(paths, rejected)         Shazam only
     ask_engines(paths, rejected, cancel=None, user_id=None, extra=None)  all engines voting
-                                        (extra = the [weak vote] of ask_local_full)  -> song dict or None
     recognize(paths, rejected, user_id=None)                 DB + engines together
     accounts_status() / shazam_status() / stats()
     NoAccounts / RateLimited
     title_key, artist_set, same_song, is_variant, fold, first_artist, reject_key, is_rejected   text helpers
 
 A song dict: {"title","artist","link","yt","dur","engine","alts","piece_path"[,"guess"]}.
-"rejected" = set of title_key()s (or reject_key()s = "titlekey::artistkey").
 Self test (offline):  python recognition.py --selftest
 """
 import asyncio
@@ -93,11 +86,11 @@ WAVES = (3, 3, 4)                                               # pieces sent pe
 ACR_TIMEOUT = _env(int, 10, "ACR_TIMEOUT", "ENGINE_TIMEOUT")    # one request
 WAVE_TIMEOUT = _env(int, 12, "WAVE_TIMEOUT")                    # one ACR piece, counted from when it STARTS
 QUEUE_TIMEOUT = _env(int, 30, "QUEUE_TIMEOUT")                  # a piece that never got a free thread
-ROUND_TIMEOUT = _env(int, 15, "ROUND_TIMEOUT")                  # the whole first round
+ROUND_TIMEOUT = _env(int, 20, "ROUND_TIMEOUT")                  # the whole first round (was 15)
 PHASE_B_TIMEOUT = _env(int, 25, "PHASE_B_TIMEOUT")              # variants + DB variants + lyrics
 WAVE_STAGGER = _env(float, 2.0, "WAVE_STAGGER")                 # next wave starts after this even if ACR is slow
 GIVEUP_AFTER = _env(int, 4, "GIVEUP_AFTER")                     # ACR heard this many pieces and knows nothing -> no more plain pieces
-SHAZAM_GRACE = _env(float, 3.0, "SHAZAM_GRACE")                 # only Shazam left: wait for it at most this long
+SHAZAM_GRACE = _env(float, 3.0, "SHAZAM_GRACE")                 # only Shazam left AND ACR gave an answer: wait this long
 SOFT_GRACE = _env(float, 1.0, "SOFT_GRACE")                     # ... but only this long when ACR already gave a decent answer
 VARIANT_EARLY = _env(float, 1.2, "VARIANT_EARLY")               # filtered variants are prepared after this many seconds
 ACR_THREADS = _env(int, 32, "ACR_THREADS", "ENGINE_THREADS")
@@ -138,10 +131,10 @@ HUM_PIECES_W = _env(float, 0.75, "HUM_PIECES_W")                # ... each with 
 HUM_HITS_MIN = _env(int, 3, "HUM_HITS_MIN")                     # or this many melody matches (any piece) ...
 HUM_HITS_W = _env(float, 0.85, "HUM_HITS_W")                    # ... each with at least this weight
 
-SHAZAM_TIMEOUT = _env(int, 10, "SHAZAM_TIMEOUT")
-SHAZAM_MAX_FAILS = _env(int, 4, "SHAZAM_MAX_FAILS")
-SHAZAM_PAUSE = _env(int, 120, "SHAZAM_PAUSE")
-SHAZAM_THREADS = max(_env(int, 3, "SHAZAM_THREADS"), 1)         # concurrent Shazam requests (all in ONE event loop)
+SHAZAM_TIMEOUT = _env(int, 12, "SHAZAM_TIMEOUT")                # was 10
+SHAZAM_MAX_FAILS = _env(int, 6, "SHAZAM_MAX_FAILS")             # was 4
+SHAZAM_PAUSE = _env(int, 45, "SHAZAM_PAUSE")                    # was 120
+SHAZAM_THREADS = max(_env(int, 4, "SHAZAM_THREADS"), 1)         # concurrent Shazam requests (all in ONE event loop)
 
 AUDD_TOKEN = os.environ.get("AUDD_TOKEN", "").strip()          # optional third engine (add "audd" to ENGINES)
 AUDD_TIMEOUT = _env(int, 12, "AUDD_TIMEOUT")
@@ -523,7 +516,7 @@ class AccountPool:
 
 POOL = AccountPool()
 _ACR_EXEC = ThreadPoolExecutor(max_workers=ACR_THREADS, thread_name_prefix="acr")
-_SH_EXEC = ThreadPoolExecutor(max_workers=max(SHAZAM_THREADS * 2, 2), thread_name_prefix="shazam")
+_SH_EXEC = ThreadPoolExecutor(max_workers=max(SHAZAM_THREADS * 3, 6), thread_name_prefix="shazam")
 _AUDD_EXEC = ThreadPoolExecutor(max_workers=4, thread_name_prefix="audd")
 _HTTP = requests.Session()
 _HTTP.mount("https://", requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=ACR_THREADS * 2))
@@ -754,7 +747,7 @@ def _sh_fail(e: Exception, took: float = 0.0):
             log.warning("shazam paused for %d s", SHAZAM_PAUSE)
 
 
-def _sh_call(path: str) -> dict:
+def _sh_call(path: str, stop=None):
     from shazamio import Shazam
     loop = _sh_loop()
 
@@ -764,6 +757,8 @@ def _sh_call(path: str) -> dict:
         if _SH["client"] is None:
             _SH["client"] = Shazam()
         async with _SH["sem"]:
+            if stop is not None and stop.is_set():     # the round is over while this piece waited: send nothing
+                return None
             cl = _SH["client"]
             fn = getattr(cl, "recognize", None) or getattr(cl, "recognize_song")
             return await asyncio.wait_for(fn(path), SHAZAM_TIMEOUT)
@@ -792,13 +787,17 @@ def shazam_piece(path: str, stop=None):
         return None
     t0 = time.time()
     try:
-        res = _sh_call(path)
+        res = _sh_call(path, stop)
     except ImportError:
         _SH["missing"] = True
         log.warning("shazamio is not installed -> Shazam is off (venv/bin/pip install shazamio)")
         return None
     except Exception as e:
         _sh_fail(e, time.time() - t0)
+        return None
+    if res is None:                                 # dropped because the round ended: not an answer, not a failure
+        with _SH_LOCK:
+            _SH_STATE["probing"] = 0.0
         return None
     _sh_ok()
     track = (res or {}).get("track") or {}
@@ -1206,17 +1205,15 @@ def _ask_engines_core(paths, rejected, cancel, engines, full, extra, meta):
       - wave 1 (3 pieces) goes out at once; the next wave starts when the FAST engines (ACR / AudD) of the
         running pieces have answered, or after WAVE_STAGGER s - never after a slow Shazam
       - votes are counted as answers arrive; the round stops the moment the answer is confirmed
-      - when only a slow Shazam is left, it is waited for SHAZAM_GRACE s at most (SOFT_GRACE s when ACR already
-        gave a decent answer)
+      - when only a slow Shazam is left AND ACR already gave an answer to fall back on, it is waited for
+        SHAZAM_GRACE s at most (SOFT_GRACE s when that answer is decent). With NOTHING to fall back on
+        (ACR knows nothing / is paused / out of quota) Shazam is waited for until the round timeout.
       - ACR heard GIVEUP_AFTER pieces and knows nothing -> no more plain pieces (saves quota)
     With full=True and nothing confirmed / decent after the first round (phase B):
-      - the best piece again as denoised / speed-corrected / tempo-shifted variants (variants of one piece count
-        as ONE piece for the normal rules, so a wrong match can not confirm itself); the own DB gets ALL
+      - the best piece again as denoised / speed-corrected / tempo-shifted variants; the own DB gets ALL
         variants too (free). The variants are prepared in the background while the first round still runs.
       - lyrics (what the singer says) run in PARALLEL when LYRICS_ENGINE is on
-    `extra` is a live list of votes from elsewhere (the weak answer of the own DB). `cancel` stops everything.
-    At the end the best answer must be 'solid' (confirmed), 'decent' (see _soft_ok) or, with GUESS_MODE, the
-    best plausible candidate (returned with guess=True)."""
+    `extra` is a live list of votes from elsewhere (the weak answer of the own DB). `cancel` stops everything."""
     engines = tuple(e for e in engines if e != "audd" or AUDD_TOKEN)
     hits = []
     st = {e: {"answered": 0, "failed": 0} for e in ("acr", "shazam", "audd")}
@@ -1227,6 +1224,10 @@ def _ask_engines_core(paths, rejected, cancel, engines, full, extra, meta):
     var = {"f": None, "tmp": None}       # the filtered variants, made in the background
     side = {}                            # future -> (piece, engine, box): lyrics / own-DB variants (no quota)
     t_start = time.time()
+
+    log.info("round start: %d pieces, engines=%s, acr_accounts_ready=%d, shazam_paused=%s",
+             len(paths), "+".join(engines), len(POOL.available()) if "acr" in engines else 0,
+             shazam_paused() if "shazam" in engines else "n/a")
 
     def cancelled() -> bool:
         if cancel is not None and cancel.is_set():
@@ -1277,8 +1278,10 @@ def _ask_engines_core(paths, rejected, cancel, engines, full, extra, meta):
         var["f"] = _VAR_POOL.submit(_make_variants, paths[:max(SECOND_PIECES, 1)], var["tmp"])
 
     def absorb(key, res):
-        gid, eng, _ = key
+        gid, eng, box = key
+        took = time.time() - (box.get("t") or box.get("sub") or time.time())
         if eng == "lyrics":
+            log.info("answer lyrics %.1fs -> %s", took, (res or {}).get("title") if res else None)
             if res and not is_rejected(res, rejected):
                 hits.append({"piece": 99, "song": {"title": res["title"], "artist": res.get("artist") or "",
                                                    "link": res.get("link"), "yt": None, "dur": None,
@@ -1294,8 +1297,11 @@ def _ask_engines_core(paths, rejected, cancel, engines, full, extra, meta):
             return
         if res is None:
             st[eng]["failed"] += 1
+            log.info("answer %s piece=%s %.1fs -> no answer (failed / paused / dropped)", eng, gid, took)
             return
         st[eng]["answered"] += 1
+        log.info("answer %s piece=%s %.1fs -> %s", eng, gid, took,
+                 [(s.get("artist"), s.get("title"), round(s.get("w", 0), 2)) for s in res[:2]] or "nothing found")
         hits.extend({"piece": gid, "song": s} for s in res if not is_rejected(s, rejected))
 
     def drive(waves, timeout, wait_side) -> bool:
@@ -1334,6 +1340,7 @@ def _ask_engines_core(paths, rejected, cancel, engines, full, extra, meta):
                         if k[1] in st:
                             st[k[1]]["failed"] += 1
                         _count("piece_timeout")
+                        log.info("piece timeout: %s piece=%s", k[1], k[0])
                 core = [k[1] for k in pending.values() if k[1] in st]
                 if s["next"] < len(waves):
                     if s["next"] >= 2 and not ranked_now() and st["acr"]["answered"] >= GIVEUP_AFTER:
@@ -1343,9 +1350,10 @@ def _ask_engines_core(paths, rejected, cancel, engines, full, extra, meta):
                         continue
                 if not (core or (wait_side and pending)):
                     break
-                # only a slow Shazam is left (and a fast engine is in play): wait for it only a little
+                # only a slow Shazam is left. The short grace is ONLY for the case where a fast engine already
+                # answered AND something exists to fall back on; with nothing at all, Shazam is the only hope.
                 only_slow = (core and all(e == "shazam" for e in core) and s["next"] >= len(waves)
-                             and any(e in FAST_ENGINES for e in engines))
+                             and any(st[e]["answered"] for e in FAST_ENGINES) and bool(ranked_now()))
                 if only_slow and not (wait_side and any(k[1] not in st for k in pending.values())):
                     s["shaz"] = s["shaz"] or now
                     grace = SOFT_GRACE if _soft_ok(ranked_now(), False) else SHAZAM_GRACE
@@ -1411,11 +1419,14 @@ def _ask_engines_core(paths, rejected, cancel, engines, full, extra, meta):
         if cancelled():
             return None
         if not ranked:
-            acr_down = "acr" in engines and st["acr"]["answered"] == 0 and st["acr"]["failed"] > 0
-            if acr_down or (answered() == 0 and failed() > 0):
+            # raise only when NOBODY could answer. If an engine (e.g. Shazam) answered "not found" while ACR is
+            # down, the honest result is "not found", not a generic error.
+            if answered() == 0 and failed() > 0:
                 _count("no_accounts")
+                log.warning("recognize: no engine could answer (acr=%s shazam=%s audd=%s)",
+                            st["acr"], st["shazam"], st["audd"])
                 raise NoAccounts("no engine could answer")
-            log.info("recognize: nothing")
+            log.info("recognize: nothing (acr=%s shazam=%s)", st["acr"], st["shazam"])
             _count("not_found")
             return None
         # per song: title, artist, score, solid?, engines, [(piece, melody?, rank, weight) of every answer]
@@ -1545,6 +1556,8 @@ def init(load_accounts, local_fn=None, words_fn=None):
     POOL.set_loader(load_accounts)
     _local_fn = local_fn
     _words_fn = words_fn
+    log.info("recognition v11: engines=%s round_timeout=%ss shazam_timeout=%ss shazam_threads=%d",
+             "+".join(ENGINES), ROUND_TIMEOUT, SHAZAM_TIMEOUT, SHAZAM_THREADS)
     threading.Thread(target=_warmup, daemon=True, name="recog-warmup").start()
 
 
@@ -1616,6 +1629,7 @@ def _selftest():
     assert not _confident(_rank(weak))                                  # one engine, one piece, score 90: not confirmed
     assert _soft_ok(_rank(weak), False)                                 # ... but decent: answered right after round 1
     assert _confident(_rank([{"piece": 0, "song": S("A Long Song", "X", "acr", 0.99)}]))   # ONE extremely sure answer
+    assert _confident(_rank([{"piece": 0, "song": S("A Long Song", "X", "shazam", 0.99)}]))  # a single Shazam answer
     assert _confident(_rank([{"piece": 0, "song": S("A Long Song", "X", "acr", 0.96)}], solo=True))   # 1-piece clip
     two = weak + [{"piece": 0, "song": S("A Long Song", "X", "shazam", 0.99)}]
     assert _confident(_rank(two))                                       # two engines agree
