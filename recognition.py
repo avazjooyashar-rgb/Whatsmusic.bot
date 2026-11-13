@@ -8,12 +8,20 @@ recognition.py - music recognition core (the ONLY file that knows how a song is 
        - ACR accounts are tried in PRIORITY order; an exhausted account is paused (backoff) and the next one is
          used at once; a paused account comes back through ONE probe request; pauses survive a restart
        - Shazam / AudD have half-open circuit breakers
-  3) not confirmed after the first seconds -> lyrics (what the singer says) start in PARALLEL, and the best piece
-     is also tried as: denoised, speed-corrected (sped-up / slowed remixes are resampled, not only time-stretched)
-     and tempo-shifted. The own DB is asked with ALL these variants too (free, no quota).
-  4) an answer is accepted only when it is CONFIRMED: two engines agree, or two different pieces agree,
-     or ONE engine is extremely sure (score >= SINGLE_W) and nothing competes with it.
-     Lyrics alone never confirm anything.
+  3) not confirmed after the first seconds -> the best piece is also tried as: denoised, speed-corrected
+     (sped-up / slowed remixes are resampled, not only time-stretched) and tempo-shifted. These variants are
+     prepared in the background while the first round is still running. The own DB is asked with ALL of them too
+     (free, no quota). Lyrics (what the singer says) are optional (LYRICS_ENGINE=1).
+  4) an answer is accepted when it is CONFIRMED:
+       - two engines agree, or two different pieces agree, or
+       - ONE engine is extremely sure (score >= SINGLE_W) and nothing competes with it, or
+       - ACR names the same song at least twice as its first answer (clip + its variants), or
+       - ACR melody (humming) matches: two different pieces (weight >= 0.75) or three matches (weight >= 0.85)
+     ... or, when SOFT_ACCEPT is on (default), when it is NOT confirmed but good enough:
+       - a normal ACR / Shazam match with weight >= SOFT_W and no real rival -> answered right after the first
+         round (no second chance needed), or
+       - a melody-only guess with weight >= SOFT_HUM_W and no real rival -> answered after the second chance.
+     Remixes / covers are never accepted this way. Lyrics alone never confirm anything.
 
   A strong DB answer is returned at once (the engines are cancelled). A weak DB answer is one more VOTE.
 
@@ -80,34 +88,47 @@ WAVES = (3, 3, 4)                                               # pieces sent pe
 ACR_TIMEOUT = _env(int, 10, "ACR_TIMEOUT", "ENGINE_TIMEOUT")    # one request
 WAVE_TIMEOUT = _env(int, 12, "WAVE_TIMEOUT")                    # one ACR piece, counted from when it STARTS
 QUEUE_TIMEOUT = _env(int, 30, "QUEUE_TIMEOUT")                  # a piece that never got a free thread
-ROUND_TIMEOUT = _env(int, 25, "ROUND_TIMEOUT")                  # the whole first round
-PHASE_B_TIMEOUT = _env(int, 35, "PHASE_B_TIMEOUT")              # variants + lyrics + DB variants
+ROUND_TIMEOUT = _env(int, 15, "ROUND_TIMEOUT")                  # the whole first round
+PHASE_B_TIMEOUT = _env(int, 20, "PHASE_B_TIMEOUT")              # variants + DB variants (+ lyrics)
 WAVE_STAGGER = _env(float, 2.0, "WAVE_STAGGER")                 # next wave starts after this even if ACR is slow
 GIVEUP_AFTER = _env(int, 4, "GIVEUP_AFTER")                     # ACR heard this many pieces and knows nothing -> no more plain pieces
-SHAZAM_GRACE = _env(float, 3.0, "SHAZAM_GRACE")                 # only Shazam left and nothing to confirm: wait this long
+SHAZAM_GRACE = _env(float, 3.0, "SHAZAM_GRACE")                 # only Shazam left: wait for it at most this long
+SOFT_GRACE = _env(float, 1.0, "SOFT_GRACE")                     # ... but only this long when ACR already gave a decent answer
+VARIANT_EARLY = _env(float, 1.2, "VARIANT_EARLY")               # filtered variants are prepared after this many seconds
 ACR_THREADS = _env(int, 32, "ACR_THREADS", "ENGINE_THREADS")
 ACR_BUDGET = _env(int, 14, "ACR_BUDGET")                        # max ACR pieces (= quota) per request
 LOCAL_TIMEOUT = _env(int, 8, "LOCAL_TIMEOUT")
 LOCAL_MIN_AGREE = _env(int, 2, "LOCAL_MIN_AGREE")               # own DB: pieces that must agree
 LOCAL_SOLO_SCORE = _env(float, 40.0, "LOCAL_SOLO_SCORE")        # own DB: one piece is enough above this score
 LOCAL_WEAK_W = _env(float, 0.7, "LOCAL_WEAK_W")                 # vote weight of a weak DB answer
-LYRICS_ENGINE = _flag("LYRICS_ENGINE", True)                    # needs faster-whisper
+LYRICS_ENGINE = _flag("LYRICS_ENGINE", False)                   # needs faster-whisper; off = faster answers
 LYRICS_EARLY = _env(float, 3.0, "LYRICS_EARLY")                 # lyrics start in parallel after this many seconds
-LYRICS_TIMEOUT = _env(int, 40, "LYRICS_TIMEOUT")
+LYRICS_TIMEOUT = _env(int, 15, "LYRICS_TIMEOUT")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")        # "small" is much better for singing / Persian
 WHISPER_LANG = os.environ.get("WHISPER_LANG", "").strip() or None   # e.g. fa / en; empty = auto detect
 WHISPER_WAIT = _env(int, 25, "WHISPER_WAIT")
 WHISPER_THREADS = _env(int, 4, "WHISPER_THREADS")
 WHISPER_PRELOAD = _flag("WHISPER_PRELOAD", True)                # load the model at start, not on the first request
 HUM_MIN_SCORE = _env(int, 30, "HUM_MIN_SCORE")                  # ACR humming guesses below this are ignored
-STRICT = _flag("STRICT", True)                                  # unconfirmed answer -> None
+STRICT = _flag("STRICT", True)                                  # unconfirmed answer -> None (unless SOFT_ACCEPT)
+SOFT_ACCEPT = _flag("SOFT_ACCEPT", True)                        # an unconfirmed but decent answer is still returned
+SOFT_W = _env(float, 0.75, "SOFT_W")                            # normal ACR / Shazam match: weight needed (= score / 100)
+SOFT_HUM_W = _env(float, 0.80, "SOFT_HUM_W")                    # melody-only guess: weight needed
 SOLO_ACCEPT = _flag("SOLO_ACCEPT", True)                        # 1-piece clip: one very sure engine is enough
 SOLO_W = _env(float, 0.95, "SOLO_W")
 SINGLE_STRONG = _flag("SINGLE_STRONG", True)                    # one extremely sure answer is enough (no rival)
 SINGLE_W = _env(float, 0.98, "SINGLE_W")
 LOCAL_FIRST = _flag("LOCAL_FIRST", False)
 
-SHAZAM_TIMEOUT = _env(int, 10, "SHAZAM_TIMEOUT")
+# ACR confirmation by repetition (same song named again and again by ACR on the clip and its variants)
+REPEAT_MIN_HITS = _env(int, 2, "REPEAT_MIN_HITS")               # normal ACR matches needed ...
+REPEAT_MIN_W = _env(float, 0.6, "REPEAT_MIN_W")                 # ... and the best one must reach this weight
+HUM_PIECES_MIN = _env(int, 2, "HUM_PIECES_MIN")                 # melody matches: this many DIFFERENT pieces ...
+HUM_PIECES_W = _env(float, 0.75, "HUM_PIECES_W")                # ... each with at least this weight
+HUM_HITS_MIN = _env(int, 3, "HUM_HITS_MIN")                     # or this many melody matches (any piece) ...
+HUM_HITS_W = _env(float, 0.85, "HUM_HITS_W")                    # ... each with at least this weight
+
+SHAZAM_TIMEOUT = _env(int, 7, "SHAZAM_TIMEOUT")
 SHAZAM_MAX_FAILS = _env(int, 3, "SHAZAM_MAX_FAILS")
 SHAZAM_PAUSE = _env(int, 300, "SHAZAM_PAUSE")
 SHAZAM_THREADS = max(_env(int, 3, "SHAZAM_THREADS"), 1)         # parallel Shazam requests (one event loop each)
@@ -129,7 +150,7 @@ SECOND_PIECES = _env(int, 1, "SECOND_CHANCE_PIECES")            # how many piece
 VARIANT_ENGINE_N = _env(int, 4, "VARIANT_ENGINE_PIECES")        # variants sent to the engines (the DB gets all)
 SILENT_DB = _env(float, -48.0, "SILENT_DB")                     # pieces quieter than this are not sent
 CACHE_TTL = _env(int, 3 * 86400, "RECOG_CACHE_TTL")
-NEG_TTL = _env(int, 600, "RECOG_NEG_TTL")                       # "not found" is remembered this long
+NEG_TTL = _env(int, 300, "RECOG_NEG_TTL")                       # "not found" is remembered this long
 CACHE_MAX = _env(int, 2000, "RECOG_CACHE_MAX")
 FFMPEG = shutil.which("ffmpeg")
 
@@ -272,6 +293,7 @@ def is_rejected(song: dict, rejected) -> bool:
 _local_fn = None
 _LOCAL_POOL = ThreadPoolExecutor(max_workers=_env(int, 8, "LOCAL_THREADS"), thread_name_prefix="local")
 _AUDIO_POOL = ThreadPoolExecutor(max_workers=_env(int, 6, "AUDIO_THREADS"), thread_name_prefix="audio")  # ffmpeg
+_VAR_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="variants")
 _MAIN_POOL = ThreadPoolExecutor(max_workers=_env(int, 32, "MAIN_THREADS"), thread_name_prefix="recog")
 _LYR_EXEC = ThreadPoolExecutor(max_workers=2, thread_name_prefix="lyrics")
 
@@ -525,7 +547,7 @@ def _hum_score(h: dict) -> float:
 
 def _parse(md: dict) -> list:
     """ACR answer -> candidates. "w" = vote weight: ACR's score, 2nd / 3rd candidates count half; a humming
-    (melody) guess weighs less and can never confirm a song by itself."""
+    (melody) guess weighs less and is only trusted through the repetition rules of _rank()."""
     cands = []
     for m in (md.get("music") or [])[:3]:
         if not m.get("title"):
@@ -782,9 +804,12 @@ def _rank(hits: list, solo: bool = False) -> list:
       - two different engines name it, or
       - two different REAL pieces name it with a real (non-humming) match, or
       - ONE non-humming answer is extremely sure (weight >= SINGLE_W), or the DB is sure (score), or
-      - the clip has only one piece and one answer is very sure (solo).
-    Lyrics count as an engine only when another engine named the song with weight >= 0.8; a melody (humming)
-    guess alone is never solid."""
+      - the clip has only one piece and one answer is very sure (solo), or
+      - ACR names it at least REPEAT_MIN_HITS times as a normal first answer (the clip and its variants), or
+      - ACR melody (humming) matches agree: HUM_PIECES_MIN different pieces (weight >= HUM_PIECES_W) or
+        HUM_HITS_MIN matches (weight >= HUM_HITS_W).
+    Lyrics count as an engine only when another engine named the song with weight >= 0.8; a single melody
+    (humming) guess alone is never solid (see _soft_ok for the softer rule)."""
     clusters = []
     for h in hits:
         for c in clusters:
@@ -811,8 +836,18 @@ def _rank(hits: list, solo: bool = False) -> list:
                        for h in first)
         sure_solo = SOLO_ACCEPT and solo and any(h["song"]["w"] >= SOLO_W and h["piece"] < _PSEUDO for h in first)
         sure_db = any(h["song"].get("sure") for h in hs)
+        # ACR named the same song again and again (the clip and its variants count as separate answers here)
+        acr_first = [h for h in first if h["song"].get("engine") == "acr"]
+        sure_repeat = (len(acr_first) >= REPEAT_MIN_HITS
+                       and max(h["song"]["w"] for h in acr_first) >= REPEAT_MIN_W)
+        # ACR melody (humming) matches: several different pieces, or several strong matches
+        hum_hits = [h for h in hs if h["song"].get("hum") and h["song"]["rank"] == 0 and h["piece"] < _PSEUDO]
+        hum_pieces = {h["piece"] for h in hum_hits if h["song"]["w"] >= HUM_PIECES_W}
+        hum_strong = [h for h in hum_hits if h["song"]["w"] >= HUM_HITS_W]
+        sure_hum = len(hum_pieces) >= HUM_PIECES_MIN or len(hum_strong) >= HUM_HITS_MIN
         c["engines"] = engs
-        c["solid"] = len(voting) >= 2 or len(real_pieces) >= 2 or sure_one or sure_solo or sure_db
+        c["solid"] = (len(voting) >= 2 or len(real_pieces) >= 2 or sure_one or sure_solo or sure_db
+                      or sure_repeat or sure_hum)
         c["score"] = score * mult
         c["bad"] = mult < 1
         c["first"] = first
@@ -827,12 +862,9 @@ def _rank(hits: list, solo: bool = False) -> list:
     return clusters
 
 
-def _confident(ranked: list) -> bool:
-    """Accuracy first. The top answer must be confirmed, must not look like a remix / mashup, and must have no
-    real competitor. A remix / live / cover that came up beside the original is NOT a competitor; a rival song
-    blocks only when it is confirmed too (and not far weaker) or nearly as strong."""
-    if not ranked or ranked[0]["bad"] or not ranked[0]["solid"]:
-        return False
+def _rival_free(ranked: list) -> bool:
+    """No real competitor for the top answer. A remix / live / cover that came up beside the original is NOT a
+    competitor; a rival song blocks only when it is confirmed too (and not far weaker) or nearly as strong."""
     top = ranked[0]
     for other in ranked[1:]:
         if other["bad"] and not other["solid"]:
@@ -842,6 +874,31 @@ def _confident(ranked: list) -> bool:
         if other["solid"] or other["score"] >= top["score"] * 0.75:
             return False
     return True
+
+
+def _confident(ranked: list) -> bool:
+    """The top answer is confirmed, does not look like a remix / mashup, and has no real competitor."""
+    if not ranked or ranked[0]["bad"] or not ranked[0]["solid"]:
+        return False
+    return _rival_free(ranked)
+
+
+def _soft_ok(ranked: list, allow_hum: bool = True) -> bool:
+    """SOFT_ACCEPT: the top answer is not confirmed, but it is good enough to be returned: a decent first
+    answer of ACR / Shazam (weight >= SOFT_W), or - when allow_hum - a melody guess (weight >= SOFT_HUM_W),
+    from a real piece, no remix / cover, no real rival. Lyrics and a weak DB vote never count."""
+    if not SOFT_ACCEPT or not ranked or ranked[0]["bad"] or not _rival_free(ranked):
+        return False
+    for h in ranked[0]["hits"]:
+        s = h["song"]
+        if h["piece"] >= _PSEUDO or s.get("rank") != 0:
+            continue
+        if s.get("hum"):
+            if allow_hum and s["w"] >= SOFT_HUM_W:
+                return True
+        elif s["w"] >= SOFT_W:
+            return True
+    return False
 
 
 # --- audio helpers: loudness order, filtered variants (second chance)
@@ -991,7 +1048,7 @@ def _check_user(user_id):
                 _USER_HITS.pop(k, None)
 
 
-# --- what the singer says (needs faster-whisper and the bot's words_fn)
+# --- what the singer says (optional: LYRICS_ENGINE=1, needs faster-whisper and the bot's words_fn)
 _words_fn = None
 _WHISPER = {"model": None}
 _WHISPER_LOCK = threading.Lock()
@@ -1005,6 +1062,16 @@ def _whisper_model():
     return _WHISPER["model"]
 
 
+def _pcm16k(path: str):
+    """Decodes a piece with ffmpeg (no PyAV needed) -> float32 mono 16 kHz numpy array, or None."""
+    import numpy as np
+    r = subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-i", path, "-f", "f32le", "-ac", "1",
+                        "-ar", "16000", "-"], capture_output=True, timeout=30)
+    if r.returncode != 0 or not r.stdout:
+        return None
+    return np.frombuffer(r.stdout, dtype=np.float32)
+
+
 def transcribe(path: str, cancel=None) -> str:
     try:
         import faster_whisper  # noqa: F401
@@ -1016,11 +1083,20 @@ def transcribe(path: str, cancel=None) -> str:
     try:
         if cancel is not None and cancel.is_set():
             return ""
+        audio = path
+        if FFMPEG:                                       # our own decoding: independent of the installed PyAV version
+            try:
+                audio = _pcm16k(path)
+            except Exception as e:
+                log.info("lyrics: ffmpeg decoding failed (%s), letting whisper read the file", e)
+                audio = path
+            if audio is None:
+                return ""
         kw = dict(vad_filter=False, beam_size=3, temperature=0.0, condition_on_previous_text=False,
                   no_speech_threshold=0.4, compression_ratio_threshold=2.2)
         if WHISPER_LANG:
             kw["language"] = WHISPER_LANG
-        segs, info = _whisper_model().transcribe(path, **kw)
+        segs, info = _whisper_model().transcribe(audio, **kw)
         if not WHISPER_LANG and (getattr(info, "language_probability", 1.0) or 0) < 0.45:
             return ""                                   # unsure about the language = it is not really speech
         out, last = [], None
@@ -1090,13 +1166,16 @@ def _ask_engines_core(paths, rejected, cancel, engines, full, extra, meta):
       - wave 1 (3 pieces) goes out at once; the next wave starts when the FAST engines (ACR / AudD) of the
         running pieces have answered, or after WAVE_STAGGER s - never after a slow Shazam
       - votes are counted as answers arrive; the round stops the moment the answer is confirmed
+      - when only a slow Shazam is left, it is waited for SHAZAM_GRACE s at most (SOFT_GRACE s when ACR already
+        gave a decent answer)
       - ACR heard GIVEUP_AFTER pieces and knows nothing -> no more plain pieces (saves quota)
-    With full=True and nothing confirmed (phase B):
-      - lyrics (what the singer says) run in PARALLEL from LYRICS_EARLY seconds on
+    With full=True and nothing confirmed / decent after the first round (phase B):
       - the best piece again as denoised / speed-corrected / tempo-shifted variants (variants of one piece count
-        as ONE piece, so a wrong match can not confirm itself); the own DB gets ALL variants too (free)
+        as ONE piece for the normal rules, so a wrong match can not confirm itself); the own DB gets ALL
+        variants too (free). The variants are prepared in the background while the first round still runs.
+      - lyrics (what the singer says) run in PARALLEL when LYRICS_ENGINE=1
     `extra` is a live list of votes from elsewhere (the weak answer of the own DB). `cancel` stops everything.
-    STRICT=1 (default): at the end the best answer must be 'solid' (confirmed), otherwise "not found"."""
+    At the end the best answer must be 'solid' (confirmed) or, with SOFT_ACCEPT, 'decent' (see _soft_ok)."""
     engines = tuple(e for e in engines if e != "audd" or AUDD_TOKEN)
     hits = []
     st = {e: {"answered": 0, "failed": 0} for e in ("acr", "shazam", "audd")}
@@ -1104,6 +1183,7 @@ def _ask_engines_core(paths, rejected, cancel, engines, full, extra, meta):
     solo = len(paths) == 1
     quit_ev = threading.Event()          # set when the round is over: stops whisper and queued work
     lyr = {"f": None}
+    var = {"f": None, "tmp": None}       # the filtered variants, made in the background
     side = {}                            # future -> (piece, engine, box): lyrics / own-DB variants (no quota)
     t_start = time.time()
 
@@ -1149,6 +1229,12 @@ def _ask_engines_core(paths, rejected, cancel, engines, full, extra, meta):
         lyr["f"] = _LYR_EXEC.submit(_timed, box, _lyrics_identify, paths, quit_ev)
         side[lyr["f"]] = (99, "lyrics", box)
 
+    def start_variants():
+        if var["f"] is not None or not (full and SECOND_CHANCE and FFMPEG) or quit_ev.is_set():
+            return
+        var["tmp"] = tempfile.mkdtemp(prefix="recog_")
+        var["f"] = _VAR_POOL.submit(_make_variants, paths[:max(SECOND_PIECES, 1)], var["tmp"])
+
     def absorb(key, res):
         gid, eng, _ = key
         if eng == "lyrics":
@@ -1193,6 +1279,8 @@ def _ask_engines_core(paths, rejected, cancel, engines, full, extra, meta):
                 now = time.time()
                 if full and now - t_start >= LYRICS_EARLY:
                     start_lyrics()
+                if full and var["f"] is None and now - t_start >= VARIANT_EARLY and not _soft_ok(ranked_now(), False):
+                    start_variants()                         # prepare the filtered variants while ACR / Shazam work
                 for f, k in side.items():
                     pending.setdefault(f, k)
                 for f, k in list(pending.items()):          # too slow: stop waiting for it
@@ -1213,10 +1301,13 @@ def _ask_engines_core(paths, rejected, cancel, engines, full, extra, meta):
                         continue
                 if not (core or (wait_side and pending)):
                     break
-                only_slow = core and all(e == "shazam" for e in core) and s["next"] >= len(waves)
-                if only_slow and not ranked_now() and not (wait_side and any(k[1] not in st for k in pending.values())):
-                    s["shaz"] = s["shaz"] or now             # only a slow Shazam is left and there is nothing to confirm
-                    if now - s["shaz"] >= SHAZAM_GRACE:
+                # only a slow Shazam is left (and a fast engine is in play): wait for it only a little
+                only_slow = (core and all(e == "shazam" for e in core) and s["next"] >= len(waves)
+                             and any(e in FAST_ENGINES for e in engines))
+                if only_slow and not (wait_side and any(k[1] not in st for k in pending.values())):
+                    s["shaz"] = s["shaz"] or now
+                    grace = SOFT_GRACE if _soft_ok(ranked_now(), False) else SHAZAM_GRACE
+                    if now - s["shaz"] >= grace:
                         break
                 else:
                     s["shaz"] = None
@@ -1247,28 +1338,30 @@ def _ask_engines_core(paths, rejected, cancel, engines, full, extra, meta):
         drive(waves, ROUND_TIMEOUT, False)
         ranked = ranked_now()
 
-        if full and not _confident(ranked) and not cancelled():
+        # nothing confirmed and no decent normal answer yet -> the second chance (filtered variants)
+        if full and not _confident(ranked) and not cancelled() and not _soft_ok(ranked, False):
             start_lyrics()
-            tmp, waves_b = None, []
+            waves_b = []
             try:
-                if SECOND_CHANCE and FFMPEG:
-                    tmp = tempfile.mkdtemp(prefix="recog_")
-                    vp, vg = _make_variants(paths[:max(SECOND_PIECES, 1)], tmp)
-                    if vp:
-                        log.info("second chance: %d variants", len(vp))
-                    if _local_fn:
-                        for v in vp:                         # the own DB is free: it gets every variant
-                            box = {"t": None, "sub": time.time()}
-                            side[_LOCAL_POOL.submit(_timed, box, _local_one, v)] = (98, "local", box)
-                    if answered() > 0:                       # engines are up: send the first variants to them
-                        pairs = list(zip(vp, vg))[:VARIANT_ENGINE_N]
-                        waves_b = [pairs[i:i + 3] for i in range(0, len(pairs), 3)]
+                start_variants()
+                vp, vg = [], []
+                if var["f"] is not None:
+                    try:
+                        vp, vg = var["f"].result(timeout=15)
+                    except Exception as e:
+                        log.warning("variants failed: %s", e)
+                if vp:
+                    log.info("second chance: %d variants", len(vp))
+                if vp and _local_fn:
+                    for v in vp:                             # the own DB is free: it gets every variant
+                        box = {"t": None, "sub": time.time()}
+                        side[_LOCAL_POOL.submit(_timed, box, _local_one, v)] = (98, "local", box)
+                if vp and answered() > 0:                    # engines are up: send the first variants to them
+                    pairs = list(zip(vp, vg))[:VARIANT_ENGINE_N]
+                    waves_b = [pairs[i:i + 3] for i in range(0, len(pairs), 3)]
                 drive(waves_b, PHASE_B_TIMEOUT, True)
             except Exception as e:
                 log.warning("second chance failed: %s", e)
-            finally:
-                if tmp:
-                    shutil.rmtree(tmp, ignore_errors=True)
             ranked = ranked_now()
 
         if meta is not None:
@@ -1283,12 +1376,20 @@ def _ask_engines_core(paths, rejected, cancel, engines, full, extra, meta):
             log.info("recognize: nothing")
             _count("not_found")
             return None
+        # per song: title, artist, score, solid?, engines, [(piece, melody?, rank, weight) of every answer]
         log.info("recognize: %s", [(c["song"].get("title"), c["song"].get("artist"), round(c["score"], 2), c["solid"],
-                                   sorted(e for e in c["engines"] if e)) for c in ranked[:3]])
+                                   sorted(e for e in c["engines"] if e),
+                                   [(h["piece"], bool(h["song"].get("hum")), h["song"]["rank"],
+                                     round(h["song"]["w"], 2)) for h in c["hits"]])
+                                  for c in ranked[:3]])
         if STRICT and not ranked[0]["solid"]:
-            log.info("recognize: best answer is not confirmed, STRICT is on -> not found")
-            _count("unconfirmed")
-            return None
+            if _soft_ok(ranked, True):
+                log.info("recognize: not confirmed but decent -> answered (SOFT_ACCEPT)")
+                _count("soft_accept")
+            else:
+                log.info("recognize: best answer is not confirmed, STRICT is on -> not found")
+                _count("unconfirmed")
+                return None
         _count("found")
         drop = ("rank", "w", "hum", "score", "sure")
         top = {k: v for k, v in ranked[0]["song"].items() if k not in drop}
@@ -1300,6 +1401,9 @@ def _ask_engines_core(paths, rejected, cancel, engines, full, extra, meta):
         return top
     finally:
         quit_ev.set()
+        if var["f"] is not None:                 # remove the variant files as soon as their making is over
+            tmp_dir = var["tmp"]
+            var["f"].add_done_callback(lambda _f: shutil.rmtree(tmp_dir, ignore_errors=True))
 
 
 # --- public API
@@ -1349,9 +1453,10 @@ def _engines_entry(paths, rejected, cancel, user_id, extra, pre_ordered):
 
 def ask_engines(paths: list, rejected: set = frozenset(), cancel=None, user_id=None):
     """ACRCloud + Shazam (+ AudD) voting WITHOUT the own DB (costs quota): loudest pieces first, silence dropped;
-    when nothing is confirmed: lyrics in parallel, denoised / speed-corrected variants. Raises NoAccounts (and
-    RateLimited when user_id is given). The answer has "engine" ("acr", "shazam", "acr+shazam"...) and
-    "piece_path". The same audio asked again is answered from a cache ("wrong song" evicts the rejected answer)."""
+    when nothing is confirmed: denoised / speed-corrected variants (lyrics when LYRICS_ENGINE=1). Raises
+    NoAccounts (and RateLimited when user_id is given). The answer has "engine" ("acr", "shazam", "acr+shazam"...)
+    and "piece_path". The same audio asked again is answered from a cache ("wrong song" evicts the rejected
+    answer)."""
     return _engines_entry(paths, set(rejected), cancel, user_id, None, False)
 
 
@@ -1422,7 +1527,7 @@ def accounts_status() -> list:
 
 
 def stats() -> dict:
-    """Counters since start (found / not_found / unconfirmed / cache_hit / acr_calls / acr_quota ...)."""
+    """Counters since start (found / not_found / unconfirmed / soft_accept / cache_hit / acr_calls / acr_quota ...)."""
     with _CACHE_LOCK:
         size = len(_CACHE)
     return {"counters": dict(_STAT), "cache_size": size, "shazam": shazam_status(), "acr": accounts_status(),
@@ -1446,13 +1551,25 @@ def _selftest():
     assert is_rejected({"title": "Crazy", "artist": "Gnarls Barkley"}, {gb})
     assert not is_rejected({"title": "Crazy", "artist": "Patsy Cline"}, {gb})
     weak = [{"piece": 0, "song": S("A Long Song", "X", "acr", 0.9)}]
-    assert not _confident(_rank(weak))                                  # one engine, one piece, score 90: not enough
+    assert not _confident(_rank(weak))                                  # one engine, one piece, score 90: not confirmed
+    assert _soft_ok(_rank(weak), False)                                 # ... but decent: answered right after round 1
     assert _confident(_rank([{"piece": 0, "song": S("A Long Song", "X", "acr", 0.99)}]))   # ONE extremely sure answer
     assert _confident(_rank([{"piece": 0, "song": S("A Long Song", "X", "acr", 0.96)}], solo=True))   # 1-piece clip
     two = weak + [{"piece": 0, "song": S("A Long Song", "X", "shazam", 0.99)}]
     assert _confident(_rank(two))                                       # two engines agree
     hum = [{"piece": 0, "song": S("A Long Song", "X", "acr", 0.99, hum=True)}]
-    assert not _confident(_rank(hum))                                   # a humming guess alone is never solid
+    assert not _confident(_rank(hum))                                   # a single humming guess is never solid
+    humrep = [{"piece": 0, "song": S("A Long Song", "X", "acr", w, hum=True)} for w in (0.86, 0.9, 0.89)]
+    assert _confident(_rank(humrep))                                    # three strong melody matches
+    assert not _confident(_rank(humrep[:2]))                            # two matches of ONE piece are not enough
+    humtwo = [{"piece": 0, "song": S("A Long Song", "X", "acr", 0.8, hum=True)},
+              {"piece": 1, "song": S("A Long Song", "X", "acr", 0.78, hum=True)}]
+    assert _confident(_rank(humtwo))                                    # two different pieces agree on the melody
+    humweak = [{"piece": 0, "song": S("A Long Song", "X", "acr", 0.7, hum=True)} for _ in range(3)]
+    assert not _confident(_rank(humweak))                               # weak melody matches never confirm
+    acr2 = [{"piece": 0, "song": S("A Long Song", "X", "acr", 0.7)},
+            {"piece": 0, "song": S("A Long Song", "X", "acr", 0.65)}]
+    assert _confident(_rank(acr2))                                      # ACR repeats the same normal answer
     lyr = [{"piece": 0, "song": S("A Long Song", "X", "acr", 0.6)}, {"piece": 99, "song": S("A Long Song", "X", "lyrics", 0.7)}]
     assert not _confident(_rank(lyr))                                   # lyrics + a weak hit never confirm
     lyr2 = [{"piece": 0, "song": S("A Long Song", "X", "acr", 0.9)}, {"piece": 99, "song": S("A Long Song", "X", "lyrics", 0.7)}]
@@ -1465,6 +1582,18 @@ def _selftest():
     assert not _confident(_rank(rival))                                 # a confirmed rival blocks
     remix = two + [{"piece": 1, "song": S("A Long Song (Remix)", "X", "acr", 0.9)}]
     assert _confident(_rank(remix))                                     # a remix beside the original does not
+    remix_hum = humrep + [{"piece": 0, "song": S("Other (Slowed & Reverb)", "Y", "acr", w, hum=True)} for w in (0.76, 0.81)]
+    assert _confident(_rank(remix_hum))                                 # the real case: melody match + slowed remix beside it
+    # soft acceptance
+    assert not _soft_ok(_rank([{"piece": 0, "song": S("A Long Song", "X", "acr", 0.7)}]), True)       # too weak
+    h1 = [{"piece": 0, "song": S("A Long Song", "X", "acr", 0.85, hum=True)}]
+    assert not _soft_ok(_rank(h1), False) and _soft_ok(_rank(h1), True)    # melody guess: only after the second chance
+    assert not _soft_ok(_rank([{"piece": 0, "song": S("A Long Song", "X", "acr", 0.7, hum=True)}]), True)
+    two_songs = weak + [{"piece": 0, "song": S("Other Thing", "Y", "acr", 0.85)}]
+    assert not _soft_ok(_rank(two_songs), False)                        # a close rival blocks
+    assert not _soft_ok(_rank([{"piece": 0, "song": S("A Long Song (Remix)", "X", "acr", 0.9)}]), True)   # remix: never
+    assert not _soft_ok(_rank([{"piece": 99, "song": S("A Long Song", "X", "lyrics", 0.9)}]), True)       # lyrics: never
+    assert _soft_ok(_rank(h1 + [{"piece": 0, "song": S("Other (Slowed & Reverb)", "Y", "acr", 0.8, hum=True)}]), True)
     assert _check_user(None) is None
     assert len(_VARIANTS) == 6 and "asetrate=35280" in _VARIANTS[1][1]
     print("selftest ok")
