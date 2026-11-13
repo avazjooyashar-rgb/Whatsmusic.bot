@@ -1077,6 +1077,50 @@ def to_mp3(src: str) -> str:
     return out
 
 
+def _is_sc_url(t: str) -> bool:
+    return bool(URL_RE.match(t or "")) and host_in(t, ("soundcloud.com",))
+
+
+def _sc_url_name(t: str):
+    """soundcloud.com/artist/track-name -> "artist track name" (a search text), None for anything else."""
+    if not _is_sc_url(t):
+        return None
+    try:
+        parts = [p for p in urlparse(t).path.split("/") if p]
+    except Exception:
+        return None
+    if len(parts) < 2 or parts[1] in ("sets", "albums", "likes", "reposts", "tracks"):
+        return None
+    return f"{parts[0]} {parts[1]}".replace("-", " ").replace("_", " ")
+
+
+def _clean_dir(outdir: str):
+    for f in glob.glob(f"{outdir}/*"):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+
+
+def _soundcloud_fallback(name: str, opts: dict, run, outdir: str):
+    """Searches SoundCloud and takes the first result that can really be downloaded: DRM / Go+ tracks and
+    other unavailable results are skipped (the old scsearch1 failed on the very first protected result)."""
+    with yt_dlp.YoutubeDL({**ydl_base(), "extract_flat": True, "skip_download": True}) as ydl:
+        items = ydl.extract_info(f"scsearch5:{name}", download=False).get("entries") or []
+    last = None
+    for it in items:
+        u = (it or {}).get("webpage_url") or (it or {}).get("url")
+        if not u:
+            continue
+        try:
+            return run(u, opts)
+        except Exception as e:
+            last = e
+            log.info("soundcloud result skipped: %s", str(e)[:150])
+            _clean_dir(outdir)
+    raise last or RuntimeError("track not found on soundcloud")
+
+
 def download_audio(target: str, outdir: str, fallback=None):
     """Max CLIP_MAX_SEC and 48 MB: anything longer can never be sent to Telegram anyway."""
     target = normalize_target(target)
@@ -1115,11 +1159,27 @@ def download_audio(target: str, outdir: str, fallback=None):
 
     try:
         info = attempt(target)
-    except Exception as e:
-        if not fallback:
+    except Exception as first_err:
+        # the REAL reason is logged in full (a sign-in / cookie problem looks different from DRM or geo-block)
+        log.warning("download failed for %s: %s", target, str(first_err)[:400])
+        name = fallback or _sc_url_name(target)
+        if not name:
             raise
-        log.warning("youtube failed (%s), trying soundcloud", str(e)[:80])
-        info = run(f"scsearch1:{fallback}", plain)
+        _clean_dir(outdir)
+        info = None
+        if _is_sc_url(target):          # a SoundCloud link that cannot be downloaded (DRM...): same song on YouTube
+            try:
+                info = run(f"ytsearch1:{name}", plain)
+            except Exception as e2:
+                log.warning("youtube search fallback failed: %s", str(e2)[:300])
+                _clean_dir(outdir)
+        if info is None:
+            log.info("trying soundcloud search for: %s", name)
+            try:
+                info = _soundcloud_fallback(name, plain, run, outdir)
+            except Exception as e3:
+                log.warning("soundcloud fallback failed: %s", str(e3)[:300])
+                raise first_err
     files = [f for f in glob.glob(f"{outdir}/*") if not f.endswith((".part", ".ytdl", ".json", ".aria2"))]
     if not files:
         raise RuntimeError("audio file was not created")
@@ -2245,7 +2305,33 @@ async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
     log.error("update error", exc_info=ctx.error)
 
 
+def cookie_report():
+    """Logs once at start what cookies.txt holds. It does NOT prove the cookies still work:
+    test with  yt-dlp --cookies cookies.txt -F <youtube link>"""
+    if not os.path.exists(COOKIES):
+        log.warning("cookies: %s not found (YouTube may ask to sign in, Instagram posts need it)", COOKIES)
+        return
+    try:
+        jar = http.cookiejar.MozillaCookieJar(COOKIES)
+        jar.load(ignore_discard=True, ignore_expires=True)
+    except Exception as e:
+        log.warning("cookies: %s could not be read: %s", COOKIES, e)
+        return
+    now = time.time()
+
+    def state(domain: str, names) -> str:
+        found = [c for c in jar if domain in (c.domain or "") and c.name in names]
+        if not found:
+            return "missing"
+        return "ok" if any(not c.expires or c.expires > now for c in found) else "EXPIRED"
+
+    log.info("cookies: file %.0f h old | youtube login: %s | instagram sessionid: %s",
+             (now - os.path.getmtime(COOKIES)) / 3600,
+             state("youtube.com", {"SID", "__Secure-3PSID", "LOGIN_INFO"}), state("instagram.com", {"sessionid"}))
+
+
 async def post_init(app: Application):
+    cookie_report()
     app.bot_data["maintenance"] = asyncio.create_task(maintenance_loop())
 
 
