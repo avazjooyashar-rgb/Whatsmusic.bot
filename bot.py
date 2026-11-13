@@ -2305,6 +2305,74 @@ async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
     log.error("update error", exc_info=ctx.error)
 
 
+COOKIE_MAX_BYTES = 256 * 1024
+_YT_LOGIN_COOKIES = {"SID", "__Secure-3PSID", "__Secure-1PSID", "LOGIN_INFO"}
+
+
+def parse_cookie_file(text: str):
+    """Checks a Netscape cookies.txt. -> (cookie_rows, names, error). error is None when the file is usable."""
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    first = next((l for l in lines if l.strip()), "")
+    if not first.startswith(("# Netscape HTTP Cookie File", "# HTTP Cookie File")):
+        return 0, set(), "the first line must be '# Netscape HTTP Cookie File' (this is not a cookies.txt export)"
+    names, rows = set(), 0
+    for l in lines:
+        if not l.strip() or (l.startswith("#") and not l.startswith("#HttpOnly_")):
+            continue
+        parts = l.split("\t")
+        if len(parts) != 7:
+            return rows, names, f"a cookie line has {len(parts)} columns instead of 7 (the TABs were lost)"
+        rows += 1
+        names.add(parts[5])
+    if not rows:
+        return 0, names, "no cookies in the file"
+    return rows, names, None
+
+
+async def on_cookies_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin only: send a cookies.txt file to the bot in a private chat -> it replaces COOKIES_FILE.
+    The message with the file is deleted again (it holds a login)."""
+    msg = update.message
+    user = update.effective_user
+    if not msg or not msg.document or not user or user.id not in ADMIN_IDS:
+        return
+    doc = msg.document
+    name = (doc.file_name or "").lower()
+    if not (name.endswith(".txt") and "cookie" in name):
+        return
+    try:
+        if doc.file_size and doc.file_size > COOKIE_MAX_BYTES:
+            await msg.reply_text("❌ فایل خیلی بزرگ است (بیشتر از ۲۵۶ کیلوبایت).")
+            return
+        data = bytes(await (await doc.get_file()).download_as_bytearray())
+        text = data.decode("utf-8", "replace")
+        rows, names, err = parse_cookie_file(text)
+        if err:
+            await msg.reply_text(f"❌ ذخیره نشد: {err}")
+            return
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        tmp = COOKIES + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, COOKIES)
+        login = "ok" if names & _YT_LOGIN_COOKIES else "MISSING (لاگین یوتیوب در فایل نیست)"
+        await msg.reply_text(f"✅ cookies.txt ذخیره شد: {rows} کوکی | youtube login: {login}\n"
+                             "پیام فایل پاک شد. حالا یک آهنگ را امتحان کن.")
+        log.info("cookies.txt replaced by an admin upload: %d cookies, youtube login %s", rows, login[:2])
+    except Exception:
+        log.exception("cookies upload failed")
+        await msg.reply_text("❌ خطا در ذخیره‌ی فایل (لاگ سرور را ببین).")
+    finally:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+
 def cookie_report():
     """Logs once at start what cookies.txt holds. It does NOT prove the cookies still work:
     test with  yt-dlp --cookies cookies.txt -F <youtube link>"""
@@ -2373,6 +2441,7 @@ def main():
     app.add_handler(InlineQueryHandler(on_inline))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND | filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE, handle))
+    app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, on_cookies_file), group=3)
     app.add_error_handler(on_error)
     try:
         from admin import register as register_admin
@@ -2383,4 +2452,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()        
