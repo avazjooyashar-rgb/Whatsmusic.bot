@@ -1,11 +1,15 @@
 """
-Music recognition Telegram bot - v10 (clean)
+Music recognition Telegram bot - v11 (complete, with the whatsmusicbot-style "wrong song" list)
 
 Recognition (see recognition.py):
   1) own fingerprint DB (fp_engine): free, fast, knows remixes and special versions
   2) ACRCloud + Shazam vote together (several ACR accounts in priority order, Shazam with a circuit breaker);
      a song confirmed by two engines is learned by the own DB, so the next time it is answered for free
 Last resort when nothing is confirmed: lyrics (faster-whisper, optional) and cleaned / tempo-shifted audio.
+
+"Wrong song": the old answer stays, a NEW message with a vertical list of candidates appears
+("3:21 • Title - Artist"). Candidates: other engine answers, the name from the post, spelling variants / other
+versions / other songs of the same artist from iTunes (Deezer fallback). All free (no ACR quota).
 
 Sources: Instagram / YouTube links (clip + one tap to identify), voice / audio / video notes, streaming links
 (Spotify, Apple Music...), song names (search), pieces of lyrics (find the song by its words).
@@ -37,6 +41,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from urllib.parse import quote, urlparse, parse_qs
 
@@ -50,7 +55,7 @@ from telegram.ext import (Application, CommandHandler, MessageHandler, CallbackQ
                           InlineQueryHandler, filters, ContextTypes)
 
 import recognition
-from recognition import title_key, artist_set, same_song, is_variant, fold, first_artist
+from recognition import title_key, artist_set, same_song, is_variant, fold, first_artist, is_rejected
 
 try:  # python-telegram-bot >= 21
     from telegram import LinkPreviewOptions
@@ -94,6 +99,7 @@ RATE_LIMIT = _int("RATE_LIMIT", 10)
 DL_CONCURRENCY = _int("DL_CONCURRENCY", 4)
 CLIP_MAX_SEC = _int("CLIP_MAX_SEC", 900)         # longest clip / song that is downloaded
 MAX_SRC_SEC = _int("MAX_SRC_SEC", 3 * 3600)      # longest source that is scanned for recognition
+MAX_CANDS = _int("MAX_CANDS", 8)                 # buttons in the "wrong song" list
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
 SAMPLES_DIR = os.environ.get("SAMPLES_DIR", "samples")
@@ -116,7 +122,7 @@ PAGE = 8
 esc = html.escape
 
 PREP = {}    # sid -> {"task", "src", "created", "used", "busy", "song"}   (clips being prepared)
-CANDS = {}   # sid -> {"alts": [...], "created": ts}                        (other answers for "wrong song")
+CANDS = {}   # sid -> {"alts", "cur", "list", "created"}                    (answers for "wrong song")
 SEARCH = {}  # sid -> {"items": [...], "created": ts}                        (search result pages)
 
 HTTP = requests.Session()
@@ -176,6 +182,7 @@ STR = {
         "btn_more": "آهنگ‌های بیشتر",
         "no_music": "⚠️ آهنگ این پست پیدا نشد.",
         "slow": "⏳ یکم آروم‌تر، چند ثانیه صبر کن.",
+        "cand_title": "ممنون که خبر دادید!\nشاید یکی از این آهنگ‌ها باشد:",
     },
     "en": {
         "welcome": (
@@ -205,6 +212,7 @@ STR = {
         "btn_more": "More songs",
         "no_music": "⚠️ Couldn't find this post's music.",
         "slow": "⏳ Slow down a little, wait a few seconds.",
+        "cand_title": "Thanks for letting us know!\nMaybe it is one of these songs:",
     },
     "tr": {
         "welcome": (
@@ -234,6 +242,7 @@ STR = {
         "btn_more": "Daha fazla şarkı",
         "no_music": "⚠️ Bu gönderinin müziği bulunamadı.",
         "slow": "⏳ Biraz yavaş, birkaç saniye bekle.",
+        "cand_title": "Bildirdiğin için teşekkürler!\nBelki bu şarkılardan biridir:",
     },
     "ar": {
         "welcome": (
@@ -263,6 +272,7 @@ STR = {
         "btn_more": "المزيد من الأغاني",
         "no_music": "⚠️ لم يتم العثور على موسيقى هذا المنشور.",
         "slow": "⏳ على مهل قليلاً، انتظر بضع ثوانٍ.",
+        "cand_title": "شكراً لإبلاغنا!\nربما تكون إحدى هذه الأغاني:",
     },
     "ru": {
         "welcome": (
@@ -292,6 +302,7 @@ STR = {
         "btn_more": "Ещё песни",
         "no_music": "⚠️ Не удалось найти музыку этого поста.",
         "slow": "⏳ Помедленнее, подожди несколько секунд.",
+        "cand_title": "Спасибо, что сообщили!\nВозможно, это одна из этих песен:",
     },
 }
 
@@ -608,7 +619,9 @@ def set_last(sid: str, song: dict):
 
 
 def remember_alts(sid: str, song: dict):
-    CANDS[sid] = {"alts": song.pop("alts", None) or [], "created": time.time()}
+    """Keeps the other answers (and the shown one) for the "wrong song" list."""
+    alts = song.pop("alts", None) or []
+    CANDS[sid] = {"alts": alts, "cur": dict(song), "list": [], "created": time.time()}
 
 
 def save_meta(sid: str, song: dict):
@@ -722,17 +735,18 @@ def _learn_async(paths, song):
 
 
 async def identify(uid: int, paths, rejected=()):
-    """Own DB first: no quota. ACRCloud + Shazam only when the DB does not know the song: costs 1 quota, refunded
-    when nothing is found or something breaks. -> song dict or None. Raises OutOfQuota / NoAccounts."""
+    """Own DB first: no quota. A weak DB match is not thrown away: it joins the ACRCloud + Shazam vote as one
+    more (lower weight) voter. The engines cost 1 quota, refunded when nothing is found or something breaks.
+    -> song dict or None. Raises OutOfQuota / NoAccounts."""
     rejected = set(rejected)
-    song = await asyncio.to_thread(recognition.ask_local, paths, rejected)
-    if song:
-        return song
+    strong, extra = await asyncio.to_thread(recognition.ask_local_full, paths, rejected)
+    if strong:
+        return strong
     if not await asyncio.to_thread(use_quota, uid):
         raise OutOfQuota()
     song = None
     try:
-        song = await asyncio.to_thread(recognition.ask_engines, paths, rejected)
+        song = await asyncio.to_thread(recognition.ask_engines, paths, rejected, None, None, extra)
     finally:
         if not song:  # not found, no account answered, or cancelled: the user did not get anything
             await asyncio.to_thread(refund_quota, uid)
@@ -1150,11 +1164,7 @@ def download_audio(target: str, outdir: str, fallback=None):
             if not ARIA2:
                 raise
             log.warning("aria2c download failed, retrying with the normal downloader")
-            for f in glob.glob(f"{outdir}/*"):
-                try:
-                    os.remove(f)
-                except OSError:
-                    pass
+            _clean_dir(outdir)
             return run(t, plain)
 
     try:
@@ -1906,6 +1916,7 @@ async def clip_from_cache(msg, src: str, hit, lang: str):
     sid = uuid.uuid4().hex[:10]
     await asyncio.to_thread(add_sample, sid, "", src)
     set_last(sid, {**song, "engine": "cache#0"})
+    CANDS[sid] = {"alts": [], "cur": dict(song), "list": [], "created": time.time()}
 
     async def prep():
         res = {"song": song, "audio": None, "blocked": False}
@@ -2024,6 +2035,7 @@ async def handle_media(msg, media, lang: str):
     if song:
         await asyncio.to_thread(add_sample, sid, "")
         set_last(sid, {**song, "engine": "cache#0"})
+        CANDS[sid] = {"alts": [], "cur": dict(song), "list": [], "created": time.time()}
     else:
         if (getattr(media, "file_size", 0) or 0) > 20 * 1024 * 1024:
             return await msg.reply_text(tr(lang, "err"))
@@ -2097,11 +2109,153 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ======================================================================================
+# "Wrong song": a vertical list of candidates (like whatsmusicbot)
+# ======================================================================================
+_CAND_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cands")
+
+
+def _itunes_songs(term: str, limit: int) -> list:
+    try:
+        r = HTTP.get("https://itunes.apple.com/search", timeout=6,
+                     params={"term": term, "media": "music", "entity": "song", "limit": limit})
+        rows = (r.json().get("results") or []) if r.ok else []
+    except Exception as e:
+        log.info("itunes candidates failed: %s", e)
+        return []
+    out = []
+    for x in rows:
+        if x.get("trackName") and x.get("artistName"):
+            ms = x.get("trackTimeMillis") or 0
+            out.append({"title": x["trackName"], "artist": x["artistName"], "dur": ms / 1000 or None,
+                        "link": None, "yt": None})
+    return out
+
+
+def _deezer_songs(term: str, limit: int) -> list:
+    try:
+        r = HTTP.get("https://api.deezer.com/search", params={"q": term, "limit": limit}, timeout=6)
+        rows = (r.json().get("data") or []) if r.ok else []
+    except Exception as e:
+        log.info("deezer candidates failed: %s", e)
+        return []
+    return [{"title": x["title"], "artist": (x.get("artist") or {}).get("name") or "",
+             "dur": x.get("duration") or None, "link": None, "yt": None} for x in rows if x.get("title")]
+
+
+def related_songs(base: dict) -> list:
+    """Catalog songs close to `base`: same title first (other spellings / versions), then the artist's others."""
+    artist, title = first_artist(base.get("artist")), base.get("title") or ""
+    f1 = _CAND_POOL.submit(_itunes_songs, f"{artist} {title}".strip(), 8)
+    f2 = _CAND_POOL.submit(_itunes_songs, artist, 12) if artist else None
+    res = f1.result() + (f2.result() if f2 else [])
+    if not res:
+        res = _deezer_songs(f"{artist} {title}".strip(), 8) + (_deezer_songs(artist, 12) if artist else [])
+    tk, ak = title_key(title), _ck(artist)
+
+    def closeness(s):
+        t = _sim(tk, title_key(s["title"]))
+        a = 1.0 if ak and ak in _ck(s["artist"]) else 0.0
+        return a * 2 + t
+    return sorted(res, key=closeness, reverse=True)
+
+
+def merge_candidates(*groups, rejected=()) -> list:
+    """Ordered and de-duplicated; songs the user already rejected are removed."""
+    out = []
+    for g in groups:
+        for s in g or []:
+            if not s or not s.get("title") or is_rejected(s, rejected):
+                continue
+            if any(same_song(s, o) for o in out):
+                continue
+            out.append({k: s.get(k) for k in SONG_KEYS})
+            if len(out) >= MAX_CANDS:
+                return out
+    return out
+
+
+def cand_label(c: dict) -> str:
+    d = ""
+    if c.get("dur"):
+        sec = int(c["dur"])
+        d = f"{sec // 60}:{sec % 60:02d} • "
+    return f"{d}{c['title']} — {c['artist']}"[:60]
+
+
+def cand_keyboard(sid: str, cands: list):
+    return Markup([[Btn(cand_label(c), callback_data=f"cand:{sid}:{i}")] for i, c in enumerate(cands)])
+
+
+def read_meta(sid: str):
+    try:
+        with open(os.path.join(SAMPLES_DIR, sid + ".json"), encoding="utf-8") as f:
+            m = json.load(f)
+        return {"title": m["title"], "artist": m["artist"], "link": m.get("link")}
+    except Exception:
+        return None
+
+
+async def show_candidates(q, sid: str, rejected: set, lang: str, paths: list):
+    """'Wrong song' pressed: the old answer stays, a NEW message with the list is sent."""
+    uid = q.from_user.id
+    await q.answer()
+    ent = CANDS.get(sid) or {}
+    cur = ent.get("cur")
+    alts = list(ent.get("alts") or [])
+    meta = read_meta(sid)
+    base = cur or (alts[0] if alts else None) or meta
+    related = await asyncio.to_thread(related_songs, base) if base else []
+    cands = merge_candidates(alts, [meta], related, rejected=rejected)
+
+    if len(cands) < 2 and paths:  # almost nothing to offer: ask the engines again, rejected songs excluded
+        async with chat_action(q.get_bot(), q.message.chat_id):
+            song, _why = await find_song(uid, paths, rejected=rejected)
+        if song:
+            cands = merge_candidates([song] + (song.get("alts") or []), cands, rejected=rejected)
+
+    if not cands:
+        return await q.message.reply_text(tr(lang, "no_more" if rejected else "not_found"))
+    CANDS[sid] = {"alts": [], "cur": cur, "list": cands, "created": time.time()}
+    await q.message.reply_text(tr(lang, "cand_title"), reply_markup=cand_keyboard(sid, cands))
+
+
+async def on_cand(q, data: str):
+    """A candidate was tapped: the list message becomes the result and its mp3 is sent."""
+    lang = await asyncio.to_thread(get_lang, q.from_user.id)
+    try:
+        _, sid, idx = data.split(":")
+    except ValueError:
+        return await q.answer()
+    lst = (CANDS.get(sid) or {}).get("list") or []
+    if not idx.isdigit() or int(idx) >= len(lst):
+        return await q.answer(tr(lang, "expired"), show_alert=True)
+    i = int(idx)
+    song = dict(lst[i])
+    await q.answer()
+    CANDS[sid] = {"alts": [c for j, c in enumerate(lst) if j != i],  # the rest stays for the next "wrong song"
+                  "cur": song, "list": [], "created": time.time()}
+    set_last(sid, {**song, "engine": "pick#0"})
+    with db() as c:
+        row = c.execute("SELECT src FROM samples WHERE id=?", (sid,)).fetchone()
+    src = row["src"] if row else None
+    task = asyncio.create_task(prepare_song_audio(song))
+    cap, kb = result_caption(song, src), result_keyboard(sid, song, lang)
+    try:
+        await q.edit_message_text(cap, parse_mode="HTML", reply_markup=kb, **NO_PREVIEW)
+    except Exception:
+        await q.message.reply_text(cap, parse_mode="HTML", reply_markup=kb, **NO_PREVIEW)
+    if src:
+        await asyncio.to_thread(clip_put, src, None, song)
+    async with chat_action(q.get_bot(), q.message.chat_id):
+        await send_audio_task(q.message, task, song, lang)
+
+
+# ======================================================================================
 # Buttons
 # ======================================================================================
 async def reidentify(q, sid: str, wrong: bool):
-    """'wrong song' (wrong=True) or 'identify' for a sample that is no longer in memory (wrong=False).
-    The wrong answer is rejected, then: other answers already known -> the name from the post -> ask again."""
+    """'wrong song' (wrong=True) -> the candidate list. 'identify' for a sample that is no longer in memory
+    (wrong=False) -> the pieces are recognized again."""
     uid = q.from_user.id
     lang = await asyncio.to_thread(get_lang, uid)
     if wrong:
@@ -2124,39 +2278,22 @@ async def reidentify(q, sid: str, wrong: bool):
             with db() as c:
                 c.execute("UPDATE samples SET tried=? WHERE id=?", (",".join("k:" + k for k in rejected), sid))
 
-    song = None
     if wrong:
-        alts = (CANDS.get(sid) or {}).get("alts") or []
-        while alts and not song:
-            cand = alts.pop(0)
-            if title_key(cand.get("title")) not in rejected:
-                song = cand
-    if not song and os.path.exists(mpath):
-        try:
-            with open(mpath, encoding="utf-8") as f:
-                m = json.load(f)
-            if title_key(m["title"]) not in rejected:
-                song = {"title": m["title"], "artist": m["artist"], "link": m.get("link"), "engine": "meta#0"}
-        except Exception:
-            song = None
+        return await show_candidates(q, sid, rejected, lang, paths)
 
-    if song:
-        await q.answer()
-    else:
-        if not paths:
-            return await q.answer(tr(lang, "no_result"), show_alert=True)
-        await q.answer()  # no text: the status at the top of the chat shows the progress
-        async with chat_action(q.get_bot(), q.message.chat_id):
-            song, why = await find_song(uid, paths, rejected=rejected)
-        if not song:
-            key = {"quota": "quota_short", "busy": "err", "none": "no_more" if rejected else "not_found"}[why]
-            return await q.message.reply_text(tr(lang, key))
-        remember_alts(sid, song)
-
+    await q.answer()  # no text: the status at the top of the chat shows the progress
+    if not paths:
+        return await q.message.reply_text(tr(lang, "no_result"))
+    async with chat_action(q.get_bot(), q.message.chat_id):
+        song, why = await find_song(uid, paths, rejected=rejected)
+    if not song:
+        key = {"quota": "quota_short", "busy": "err", "none": "no_more" if rejected else "not_found"}[why]
+        return await q.message.reply_text(tr(lang, key))
+    remember_alts(sid, song)
     set_last(sid, song)
     src = row["src"]
-    cap, kb = result_caption(song, src), result_keyboard(sid, song, lang)
     task = asyncio.create_task(prepare_song_audio(song))
+    cap, kb = result_caption(song, src), result_keyboard(sid, song, lang)
     try:
         if q.message.text:
             await q.edit_message_text(cap, parse_mode="HTML", reply_markup=kb, **NO_PREVIEW)
@@ -2247,6 +2384,8 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         if data.startswith(("rec:", "bad:")):
             return await on_rec(q, data)
+        if data.startswith("cand:"):
+            return await on_cand(q, data)
         if data.startswith("pick:"):
             return await on_pick(q, ctx, data)
         if data.startswith("more:"):
@@ -2270,7 +2409,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.inline_query
     text = (q.query or "").strip()
-    if len(text) < 2:
+   if len(text) < 2:
         return await q.answer([], cache_time=5)
     try:
         items = await asyncio.to_thread(yt_search, text)
@@ -2452,4 +2591,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()        
+    main()
+ 
