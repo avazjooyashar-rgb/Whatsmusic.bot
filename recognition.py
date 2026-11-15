@@ -1,5 +1,5 @@
 """
-recognition.py - music recognition core (the ONLY file that knows how a song is recognized).  v11
+recognition.py - music recognition core (the ONLY file that knows how a song is recognized).  v11.1
 
   1) own fingerprint DB  (free, fast, knows remixes / special versions)
   2) ACRCloud + Shazam (+ AudD when AUDD_TOKEN is set) - every piece goes to ALL engines at the same time
@@ -13,17 +13,11 @@ recognition.py - music recognition core (the ONLY file that knows how a song is 
   4) an answer is accepted when it is CONFIRMED (two engines agree / two pieces agree / one engine extremely
      sure / ACR repeats itself / melody matches), or SOFT_ACCEPT, or GUESS_MODE (returned with guess=True).
 
-  v11 changes (why the bot stayed silent while other bots answered):
-    * Shazam was only given SHAZAM_GRACE (3 s) as soon as ACR had nothing to say - e.g. when the ACR quota is
-      used up or ACR does not know the song. Shazam needs 3-8 s, so its answer arrived AFTER the round gave
-      up. Now the short grace applies only when ACR already gave an answer to fall back on; if there is
-      nothing yet, Shazam is waited for until the round timeout.
-    * ROUND_TIMEOUT 15 -> 20 s, SHAZAM_TIMEOUT 10 -> 12 s.
-    * The Shazam circuit breaker was too nervous (4 timeouts = 2 min pause for everybody): now 6 fails = 45 s.
-    * "No engine could answer" (-> the generic error text) is only raised when really NO engine answered; when
-      Shazam answered "not found" while ACR is down, the user gets "not found".
-    * Every engine answer is logged (engine, piece, seconds, titles): journalctl shows exactly who said what.
-    * Queued Shazam pieces are dropped when the round is already over (no useless requests).
+  v11: Shazam gets the full round time when ACR has nothing; ROUND_TIMEOUT 20 s, SHAZAM_TIMEOUT 12 s;
+       calmer Shazam breaker (6 fails = 45 s); "no engine could answer" only when really nobody answered;
+       every engine answer is logged; queued Shazam pieces are dropped when the round is over.
+  v11.1: ACR returns up to ACR_CANDS (5) candidates per piece and the answer carries up to ALTS_MAX (6)
+       alternatives: they feed the bot's "wrong song" list.
 
 bot.py uses this interface (unchanged):
 
@@ -86,7 +80,7 @@ WAVES = (3, 3, 4)                                               # pieces sent pe
 ACR_TIMEOUT = _env(int, 10, "ACR_TIMEOUT", "ENGINE_TIMEOUT")    # one request
 WAVE_TIMEOUT = _env(int, 12, "WAVE_TIMEOUT")                    # one ACR piece, counted from when it STARTS
 QUEUE_TIMEOUT = _env(int, 30, "QUEUE_TIMEOUT")                  # a piece that never got a free thread
-ROUND_TIMEOUT = _env(int, 20, "ROUND_TIMEOUT")                  # the whole first round (was 15)
+ROUND_TIMEOUT = _env(int, 20, "ROUND_TIMEOUT")                  # the whole first round
 PHASE_B_TIMEOUT = _env(int, 25, "PHASE_B_TIMEOUT")              # variants + DB variants + lyrics
 WAVE_STAGGER = _env(float, 2.0, "WAVE_STAGGER")                 # next wave starts after this even if ACR is slow
 GIVEUP_AFTER = _env(int, 4, "GIVEUP_AFTER")                     # ACR heard this many pieces and knows nothing -> no more plain pieces
@@ -122,6 +116,8 @@ SOLO_W = _env(float, 0.95, "SOLO_W")
 SINGLE_STRONG = _flag("SINGLE_STRONG", True)                    # one extremely sure answer is enough (no rival)
 SINGLE_W = _env(float, 0.98, "SINGLE_W")
 LOCAL_FIRST = _flag("LOCAL_FIRST", False)
+ACR_CANDS = _env(int, 5, "ACR_CANDS")                           # ACR candidates read per piece (feeds "wrong song")
+ALTS_MAX = _env(int, 6, "ALTS_MAX")                             # alternatives returned with the answer
 
 # ACR confirmation by repetition (same song named again and again by ACR on the clip and its variants)
 REPEAT_MIN_HITS = _env(int, 2, "REPEAT_MIN_HITS")               # normal ACR matches needed ...
@@ -131,9 +127,9 @@ HUM_PIECES_W = _env(float, 0.75, "HUM_PIECES_W")                # ... each with 
 HUM_HITS_MIN = _env(int, 3, "HUM_HITS_MIN")                     # or this many melody matches (any piece) ...
 HUM_HITS_W = _env(float, 0.85, "HUM_HITS_W")                    # ... each with at least this weight
 
-SHAZAM_TIMEOUT = _env(int, 12, "SHAZAM_TIMEOUT")                # was 10
-SHAZAM_MAX_FAILS = _env(int, 6, "SHAZAM_MAX_FAILS")             # was 4
-SHAZAM_PAUSE = _env(int, 45, "SHAZAM_PAUSE")                    # was 120
+SHAZAM_TIMEOUT = _env(int, 12, "SHAZAM_TIMEOUT")
+SHAZAM_MAX_FAILS = _env(int, 6, "SHAZAM_MAX_FAILS")
+SHAZAM_PAUSE = _env(int, 45, "SHAZAM_PAUSE")
 SHAZAM_THREADS = max(_env(int, 4, "SHAZAM_THREADS"), 1)         # concurrent Shazam requests (all in ONE event loop)
 
 AUDD_TOKEN = os.environ.get("AUDD_TOKEN", "").strip()          # optional third engine (add "audd" to ENGINES)
@@ -552,7 +548,7 @@ def _parse(md: dict) -> list:
     """ACR answer -> candidates. "w" = vote weight: ACR's score, 2nd / 3rd candidates count half; a humming
     (melody) guess weighs less and is only trusted through the repetition rules of _rank()."""
     cands = []
-    for m in (md.get("music") or [])[:3]:
+    for m in (md.get("music") or [])[:ACR_CANDS]:
         if not m.get("title"):
             continue
         ext = m.get("external_metadata") or {}
@@ -1457,7 +1453,7 @@ def _ask_engines_core(paths, rejected, cancel, engines, full, extra, meta):
         own = [h["piece"] for h in (top_c["first"] or top_c["hits"]) if h["piece"] < len(paths)]
         top["piece_path"] = paths[min(own) if own else 0]
         top["alts"] = [{**{k: v for k, v in c["song"].items() if k not in drop}, "guess": True}
-                       for c in ranked if c is not top_c][:3]     # what "wrong song" shows next: always guesses
+                       for c in ranked if c is not top_c][:ALTS_MAX]     # what "wrong song" shows next: always guesses
         if guess:
             top["guess"] = True
         log.info("recognize: answered in %.1fs", time.time() - t_start)
@@ -1556,7 +1552,7 @@ def init(load_accounts, local_fn=None, words_fn=None):
     POOL.set_loader(load_accounts)
     _local_fn = local_fn
     _words_fn = words_fn
-    log.info("recognition v11: engines=%s round_timeout=%ss shazam_timeout=%ss shazam_threads=%d",
+    log.info("recognition v11.1: engines=%s round_timeout=%ss shazam_timeout=%ss shazam_threads=%d",
              "+".join(ENGINES), ROUND_TIMEOUT, SHAZAM_TIMEOUT, SHAZAM_THREADS)
     threading.Thread(target=_warmup, daemon=True, name="recog-warmup").start()
 
