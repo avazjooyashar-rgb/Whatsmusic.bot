@@ -2409,7 +2409,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.inline_query
     text = (q.query or "").strip()
-   if len(text) < 2:
+    if len(text) < 2:
         return await q.answer([], cache_time=5)
     try:
         items = await asyncio.to_thread(yt_search, text)
@@ -2592,4 +2592,3 @@ def main():
 
 if __name__ == "__main__":
     main()
- 
