@@ -1,11 +1,14 @@
 """
-Music recognition Telegram bot - v11 (complete, with the whatsmusicbot-style "wrong song" list)
+Music recognition Telegram bot - v12 (complete, with the whatsmusicbot-style "wrong song" list)
 
 Recognition (see recognition.py):
   1) own fingerprint DB (fp_engine): free, fast, knows remixes and special versions
   2) ACRCloud + Shazam vote together (several ACR accounts in priority order, Shazam with a circuit breaker);
      a song confirmed by two engines is learned by the own DB, so the next time it is answered for free
 Last resort when nothing is confirmed: lyrics (faster-whisper, optional) and cleaned / tempo-shifted audio.
+
+v12 changes: faster mp3 download (no YouTube search when the engine already gave the video), only the 3 pieces that
+recognition really uses are cut, and a stronger lyrics-by-words search (parallel windows, typo tolerant, best match).
 
 "Wrong song": the old answer stays, a NEW message with a vertical list of candidates appears
 ("3:21 • Title - Artist"). Candidates: other engine answers, the name from the post, spelling variants / other
@@ -19,6 +22,7 @@ Environment:
   ACR_HOST / ACR_KEY / ACR_SECRET            first ACRCloud account (only used when the accounts table is empty)
   ACR_ACCOUNTS="host:key:secret,host:key:secret"   more accounts to seed (only used when the table is empty)
   more accounts can be added to the `accounts` table (type='acr') at any time: lowest id = highest priority
+  LYRICS_MIN_OVERLAP=0.5  LYRICS_MIN_HITS=4  LYRICS_WINDOWS=4  LYRICS_TIMEOUT=30   (lyrics-by-words search, optional)
 """
 import array
 import asyncio
@@ -41,7 +45,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import asynccontextmanager
 from urllib.parse import quote, urlparse, parse_qs
 
@@ -1068,7 +1072,7 @@ def pick_targets(song: dict) -> list:
                 add(norm_url(yt))
         except Exception:
             pass
-    if not out or song.get("dur"):  # without a known duration a direct id cannot be verified: skip the search
+    if not out:  # a video id is already known (ACR / link): skip the YouTube search, the length check below guards it
         for score, vid in rank_youtube(song)[:3]:
             if score >= 2:
                 add(f"https://www.youtube.com/watch?v={vid}")
@@ -1483,7 +1487,8 @@ def loud_offsets(src: str, win: int, n: int = 2, maxsec: int = 600) -> list:
 
 
 def pick_offsets(src: str, d: float, win: int = 15) -> list:
-    """Order matters: loudest, middle, 2nd loudest, then evenly spread. The own DB uses the first three."""
+    """Order matters: loudest, middle, 2nd loudest, then evenly spread. The own DB uses the first three, and
+    recognition.py never asks for more than three pieces, so only three are cut."""
     if not d or d <= win + 3:
         return [0]
     n = 4 if d <= 60 else 6 if d <= 300 else 8
@@ -1495,7 +1500,7 @@ def pick_offsets(src: str, d: float, win: int = 15) -> list:
         o = round(max(0, min(o, d - win)))
         if all(abs(o - x) >= 5 for x in offs):
             offs.append(o)
-    return offs[:n]
+    return offs[:3]
 
 
 def make_samples(src: str, sid: str) -> list:
@@ -1634,32 +1639,114 @@ def _parse_yt_title(title: str, channel: str):
     return re.sub(r"(?i)\s*-\s*topic$", "", channel or "").strip(), (parts[0] if parts else "")
 
 
-def find_song_by_words(words):
-    """A few words of the lyrics -> the song: YouTube search, then the lyrics of each result must contain the words."""
-    slices = [words[:12]] + ([words[10:22]] if len(words) >= 20 else [])
-    seen = set()
-    for sl in slices:
-        try:
-            items = yt_search(" ".join(sl) + " lyrics", 6)
-        except Exception as e:
-            log.warning("yt lyrics search failed: %s", e)
+# --- find a song from a few (possibly misheard) words of its lyrics ------------------------------------
+_LYR_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="lyrsearch")
+LYR_MIN_OVERLAP = float(os.environ.get("LYRICS_MIN_OVERLAP", "0.5"))   # share of the words that must match
+LYR_MIN_HITS = _int("LYRICS_MIN_HITS", 4)                              # and at least this many words
+LYR_WINDOWS = _int("LYRICS_WINDOWS", 4)
+LYR_TIMEOUT = float(os.environ.get("LYRICS_TIMEOUT", "30"))
+_LYR_WIN = 7
+_LYR_MAX_ITEMS = 10
+
+
+def _lyr_windows(ws):
+    """Short windows (7 words) spread over the text: one misheard word spoils only one window."""
+    if len(ws) <= _LYR_WIN + 2:
+        return [ws]
+    step = max(3, (len(ws) - _LYR_WIN) // max(1, LYR_WINDOWS - 1))
+    out, i = [], 0
+    while i + _LYR_WIN <= len(ws) and len(out) < LYR_WINDOWS:
+        out.append(ws[i:i + _LYR_WIN])
+        i += step
+    if len(out) < LYR_WINDOWS and out and out[-1] != ws[-_LYR_WIN:]:
+        out.append(ws[-_LYR_WIN:])
+    return out
+
+
+def _fuzzy_overlap(words, lyric_text: str):
+    """-> (share, hits) of the words found in the lyrics, tolerant to small spelling mistakes (Whisper)."""
+    qs = [w for w in dict.fromkeys(fold(x) for x in words) if len(w) > 2]
+    if not qs:
+        return 0.0, 0
+    lw = set(re.findall(r"\w+", fold(lyric_text)))
+    by_len = {}
+    for w in lw:
+        by_len.setdefault(len(w), []).append(w)
+    hits = 0
+    for q in qs:
+        if q in lw:
+            hits += 1
             continue
-        for it in items[:5]:
-            if it.get("id") in seen:
-                continue
-            seen.add(it.get("id"))
-            a, t = _parse_yt_title(it.get("title"), it.get("channel") or it.get("uploader") or "")
-            for artist, name in ((a, t), (t, a)):
-                if not artist or not name:
-                    continue
-                try:
-                    ly = get_lyrics(artist, name)
-                except Exception:
-                    ly = None
-                if ly and lyric_overlap(words, ly) >= 0.35:
-                    return {"title": name, "artist": artist, "link": None}
-                if ly:
-                    break
+        if len(q) < 4:
+            continue
+        cands = [c for n in (len(q) - 1, len(q), len(q) + 1) for c in by_len.get(n, ())]
+        if any(c[0] == q[0] and difflib.SequenceMatcher(None, q, c).ratio() >= 0.82 for c in cands):
+            hits += 1
+    return hits / len(qs), hits
+
+
+def _lyr_search_window(win):
+    try:
+        return yt_search(" ".join(win) + " lyrics", 6) or []
+    except Exception as e:
+        log.warning("yt lyrics search failed: %s", e)
+        return []
+
+
+def _lyr_check(artist: str, name: str, words):
+    try:
+        ly = get_lyrics(artist, name)
+    except Exception:
+        ly = None
+    if not ly:
+        return None
+    ratio, hits = _fuzzy_overlap(words, ly)
+    return ratio, hits, artist, name
+
+
+def find_song_by_words(words):
+    """A few words of the lyrics -> the song. Several short windows are searched on YouTube in parallel, the lyrics
+    of every candidate are fetched in parallel and compared with typo tolerance; the BEST match wins."""
+    ws = [w for w in words if len(w) > 1]
+    if len(ws) < 4:
+        return None
+    results = list(_LYR_POOL.map(_lyr_search_window, _lyr_windows(ws)))
+    items, seen = [], set()
+    for rank in range(6):            # round-robin over the windows
+        for res in results:
+            if rank < len(res):
+                it = res[rank]
+                if it.get("id") and it["id"] not in seen:
+                    seen.add(it["id"])
+                    items.append(it)
+    items = items[:_LYR_MAX_ITEMS]
+    if not items:
+        return None
+    futs, done_pairs = [], set()
+    for it in items:
+        a, t = _parse_yt_title(it.get("title"), it.get("channel") or it.get("uploader") or "")
+        for artist, name in ((a, t), (t, a)):
+            key = (fold(artist), fold(name))
+            if artist and name and key not in done_pairs:
+                done_pairs.add(key)
+                futs.append(_LYR_POOL.submit(_lyr_check, artist, name, ws))
+    done, _pending = wait(futs, timeout=LYR_TIMEOUT)
+    best = None
+    for f in done:
+        try:
+            r = f.result()
+        except Exception:
+            continue
+        if r and (best is None or (r[0], r[1]) > (best[0], best[1])):
+            best = r
+    for f in futs:
+        f.cancel()
+    if not best:
+        return None
+    ratio, hits, artist, name = best
+    log.info("lyrics search best: %s - %s | overlap=%.2f hits=%d", artist, name, ratio, hits)
+    if ratio >= LYR_MIN_OVERLAP and hits >= LYR_MIN_HITS:
+        return {"title": name, "artist": artist, "link": None}
     return None
 
 
