@@ -129,7 +129,7 @@ def init(load_accounts, local_fn=None, words_fn=None):
     _cfg["local_excl"] = _accepts_exclude(local_fn)
     if words_fn and WHISPER_MODEL and WHISPER_PRELOAD:
         threading.Thread(target=_get_whisper, daemon=True, name="whisper-load").start()
-    log.info("recognition v13: local=%s lyrics=%s whisper=%s",
+    log.info("recognition v14: local=%s lyrics=%s whisper=%s",
              bool(local_fn), bool(words_fn), WHISPER_MODEL or "off")
 
 
@@ -360,9 +360,9 @@ def _acr(path):
             sts = "\n".join(["POST", "/v1/identify", acc["key"], "audio", "1", ts])
             sig = base64.b64encode(hmac.new(acc["secret"].encode(), sts.encode(), hashlib.sha1).digest()).decode()
             r = _SESS.post(f"https://{acc['host']}/v1/identify", timeout=ACR_TIMEOUT,
-                              data={"access_key": acc["key"], "sample_bytes": str(len(data)), "timestamp": ts,
-                                    "signature": sig, "data_type": "audio", "signature_version": "1"},
-                              files={"sample": ("s.mp3", data)})
+                           data={"access_key": acc["key"], "sample_bytes": str(len(data)), "timestamp": ts,
+                                 "signature": sig, "data_type": "audio", "signature_version": "1"},
+                           files={"sample": ("s.mp3", data)})
             j = r.json()
         except Exception as e:
             log.warning("acr #%s failed: %s", acc["id"], str(e)[:120])
