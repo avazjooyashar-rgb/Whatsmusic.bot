@@ -17,7 +17,7 @@ recognition.py - v15 (یک فایل، جای recognition.py قبلی؛ bot.py ب
     path = await asyncio.to_thread(fut.result, 120)
     await bot.send_audio(chat_id, open(path, "rb"), title=song["title"], performer=song["artist"],
                          thumbnail=recognition.thumb_of(path))
-  env: YT_COOKIES=/root/cookies.txt  DL_BITRATE=192  DL_DIR=/tmp/dl  DL_FRAGMENTS=8
+  env: COOKIES_FILE (همون کوکی بات؛ یا YT_COOKIES)  DL_BITRATE=192  DL_DIR=/tmp/dl  DL_FRAGMENTS=8
 
 ترتیب تشخیص:
   1) دیتابیس خودت (fp_engine)  2) رای‌گیری ACR + Shazam + ملودی + متن ترانه + رای ضعیف دیتابیس
@@ -836,7 +836,7 @@ def _ask_engines(paths, rejected, items, stop):
 DL_DIR = os.environ.get("DL_DIR", os.path.join(tempfile.gettempdir(), "dl"))
 BITRATE = os.environ.get("DL_BITRATE", "192")
 FRAGMENTS = int(os.environ.get("DL_FRAGMENTS", "8"))
-COOKIES = os.environ.get("YT_COOKIES", "").strip()
+COOKIES = (os.environ.get("YT_COOKIES") or os.environ.get("COOKIES_FILE") or "cookies.txt").strip()   # همون کوکی بات
 os.makedirs(DL_DIR, exist_ok=True)
 
 _DPOOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="dl")
