@@ -109,9 +109,10 @@ ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.str
 SAMPLES_DIR = os.environ.get("SAMPLES_DIR", "samples")
 DL_DIR = os.path.join(SAMPLES_DIR, "dl")
 COOKIES = os.environ.get("COOKIES_FILE", "cookies.txt")
+YT_PROXY = os.environ.get("YT_PROXY", "").strip()   # e.g. socks5://127.0.0.1:40000 (Cloudflare WARP proxy mode)
 MAX_BYTES = 49 * 1024 * 1024          # Telegram upload limit for bots
 AUDIO_MAX_BYTES = 48 * 1024 * 1024
-ARIA2 = bool(shutil.which("aria2c")) and os.environ.get("ARIA2", "1") == "1"
+ARIA2 = bool(shutil.which("aria2c")) and os.environ.get("ARIA2", "1") == "1" and not YT_PROXY   # aria2c cannot use a socks proxy
 os.makedirs(SAMPLES_DIR, exist_ok=True)
 os.makedirs(DL_DIR, exist_ok=True)
 
@@ -970,6 +971,8 @@ def ydl_base():
          "http_chunk_size": 10 * 1024 * 1024, "socket_timeout": 20, "retries": 3, "fragment_retries": 3}
     if os.path.exists(COOKIES):
         o["cookiefile"] = COOKIES
+    if YT_PROXY:
+        o["proxy"] = YT_PROXY
     return o
 
 
@@ -1685,6 +1688,19 @@ def _fuzzy_overlap(words, lyric_text: str):
     return hits / len(qs), hits
 
 
+def _lyr_hook(ws):
+    """The most repeated 2-word phrase (a chorus / title usually repeats), or None."""
+    counts = {}
+    for i in range(len(ws) - 1):
+        a, c = ws[i], ws[i + 1]
+        if len(a) >= 2 and len(c) >= 2:
+            counts[(a, c)] = counts.get((a, c), 0) + 1
+    if not counts:
+        return None
+    (a, c), n = max(counts.items(), key=lambda kv: kv[1])
+    return [a, c] if n >= 2 else None
+
+
 def _lyr_search_window(win):
     try:
         return yt_search(" ".join(win) + " lyrics", 6) or []
@@ -1710,7 +1726,11 @@ def find_song_by_words(words):
     ws = [w for w in words if len(w) > 1]
     if len(ws) < 4:
         return None
-    results = list(_LYR_POOL.map(_lyr_search_window, _lyr_windows(ws)))
+    wins = _lyr_windows(ws)
+    hook = _lyr_hook(ws)
+    if hook:                         # the repeated phrase (chorus / title) searched first: it survives misheard words
+        wins = [hook] + wins
+    results = list(_LYR_POOL.map(_lyr_search_window, wins))
     items, seen = [], set()
     for rank in range(6):            # round-robin over the windows
         for res in results:
