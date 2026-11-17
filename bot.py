@@ -2605,23 +2605,24 @@ def parse_cookie_file(text: str):
 
 
 def _cookie_rows(text: str):
-    """-> [(domain, raw_line)] for the cookie lines of a Netscape file."""
+    """-> [((domain, path, name), raw_line)] for the cookie lines of a Netscape file."""
     out = []
     for l in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         if not l.strip() or (l.startswith("#") and not l.startswith("#HttpOnly_")):
             continue
         parts = l.split("\t")
         if len(parts) == 7:
-            out.append((parts[0].replace("#HttpOnly_", "").lstrip(".").lower(), l))
+            out.append(((parts[0].replace("#HttpOnly_", "").lstrip(".").lower(), parts[2], parts[5]), l))
     return out
 
 
 def merge_cookie_text(old: str, new: str) -> str:
-    """The uploaded file replaces only the domains it contains (e.g. youtube.com / google.com);
-    cookies of every other domain (e.g. instagram.com) stay."""
+    """Cookie by cookie: a cookie in the uploaded file replaces the stored cookie with the same
+    (domain, path, name); every other stored cookie stays. So a file that only holds some cookies of a site
+    (or none of its login cookies) can never wipe a login that was saved earlier."""
     new_rows = _cookie_rows(new)
-    new_domains = {d for d, _ in new_rows}
-    keep = [l for d, l in _cookie_rows(old) if d not in new_domains]
+    new_keys = {k for k, _ in new_rows}
+    keep = [l for k, l in _cookie_rows(old) if k not in new_keys]
     return "# Netscape HTTP Cookie File\n" + "\n".join(keep + [l for _, l in new_rows]) + "\n"
 
 
@@ -2758,3 +2759,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+ 
