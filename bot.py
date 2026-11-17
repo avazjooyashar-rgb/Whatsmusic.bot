@@ -1,14 +1,14 @@
 """
-Music recognition Telegram bot - v12 (complete, with the whatsmusicbot-style "wrong song" list)
+Music recognition Telegram bot - v13 (complete, with the whatsmusicbot-style "wrong song" list)
+
+v13: mp3 downloads come from recognition.start_download (cover art embedded + thumbnail, parallel, cached);
+the old downloader stays as an automatic fallback (prepare_song_audio_old).
 
 Recognition (see recognition.py):
   1) own fingerprint DB (fp_engine): free, fast, knows remixes and special versions
   2) ACRCloud + Shazam vote together (several ACR accounts in priority order, Shazam with a circuit breaker);
      a song confirmed by two engines is learned by the own DB, so the next time it is answered for free
 Last resort when nothing is confirmed: lyrics (faster-whisper, optional) and cleaned / tempo-shifted audio.
-
-v12 changes: faster mp3 download (no YouTube search when the engine already gave the video), only the 3 pieces that
-recognition really uses are cut, and a stronger lyrics-by-words search (parallel windows, typo tolerant, best match).
 
 "Wrong song": the old answer stays, a NEW message with a vertical list of candidates appears
 ("3:21 • Title - Artist"). Candidates: other engine answers, the name from the post, spelling variants / other
@@ -120,7 +120,7 @@ CLIP_HOSTS = ("youtube.com", "youtu.be", "instagram.com")
 AUDIO_HOSTS = ("youtube.com", "youtu.be", "soundcloud.com")
 YT_HOSTS = ("youtube.com", "youtu.be")
 MP3_PREFIX = "🎵 "
-SONG_KEYS = ("title", "artist", "link", "yt", "dur")
+SONG_KEYS = ("title", "artist", "link", "yt", "dur", "cover")
 PAGE = 8
 
 esc = html.escape
@@ -1839,6 +1839,30 @@ async def fetch_audio(target: str, song=None) -> dict:
 
 
 async def prepare_song_audio(song: dict) -> dict:
+    """mp3 with the cover embedded (recognition.start_download). Telegram cache first; on any failure the old
+    method (prepare_song_audio_old) is used."""
+    for k in song_keys(song):
+        hit = await asyncio.to_thread(cache_get, k)
+        if hit:
+            return {"file_id": hit["file_id"], "title": hit["title"], "info": hit["info"]}
+    try:
+        fut = recognition.start_download(song.get("title") or "", song.get("artist") or "", dur=song.get("dur"),
+                                         cover_url=song.get("cover"), yt=song.get("yt"))
+        async with dl_sem():
+            path = await asyncio.wait_for(asyncio.wrap_future(fut), 180)
+        tmp = tempfile.mkdtemp(dir=DL_DIR)
+        dst = os.path.join(tmp, os.path.basename(path))
+        shutil.move(path, dst)
+        dur = await asyncio.to_thread(probe_duration, dst)
+        return {"path": dst, "title": song.get("title") or "music", "vid": None,
+                "url": song.get("link") or song.get("yt"), "duration": int(dur) or None,
+                "dir": tmp, "keys": song_keys(song)}
+    except Exception as e:
+        log.warning("fast download failed (%s): using the old method", str(e)[:200])
+        return await prepare_song_audio_old(song)
+
+
+async def prepare_song_audio_old(song: dict) -> dict:
     """Downloads the ORIGINAL recording. If the downloaded length is clearly different from the real length of
     the song, the next candidate is tried."""
     targets = await asyncio.to_thread(pick_targets, song)
@@ -1874,10 +1898,15 @@ async def deliver_audio(msg, a: dict, song=None, lang: str = "fa"):
     try:
         if os.path.getsize(a["path"]) > MAX_BYTES:
             raise RuntimeError("audio file is larger than Telegram's upload limit")
-        with open(a["path"], "rb") as f:
-            sent = await msg.reply_audio(f, title=title, performer=performer, duration=a.get("duration"),
-                                         caption=audio_caption(info), parse_mode="HTML", reply_markup=kb,
-                                         read_timeout=300, write_timeout=300)
+        thumb = await asyncio.to_thread(recognition.thumb_of, a["path"])
+        try:
+            with open(a["path"], "rb") as f:
+                sent = await msg.reply_audio(f, title=title, performer=performer, duration=a.get("duration"),
+                                             thumbnail=thumb, caption=audio_caption(info), parse_mode="HTML",
+                                             reply_markup=kb, read_timeout=300, write_timeout=300)
+        finally:
+            if thumb:
+                thumb.close()
     finally:
         shutil.rmtree(a["dir"], ignore_errors=True)
     if sent.audio:
@@ -2555,6 +2584,27 @@ def parse_cookie_file(text: str):
     return rows, names, None
 
 
+def _cookie_rows(text: str):
+    """-> [(domain, raw_line)] for the cookie lines of a Netscape file."""
+    out = []
+    for l in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if not l.strip() or (l.startswith("#") and not l.startswith("#HttpOnly_")):
+            continue
+        parts = l.split("\t")
+        if len(parts) == 7:
+            out.append((parts[0].replace("#HttpOnly_", "").lstrip(".").lower(), l))
+    return out
+
+
+def merge_cookie_text(old: str, new: str) -> str:
+    """The uploaded file replaces only the domains it contains (e.g. youtube.com / google.com);
+    cookies of every other domain (e.g. instagram.com) stay."""
+    new_rows = _cookie_rows(new)
+    new_domains = {d for d, _ in new_rows}
+    keep = [l for d, l in _cookie_rows(old) if d not in new_domains]
+    return "# Netscape HTTP Cookie File\n" + "\n".join(keep + [l for _, l in new_rows]) + "\n"
+
+
 async def on_cookies_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Admin only: send a cookies.txt file to the bot in a private chat -> it replaces COOKIES_FILE.
     The message with the file is deleted again (it holds a login)."""
@@ -2576,7 +2626,14 @@ async def on_cookies_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if err:
             await msg.reply_text(f"❌ ذخیره نشد: {err}")
             return
+        if os.path.exists(COOKIES):
+            try:
+                with open(COOKIES, encoding="utf-8", errors="replace") as f:
+                    text = merge_cookie_text(f.read(), text)
+            except OSError:
+                pass
         text = text.replace("\r\n", "\n").replace("\r", "\n")
+        rows, names, _e = parse_cookie_file(text)
         tmp = COOKIES + ".tmp"
         with open(tmp, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
@@ -2586,7 +2643,9 @@ async def on_cookies_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             pass
         os.replace(tmp, COOKIES)
         login = "ok" if names & _YT_LOGIN_COOKIES else "MISSING (لاگین یوتیوب در فایل نیست)"
-        await msg.reply_text(f"✅ cookies.txt ذخیره شد: {rows} کوکی | youtube login: {login}\n"
+        ig = "ok" if "sessionid" in names else "MISSING"
+        await msg.reply_text(f"✅ cookies.txt ذخیره شد (ادغام با قبلی): {rows} کوکی | "
+                             f"youtube login: {login} | instagram: {ig}\n"
                              "پیام فایل پاک شد. حالا یک آهنگ را امتحان کن.")
         log.info("cookies.txt replaced by an admin upload: %d cookies, youtube login %s", rows, login[:2])
     except Exception:
