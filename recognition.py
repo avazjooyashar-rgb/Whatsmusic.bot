@@ -34,7 +34,7 @@ recognition.py - v16 (یک فایل کامل، جای recognition.py قبلی؛ 
   WHISPER_BEAM=1 (برای دقت بیشتر ۳ یا ۵؛ کندتر)  WHISPER_PRELOAD=1
   FAST_W=1.0  FAST_GRACE=2  SOFT_LAUNCH=4  LYRICS_DELAY=2  SHAZAM_TIMEOUT=20  SHAZAM_THREADS=3
   FP_STRONG=60  FP_STRONG2=20  FP_WEAK_MIN=12  LOCAL_PIECES=3
-  HUM_CAP=0.6  LAST_RESORT=1  LAST_RESORT_PIECES=2  VAR_WORKERS=2 LAST_RESORT_BUDGET=25 WHISPER_LOOSE=1  DB_PATH
+  HUM_CAP=0.6  LAST_RESORT=1  LAST_RESORT_PIECES=2  VAR_WORKERS=2 LAST_RESORT_BUDGET=15 WHISPER_LOOSE=1  DB_PATH
 """
 import asyncio
 import base64
@@ -90,7 +90,7 @@ SHAZAM_THREADS = max(1, int(_f("SHAZAM_THREADS", 3)))
 LAST_RESORT = os.environ.get("LAST_RESORT", "1") == "1"
 LAST_RESORT_PIECES = max(1, int(_f("LAST_RESORT_PIECES", 2)))
 VAR_WORKERS = max(1, int(_f("VAR_WORKERS", 2)))          # روی ۲ هسته بیشتر از ۲ ffmpeg همزمان Shazam رو گرسنه می‌کنه
-LAST_RESORT_BUDGET = _f("LAST_RESORT_BUDGET", 25)
+LAST_RESORT_BUDGET = _f("LAST_RESORT_BUDGET", 15)
 ACR_TIMEOUT = 15
 SHAZAM_TIMEOUT = _f("SHAZAM_TIMEOUT", 8)          # هر تلاش؛ اتصال گیرکرده رها و دوباره امتحان می‌شه
 SHAZAM_TRIES = max(1, int(_f("SHAZAM_TRIES", 2)))
@@ -133,7 +133,7 @@ def init(load_accounts, local_fn=None, words_fn=None):
     if words_fn and WHISPER_MODEL and WHISPER_PRELOAD:
         threading.Thread(target=_get_whisper, daemon=True, name="whisper-load").start()
     threading.Thread(target=_sh_warm, daemon=True, name="shazam-warm").start()
-    log.info("recognition v16.6: local=%s lyrics=%s whisper=%s",
+    log.info("recognition v16.7: local=%s lyrics=%s whisper=%s",
              bool(local_fn), bool(words_fn), WHISPER_MODEL or "off")
 
 
@@ -536,7 +536,7 @@ def _whisper_pass(model, path, lang, vad, strict):
     return " ".join(kept).strip(), info, drop
 
 
-def _transcribe(path, lang=None):
+def _transcribe(path, lang=None, skip_vad=False):
     """-> (text, زبان تشخیص‌داده‌شده یا None, loose)
     پاس اول: با VAD و فیلتر سخت‌گیر (مناسب ویس). اگه چیزی نشنید، پاس دوم: بدون VAD و فیلتر نرم‌تر
     (VAD گاهی آواز با موزیک رو «غیرگفتار» می‌دونه و کل صدا رو حذف می‌کنه)."""
@@ -546,11 +546,12 @@ def _transcribe(path, lang=None):
     lang = WHISPER_LANG or lang
     try:
         with _WH_RUN:
-            text, info, drop = _whisper_pass(model, path, lang, vad=True, strict=True)
-            loose = False
-            log.info("whisper pass1 (vad): %d chars, dropped=%s, lang=%s(%.2f)", len(text), drop,
-                     getattr(info, "language", None), getattr(info, "language_probability", 0) or 0)
-            if not text and WHISPER_LOOSE:
+            text, loose = "", False
+            if not skip_vad:
+                text, info, drop = _whisper_pass(model, path, lang, vad=True, strict=True)
+                log.info("whisper pass1 (vad): %d chars, dropped=%s, lang=%s(%.2f)", len(text), drop,
+                         getattr(info, "language", None), getattr(info, "language_probability", 0) or 0)
+            if not text and (WHISPER_LOOSE or skip_vad):
                 text, info, drop = _whisper_pass(model, path, lang, vad=False, strict=False)
                 loose = True
                 log.info("whisper pass2 (no vad): %d chars, dropped=%s", len(text), drop)
@@ -608,11 +609,13 @@ def _lyrics_vote(paths, stop=None):
     if not wf or not WHISPER_MODEL:
         return [], True
     lang = None            # قفل زبان فقط داخل همین درخواست (بین کاربرها قفل نمی‌مونه)
+    skip_vad = False       # اگه تکه‌ی قبلی فقط با پاس دوم متن داد، برای بعدی پاس VAD رو تکرار نمی‌کنیم
     for i, p in enumerate(paths[:max(1, WHISPER_MAX_PIECES)]):
         if stop is not None and stop.is_set():
             return [], True
-        text, det, loose = _transcribe(p, lang)
+        text, det, loose = _transcribe(p, lang, skip_vad)
         lang = lang or det
+        skip_vad = skip_vad or loose
         ws = _usable_words(text)
         if not ws:
             log.info("lyrics: piece %d unusable (heard %d chars)", i, len(text))
@@ -726,8 +729,8 @@ _VARIANTS = {
     "pitch_up": "aresample=44100,asetrate=49500,atempo=0.8909,aresample=44100",
     "pitch_down": "aresample=44100,asetrate=39289,atempo=1.1225,aresample=44100",
 }
-_PRIMARY_VARIANTS = ("clean", "denoise", "tempo_down", "tempo_up", "pitch_up", "pitch_down",
-                     "slow", "fast", "vocal", "slow2", "fast2")
+_PRIMARY_VARIANTS = ("slow", "fast", "clean", "tempo_down", "tempo_up", "pitch_up", "pitch_down",
+                     "denoise", "vocal", "slow2", "fast2")
 _EXTRA_PIECE_VARIANTS = ("clean", "tempo_down", "pitch_up")
 
 
