@@ -1,15 +1,19 @@
 """
-recognition.py - v15 (یک فایل، جای recognition.py قبلی؛ bot.py بدون تغییر کار می‌کنه)
+recognition.py - v16 (یک فایل کامل، جای recognition.py قبلی؛ bot.py بدون تغییر کار می‌کنه)
 
-تغییرهای v15 نسبت به v14:
-  - ملودی/زمزمه‌ی ACR حالا یک «رای مستقل» (src=hum) حساب می‌شه، نه قاطی ACR معمولی؛
-    پس ملودی + متن ترانه، یا ملودی + دیتابیس خودت با هم جواب قطعی می‌دن (تنها هنوز قبول نمی‌شه)
-  - متن ترانه قوی‌تر: جستجو با کل کلمات و نصف‌ها (خود بات هم پنجره‌ای جستجو می‌کنه)
-  - Whisper زودتر شروع می‌شه (LYRICS_DELAY=2) و مدل/compute از env قابل تنظیمه
-  - Shazam تکه‌ی دوم هم از همون اول موازی شروع می‌شه (رایگانه) -> سریع‌تر
-  - FAST_GRACE=2 (قبلاً ۳)
-  - کاور آهنگ از Shazam گرفته می‌شه و تو song["cover"] میاد (برای fastdl.py)
-  - آخرین راه یک نسخه‌ی نویزگیری‌شده (denoise) هم داره
+تغییرهای v16 نسبت به v15:
+  سرعت:
+  - Shazam حالا یک event-loop دائمی و یک نمونه‌ی Shazam مشترک داره (دیگه هر بار asyncio.run نمی‌زنه)
+  - Shazam برای هر سه تکه از همون لحظه‌ی اول موازی شروع می‌شه (رایگانه)
+  - اگه همه‌ی موتورهای آنلاینِ شروع‌شده جواب دادن و جواب قوی و بدون مخالفه، بدون صبر (grace) فوری قبول می‌شه
+  - Whisper: زبان بعد از اولین تکه قفل می‌شه (تکه‌ی دوم سریع‌تر)، و منتظر کامل شدن نمی‌مونه؛ نتیجه‌اش همون لحظه برداشته می‌شه
+  - نسخه‌های «آخرین راه» تو /dev/shm (RAM) ساخته می‌شن و شش‌تا همزمان
+  - SOFT_LAUNCH=4 (قبلاً ۶): تکه‌ی بعدیِ ACR زودتر شروع می‌شه
+  دقت:
+  - نسخه‌های جدید آخرین راه که سرعت رو عوض می‌کنن ولی پیچ رو نه (tempo)، و پیچ رو عوض می‌کنن ولی سرعت رو نه (pitch ±2)؛
+    برای کاور/اجرای کندتر-تندتر یا کلید متفاوت
+  - بونس ترکیبی: متن ترانه + دیتابیس خودت / ملودی / موتور آنلاین هم‌نظر بشن، اطمینان بالاتر می‌ره
+  - متن ترانه: کلمه‌های تکراریِ بیش از حد (hallucination) بهتر فیلتر می‌شن
 
 دانلود (تو همین فایل): mp3 با کاور + تگ، موازی و کش‌شده
     fut = recognition.start_download(song["title"], song["artist"], dur=song.get("dur"),
@@ -28,9 +32,9 @@ recognition.py - v15 (یک فایل، جای recognition.py قبلی؛ bot.py ب
   WHISPER_MODEL=small   (دقیق‌تر: medium یا large-v3-turbo؛ خالی = متن ترانه خاموش)
   WHISPER_COMPUTE=int8  WHISPER_LANG=  WHISPER_THREADS=4  WHISPER_MAX_PIECES=2  WHISPER_WAIT=45
   WHISPER_BEAM=1 (برای دقت بیشتر ۳ یا ۵؛ کندتر)  WHISPER_PRELOAD=1
-  FAST_W=1.0  FAST_GRACE=2  SOFT_LAUNCH=6  LYRICS_DELAY=2  SHAZAM_TIMEOUT=20  SHAZAM_THREADS=2
+  FAST_W=1.0  FAST_GRACE=2  SOFT_LAUNCH=4  LYRICS_DELAY=2  SHAZAM_TIMEOUT=20  SHAZAM_THREADS=3
   FP_STRONG=60  FP_STRONG2=20  FP_WEAK_MIN=12  LOCAL_PIECES=3
-  HUM_CAP=0.6  LAST_RESORT=1  LAST_RESORT_PIECES=2  DB_PATH
+  HUM_CAP=0.6  LAST_RESORT=1  LAST_RESORT_PIECES=2  VAR_WORKERS=6  DB_PATH
 """
 import asyncio
 import base64
@@ -47,6 +51,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+import uuid
 from concurrent.futures import ThreadPoolExecutor, Future, wait, FIRST_COMPLETED
 
 import requests
@@ -80,14 +85,15 @@ WHISPER_LANG = os.environ.get("WHISPER_LANG", "").strip()
 WHISPER_MAX_PIECES = int(_f("WHISPER_MAX_PIECES", 2))
 WHISPER_WAIT = _f("WHISPER_WAIT", 45)
 WHISPER_PRELOAD = os.environ.get("WHISPER_PRELOAD", "1") == "1"
-SHAZAM_THREADS = max(1, int(_f("SHAZAM_THREADS", 2)))
+SHAZAM_THREADS = max(1, int(_f("SHAZAM_THREADS", 3)))
 LAST_RESORT = os.environ.get("LAST_RESORT", "1") == "1"
 LAST_RESORT_PIECES = max(1, int(_f("LAST_RESORT_PIECES", 2)))
+VAR_WORKERS = max(1, int(_f("VAR_WORKERS", 6)))
 ACR_TIMEOUT = 15
 SHAZAM_TIMEOUT = _f("SHAZAM_TIMEOUT", 20)
 FAST_W = _f("FAST_W", 1.0)
 FAST_GRACE = _f("FAST_GRACE", 2)
-SOFT_LAUNCH = _f("SOFT_LAUNCH", 6)
+SOFT_LAUNCH = _f("SOFT_LAUNCH", 4)
 LYRICS_DELAY = _f("LYRICS_DELAY", 2)
 TIE_GAP = 0.15
 EARLY_W = 1.6
@@ -95,12 +101,14 @@ EARLY_GAP = 0.5
 LAST_GAP = 0.3
 MAX_PIECES = 3
 
-_POOL = ThreadPoolExecutor(max_workers=10, thread_name_prefix="rec")
+_POOL = ThreadPoolExecutor(max_workers=12, thread_name_prefix="rec")
 _WPOOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="whisper")
-_VPOOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="variant")
+_VPOOL = ThreadPoolExecutor(max_workers=VAR_WORKERS, thread_name_prefix="variant")
 _SESS = requests.Session()
 _SESS.mount("https://", HTTPAdapter(pool_connections=4, pool_maxsize=12))
 _cfg = {"load": None, "local": None, "words": None, "local_excl": False}
+
+_ONLINE = ("acr", "shazam")
 
 
 def _accepts_exclude(fn):
@@ -119,7 +127,8 @@ def init(load_accounts, local_fn=None, words_fn=None):
     _cfg["local_excl"] = _accepts_exclude(local_fn)
     if words_fn and WHISPER_MODEL and WHISPER_PRELOAD:
         threading.Thread(target=_get_whisper, daemon=True, name="whisper-load").start()
-    log.info("recognition v15: local=%s lyrics=%s whisper=%s",
+    threading.Thread(target=_sh_warm, daemon=True, name="shazam-warm").start()
+    log.info("recognition v16: local=%s lyrics=%s whisper=%s",
              bool(local_fn), bool(words_fn), WHISPER_MODEL or "off")
 
 
@@ -361,7 +370,8 @@ def _acr(path):
             _acc_fail(acc["id"])
             continue
         _bump(acc["id"], "uses")
-        _ACC_ERR[acc["id"]] = 0
+        with _LOCK:
+            _ACC_ERR[acc["id"]] = 0
         code = (j.get("status") or {}).get("code")
         if code == 0:
             return _acr_parse(j), True
@@ -379,15 +389,36 @@ def _acr(path):
 
 
 # ======================================================================================
-# Shazam
+# Shazam (event-loop دائمی + یک نمونه‌ی مشترک)
 # ======================================================================================
-_SH = {"fails": 0, "until": 0.0}
+_SH = {"fails": 0, "until": 0.0, "loop": None, "obj": None}
+_SH_INIT = threading.Lock()
 _SH_SEM = threading.Semaphore(SHAZAM_THREADS)
 
 
+def _sh_get_loop():
+    with _SH_INIT:
+        if _SH["loop"] is None:
+            loop = asyncio.new_event_loop()
+            t = threading.Thread(target=loop.run_forever, daemon=True, name="shazam-loop")
+            t.start()
+            _SH["loop"] = loop
+        return _SH["loop"]
+
+
+def _sh_warm():
+    try:
+        _sh_get_loop()
+        from shazamio import Shazam  # noqa: F401  (import گرم می‌شه)
+    except Exception:
+        pass
+
+
 async def _shazam_async(path):
-    from shazamio import Shazam
-    s = Shazam()
+    if _SH["obj"] is None:
+        from shazamio import Shazam
+        _SH["obj"] = Shazam()
+    s = _SH["obj"]
     fn = getattr(s, "recognize", None) or getattr(s, "recognize_song")
     return await asyncio.wait_for(fn(path), SHAZAM_TIMEOUT)
 
@@ -397,24 +428,30 @@ def _shazam(path):
     if time.time() < _SH["until"]:
         return [], False
     out, ok = None, False
+    loop = _sh_get_loop()
     with _SH_SEM:
         for attempt in (1, 2):
+            fut = asyncio.run_coroutine_threadsafe(_shazam_async(path), loop)
             try:
-                out = asyncio.run(_shazam_async(path))
+                out = fut.result(SHAZAM_TIMEOUT + 5)
                 ok = True
                 break
-            except asyncio.TimeoutError:
+            except (asyncio.TimeoutError, TimeoutError):
+                fut.cancel()
                 log.warning("shazam timeout")
                 break
             except Exception as e:
+                fut.cancel()
                 log.warning("shazam failed (try %d): %s", attempt, str(e)[:120])
-                time.sleep(0.4)
+                if "No module named" in str(e):
+                    break
+                time.sleep(0.3)
     with _LOCK:
         if ok:
             _SH["fails"] = 0
         else:
             _SH["fails"] += 1
-            if _SH["fails"] >= 3:
+            if _SH["fails"] >= 4:
                 _SH["until"] = time.time() + 60
                 _SH["fails"] = 0
     if not ok:
@@ -431,7 +468,7 @@ def _shazam(path):
 # ======================================================================================
 # متن ترانه: صدا -> متن (Whisper) -> پیدا کردن ترانه از روی کلمات
 # ======================================================================================
-_WH = {"m": None, "fail": False}
+_WH = {"m": None, "fail": False, "lang": None}
 _WH_LOCK = threading.Lock()
 _WH_RUN = threading.Lock()
 _HALLU_SEG = re.compile(
@@ -458,18 +495,19 @@ def _get_whisper():
         return _WH["m"]
 
 
-def _transcribe(path) -> str:
+def _transcribe(path, lang=None) -> str:
     model = _get_whisper()
     if model is None:
         return ""
     kw = dict(vad_filter=True, vad_parameters=dict(min_silence_duration_ms=300),
               beam_size=max(1, int(_f("WHISPER_BEAM", 1))),
               condition_on_previous_text=False, temperature=0.0)
-    if WHISPER_LANG:
-        kw["language"] = WHISPER_LANG
+    lang = WHISPER_LANG or lang
+    if lang:
+        kw["language"] = lang
     try:
         with _WH_RUN:
-            segs, _info = model.transcribe(path, **kw)
+            segs, info = model.transcribe(path, **kw)
             kept = []
             for s in segs:
                 t = (getattr(s, "text", "") or "").strip()
@@ -484,7 +522,12 @@ def _transcribe(path) -> str:
                 if len(t) < 60 and _HALLU_SEG.search(t):
                     continue
                 kept.append(t)
-            return " ".join(kept).strip()
+            text = " ".join(kept).strip()
+            # زبانِ تشخیص‌داده‌شده برای تکه‌ی بعدی قفل می‌شه (سریع‌تر + دقیق‌تر)
+            if text and not WHISPER_LANG and not _WH["lang"]:
+                if getattr(info, "language_probability", 0) >= 0.7 and getattr(info, "language", None):
+                    _WH["lang"] = info.language
+            return text
     except Exception as e:
         log.warning("whisper failed: %s", str(e)[:150])
     return ""
@@ -496,6 +539,12 @@ def _usable_words(text):
     ws = re.findall(r"\w+", fold(text))
     if len(ws) < 5 or len(set(ws)) / len(ws) < 0.35:
         return []
+    # تکرار پشت‌سرهمِ یک کلمه (۴ بار یا بیشتر) = hallucination
+    run = 1
+    for a, b in zip(ws, ws[1:]):
+        run = run + 1 if a == b else 1
+        if run >= 4:
+            return []
     return ws
 
 
@@ -528,7 +577,7 @@ def _lyrics_vote(paths, stop=None):
     for i, p in enumerate(paths[:max(1, WHISPER_MAX_PIECES)]):
         if stop is not None and stop.is_set():
             return [], True
-        text = _transcribe(p)
+        text = _transcribe(p, _WH["lang"])
         ws = _usable_words(text)
         if not ws:
             continue
@@ -567,6 +616,16 @@ def _group(items):
         bonus = sum(min(0.6, 0.3 * (len(s) - 1)) for s in pieces.values())
         if len(per) >= 3:
             bonus += 0.25
+        # هم‌نظری متن ترانه با یک منبع مستقل (صدا + متن = دو نوع شاهد متفاوت)
+        if "lyrics" in per:
+            if "local" in per:
+                bonus += 0.3
+            if "hum" in per:
+                bonus += 0.2
+            if "acr" in per or "shazam" in per:
+                bonus += 0.15
+        elif "hum" in per and "local" in per:
+            bonus += 0.15
         out.append({"w": sum(per.values()) + bonus, "srcs": per, "items": g})
     out.sort(key=lambda x: (-x["w"], min(_NAME_PRIORITY.get(s, 9) for s in x["srcs"])))
     return out
@@ -609,24 +668,42 @@ def _tag(items, path, idx):
 
 
 # ======================================================================================
-# آخرین راه: نسخه‌ی تمیز / تغییر سرعت / فقط صدای خواننده / نویزگیری
+# آخرین راه: نسخه‌ی تمیز / تغییر سرعت / تغییر پیچ / فقط صدای خواننده / نویزگیری
 # ======================================================================================
+_VAR_DIR = "/dev/shm" if (os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK)) else tempfile.gettempdir()
+
 _VARIANTS = {
     "clean": "aresample=44100,highpass=f=100,lowpass=f=7500,dynaudnorm",
     "denoise": "aresample=44100,highpass=f=80,afftdn=nf=-25,dynaudnorm",
+    "vocal": "aresample=44100,highpass=f=180,lowpass=f=4000,dynaudnorm=f=150",
+    # سرعت+پیچ با هم (اسلوود/اسپدآپ)
     "fast": "aresample=44100,asetrate=55125,aresample=44100",
     "slow": "aresample=44100,asetrate=35280,aresample=44100",
     "fast2": "aresample=44100,asetrate=48510,aresample=44100",
     "slow2": "aresample=44100,asetrate=39690,aresample=44100",
-    "vocal": "aresample=44100,highpass=f=180,lowpass=f=4000,dynaudnorm=f=150",
+    # فقط سرعت (پیچ ثابت): کاور/اجرای کندتر یا تندتر
+    "tempo_up": "aresample=44100,atempo=1.12",
+    "tempo_down": "aresample=44100,atempo=0.89",
+    # فقط پیچ (سرعت ثابت): کاور با کلید متفاوت (±۲ نیم‌پرده)
+    "pitch_up": "aresample=44100,asetrate=49500,atempo=0.8909,aresample=44100",
+    "pitch_down": "aresample=44100,asetrate=39289,atempo=1.1225,aresample=44100",
 }
-_EXTRA_PIECE_VARIANTS = ("clean", "fast", "slow")
+_PRIMARY_VARIANTS = ("clean", "denoise", "tempo_down", "tempo_up", "pitch_up", "pitch_down",
+                     "slow", "fast", "vocal", "slow2", "fast2")
+_EXTRA_PIECE_VARIANTS = ("clean", "tempo_down", "pitch_up")
 
 
 def _variant(path, kind):
-    out = f"{path}_{kind}.mp3"
-    subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-y", "-i", path, "-vn", "-af", _VARIANTS[kind],
-                    "-ac", "1", "-ar", "44100", out], check=True, capture_output=True, timeout=60)
+    out = os.path.join(_VAR_DIR, f"rv_{uuid.uuid4().hex[:12]}_{kind}.mp3")
+    try:
+        subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-y", "-i", path, "-vn", "-af", _VARIANTS[kind],
+                        "-ac", "1", "-ar", "44100", out], check=True, capture_output=True, timeout=60)
+    except Exception:
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+        raise
     return out
 
 
@@ -696,7 +773,7 @@ def _ask_engines(paths, rejected, items, stop):
         return max(0.2, deadline - time.time())
 
     def get_sh(i):
-        """Shazam رایگانه: هر تکه فقط یک بار شروع می‌شه (تکه‌ی بعدی می‌تونه زودتر پیش‌شروع بشه)."""
+        """Shazam رایگانه: هر تکه فقط یک بار شروع می‌شه."""
         if i not in sh_f:
             f = _POOL.submit(_shazam, pieces[i])
             sh_f[i] = f
@@ -704,6 +781,7 @@ def _ask_engines(paths, rejected, items, stop):
         return sh_f[i]
 
     def launch(i):
+        """ACR (سهمیه‌دار) تکه‌به‌تکه؛ Shazam همه‌ی تکه‌ها از اول."""
         p = pieces[i]
         fa = _POOL.submit(_acr, p)
         futs[fa] = ("acr", p, i)
@@ -747,6 +825,9 @@ def _ask_engines(paths, rejected, items, stop):
             answered, failed = answered + (1 if ok else 0), failed + (0 if ok else 1)
             items.extend(_tag(got, path, idx))
 
+    def online_pending():
+        return [f for f, (k, _p, _i) in futs.items() if k in _ONLINE and not f.done()]
+
     def show(tag):
         if len(items) != st["logged"]:
             st["logged"] = len(items)
@@ -756,8 +837,8 @@ def _ask_engines(paths, rejected, items, stop):
 
     try:
         launch(0)
-        if len(pieces) > 1:
-            get_sh(1)       # Shazam تکه‌ی دوم از همون اول موازی
+        for i in range(1, len(pieces)):
+            get_sh(i)       # Shazam همه‌ی تکه‌ها از همون اول موازی
         grace_until = None
         while time.time() < deadline:
             harvest(futs)
@@ -768,6 +849,10 @@ def _ask_engines(paths, rejected, items, stop):
             if groups and groups[0]["w"] >= EARLY_W and groups[0]["w"] - second >= EARLY_GAP:
                 return _to_song(groups)
             if _single_fast(groups, second):
+                # همه‌ی موتورهای آنلاین شروع‌شده جواب دادن و کسی مخالف نیست -> بدون صبر
+                if not online_pending() and st["launched"] >= min(2, len(pieces)):
+                    log.info("fast accept (all answered): %s", groups[0]["items"][0]["title"])
+                    return _to_song(groups)
                 if grace_until is None:
                     grace_until = now + FAST_GRACE
                 if now >= grace_until:
@@ -785,7 +870,10 @@ def _ask_engines(paths, rejected, items, stop):
                     continue
             if not pending:
                 break
-            wait(pending, timeout=min(0.4, left()), return_when=FIRST_COMPLETED)
+            waitset = list(pending)
+            if st["lyr"] is not None and not st["lyr_taken"] and not st["lyr"].done():
+                waitset.append(st["lyr"])
+            wait(waitset, timeout=min(0.3, left()), return_when=FIRST_COMPLETED)
         harvest(futs)
 
         start_lyrics()
@@ -797,7 +885,7 @@ def _ask_engines(paths, rejected, items, stop):
         tie = bool(groups and groups[0]["w"] >= GUESS_MIN_W)
 
         if LAST_RESORT and time.time() < deadline:
-            tasks = [(pieces[0], 0, k) for k in _VARIANTS]
+            tasks = [(pieces[0], 0, k) for k in _PRIMARY_VARIANTS]
             for j in range(1, min(LAST_RESORT_PIECES, len(pieces))):
                 tasks += [(pieces[j], j, k) for k in _EXTRA_PIECE_VARIANTS]
             vfuts = {_VPOOL.submit(_try_variant, p, k, rejected): ("variant", p, j) for p, j, k in tasks}
@@ -843,7 +931,7 @@ _DPOOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="dl")
 _CACHE = {}
 _DLOCK = threading.Lock()
 _DL_VARIANT = re.compile(r"remix|slowed|sped\s?up|reverb|nightcore|karaoke|instrumental|live|cover|acoustic|8d|"
-                      r"mashup|bass\s?boost|lofi|lo-fi|piano|ریمیکس|اسلو|کاور|زنده", re.I)
+                         r"mashup|bass\s?boost|lofi|lo-fi|piano|ریمیکس|اسلو|کاور|زنده", re.I)
 
 
 def _norm(s):
@@ -997,13 +1085,22 @@ def tag_mp3_with_cover(src, cover_bytes, title, artist, out, thumb=None):
 
 
 def clean_dl_cache(max_age=6 * 3600):
-    """فایل‌های قدیمی کش دانلود (DL_DIR) رو پاک می‌کنه؛ bot.py هر ۱۰ دقیقه صداش می‌زنه."""
+    """فایل‌های قدیمی کش دانلود (DL_DIR) رو پاک می‌کنه؛ bot.py هر ۱۰ دقیقه صداش می‌زنه.
+    فایل‌های ناقص آخرین راه تو /dev/shm هم اگه جا مونده باشن پاک می‌شن."""
     now = time.time()
     try:
         for n in os.listdir(DL_DIR):
             p = os.path.join(DL_DIR, n)
             if os.path.isfile(p) and now - os.path.getmtime(p) > max_age:
                 os.remove(p)
+    except OSError:
+        pass
+    try:
+        for n in os.listdir(_VAR_DIR):
+            if n.startswith("rv_"):
+                p = os.path.join(_VAR_DIR, n)
+                if os.path.isfile(p) and now - os.path.getmtime(p) > 900:
+                    os.remove(p)
     except OSError:
         pass
 
