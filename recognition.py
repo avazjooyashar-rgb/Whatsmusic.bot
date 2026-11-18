@@ -34,7 +34,7 @@ recognition.py - v16 (یک فایل کامل، جای recognition.py قبلی؛ 
   WHISPER_BEAM=1 (برای دقت بیشتر ۳ یا ۵؛ کندتر)  WHISPER_PRELOAD=1
   FAST_W=1.0  FAST_GRACE=2  SOFT_LAUNCH=4  LYRICS_DELAY=2  SHAZAM_TIMEOUT=20  SHAZAM_THREADS=3
   FP_STRONG=60  FP_STRONG2=20  FP_WEAK_MIN=12  LOCAL_PIECES=3
-  HUM_CAP=0.6  LAST_RESORT=1  LAST_RESORT_PIECES=2  VAR_WORKERS=2 LAST_RESORT_BUDGET=15 WHISPER_LOOSE=1  DB_PATH
+  DEBUG_KEEP_DIR=/tmp/dbg (فقط عیب‌یابی)  HUM_CAP=0.6  LAST_RESORT=1  LAST_RESORT_PIECES=2  VAR_WORKERS=2 LAST_RESORT_BUDGET=15 WHISPER_LOOSE=1  DB_PATH
 """
 import asyncio
 import base64
@@ -133,7 +133,7 @@ def init(load_accounts, local_fn=None, words_fn=None):
     if words_fn and WHISPER_MODEL and WHISPER_PRELOAD:
         threading.Thread(target=_get_whisper, daemon=True, name="whisper-load").start()
     threading.Thread(target=_sh_warm, daemon=True, name="shazam-warm").start()
-    log.info("recognition v16.7: local=%s lyrics=%s whisper=%s",
+    log.info("recognition v16.8: local=%s lyrics=%s whisper=%s",
              bool(local_fn), bool(words_fn), WHISPER_MODEL or "off")
 
 
@@ -790,6 +790,17 @@ def ask_engines(paths, rejected=(), _unused1=None, _unused2=None, extra=None):
             except OSError:
                 sizes.append(-1)
         log.info("START pieces(KB)=%s", sizes)
+        dbg = os.environ.get("DEBUG_KEEP_DIR", "").strip()
+        if dbg:                      # فقط برای عیب‌یابی: تکه‌های صدا رو نگه می‌داره تا دستی تست بشن
+            try:
+                import shutil
+                os.makedirs(dbg, exist_ok=True)
+                stamp = time.strftime("%H%M%S")
+                for i, p in enumerate(list(paths)[:MAX_PIECES]):
+                    shutil.copy(p, os.path.join(dbg, f"{stamp}_p{i}{os.path.splitext(p)[1] or '.mp3'}"))
+                log.info("DEBUG pieces saved: %s/%s_p*", dbg, stamp)
+            except Exception as e:
+                log.info("DEBUG save failed: %s", str(e)[:100])
         res = _ask_engines(paths, set(rejected or ()), list(extra or []), stop)
         if res:
             log.info("RESULT (%.1fs): %s - %s [%s]", time.time() - t0, res.get("artist"), res.get("title"),
