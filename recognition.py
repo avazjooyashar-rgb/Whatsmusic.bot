@@ -93,6 +93,7 @@ ACR_TIMEOUT = 15
 SHAZAM_TIMEOUT = _f("SHAZAM_TIMEOUT", 8)          # هر تلاش؛ اتصال گیرکرده رها و دوباره امتحان می‌شه
 SHAZAM_TRIES = max(1, int(_f("SHAZAM_TRIES", 2)))
 SHAZAM_COOLDOWN = _f("SHAZAM_COOLDOWN", 120)
+SHAZAM_VARIANT_KINDS = {k.strip() for k in os.environ.get("SHAZAM_VARIANT_KINDS", "clean,slow,fast").split(",") if k.strip()}
 FAST_W = _f("FAST_W", 1.0)
 FAST_GRACE = _f("FAST_GRACE", 2)
 SOFT_LAUNCH = _f("SOFT_LAUNCH", 4)
@@ -130,7 +131,7 @@ def init(load_accounts, local_fn=None, words_fn=None):
     if words_fn and WHISPER_MODEL and WHISPER_PRELOAD:
         threading.Thread(target=_get_whisper, daemon=True, name="whisper-load").start()
     threading.Thread(target=_sh_warm, daemon=True, name="shazam-warm").start()
-    log.info("recognition v16.3: local=%s lyrics=%s whisper=%s",
+    log.info("recognition v16.4: local=%s lyrics=%s whisper=%s",
              bool(local_fn), bool(words_fn), WHISPER_MODEL or "off")
 
 
@@ -419,14 +420,16 @@ async def _shazam_async(path):
     return await asyncio.wait_for(fn(path), SHAZAM_TIMEOUT)
 
 
-def _shazam(path):
-    """-> (items, answered)"""
+def _shazam(path, variant=False):
+    """-> (items, answered)
+    variant=True: نسخه‌ی دستکاری‌شده؛ یک تلاش، و شکستش حساب breaker نمی‌شه."""
     if time.time() < _SH["until"]:
         return [], False
     out, ok = None, False
+    tries = 1 if variant else SHAZAM_TRIES
     t_start = time.time()
     with _SH_SEM:
-        for attempt in range(1, SHAZAM_TRIES + 1):
+        for attempt in range(1, tries + 1):
             try:
                 out = asyncio.run(_shazam_async(path))
                 ok = True
@@ -439,11 +442,15 @@ def _shazam(path):
                 if "No module named" in str(e):
                     break
                 time.sleep(0.3)
-    with _LOCK:
-        if ok:
-            _SH["fails"] = 0
-        else:
-            _SH["fails"] += 1
+    if variant:
+        if not ok:
+            return [], False
+    else:
+        with _LOCK:
+            if ok:
+                _SH["fails"] = 0
+            else:
+                _SH["fails"] += 1
             if _SH["fails"] >= 3:
                 _SH["until"] = time.time() + SHAZAM_COOLDOWN
                 _SH["fails"] = 0
@@ -452,6 +459,8 @@ def _shazam(path):
     if not ok:
         return [], False
     t = (out or {}).get("track")
+    log.info("shazam %s (%.1fs): %s", "variant" if variant else "ok", time.time() - t_start,
+             (t or {}).get("title") or "no match")
     if not t or not t.get("title"):
         return [], True
     imgs = t.get("images") or {}
@@ -713,11 +722,12 @@ def _try_variant(path, kind, rejected):
         log.info("variant %s failed: %s", kind, str(e)[:100])
         return [], False
     try:
-        got, ok = _shazam(v)
-        answered = ok
-        for c in got:
-            c["w"] = 0.9
-        items += got
+        if kind in SHAZAM_VARIANT_KINDS:      # فقط چند نسخه‌ی مهم به Shazam می‌رن؛ ریزش درخواست باعث گیرکردنش می‌شد
+            got, ok = _shazam(v, variant=True)
+            answered = ok
+            for c in got:
+                c["w"] = 0.9
+            items += got
         if _cfg["local"]:
             r = _local_piece(v, rejected)
             if r and r.get("score", 0) >= FP_WEAK_MIN:
