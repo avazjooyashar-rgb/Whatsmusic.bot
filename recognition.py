@@ -128,7 +128,7 @@ def init(load_accounts, local_fn=None, words_fn=None):
     if words_fn and WHISPER_MODEL and WHISPER_PRELOAD:
         threading.Thread(target=_get_whisper, daemon=True, name="whisper-load").start()
     threading.Thread(target=_sh_warm, daemon=True, name="shazam-warm").start()
-    log.info("recognition v16: local=%s lyrics=%s whisper=%s",
+    log.info("recognition v16.1: local=%s lyrics=%s whisper=%s",
              bool(local_fn), bool(words_fn), WHISPER_MODEL or "off")
 
 
@@ -318,6 +318,14 @@ def _acc_fail(acc_id):
             _ACC_ERR[acc_id] = 0
 
 
+def _num(x, default=0.0) -> float:
+    """ACRCloud بعضی فیلدها (duration_ms, score) رو گاهی رشته می‌فرسته."""
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return default
+
+
 def _acr_parse(j) -> list:
     out = []
     md = j.get("metadata") or {}
@@ -328,8 +336,8 @@ def _acr_parse(j) -> list:
             ext = m.get("external_metadata") or {}
             sp = ((ext.get("spotify") or {}).get("track") or {}).get("id")
             yt = (ext.get("youtube") or {}).get("vid")
-            ms = m.get("duration_ms") or 0
-            score = float(m.get("score") or 0) / 100
+            ms = _num(m.get("duration_ms"))
+            score = _num(m.get("score")) / 100
             if kind == "humming":
                 w = min(HUM_CAP, score * 0.7)      # ملودی تنها هرگز قبول نمی‌شه
                 src = "hum"
@@ -389,36 +397,22 @@ def _acr(path):
 
 
 # ======================================================================================
-# Shazam (event-loop دائمی + یک نمونه‌ی مشترک)
+# Shazam (هر تماس لوپ مخصوص خودش رو داره؛ تماس‌ها موازی‌ان و هم‌دیگه رو بلاک نمی‌کنن)
 # ======================================================================================
-_SH = {"fails": 0, "until": 0.0, "loop": None, "obj": None}
-_SH_INIT = threading.Lock()
+_SH = {"fails": 0, "until": 0.0}
 _SH_SEM = threading.Semaphore(SHAZAM_THREADS)
-
-
-def _sh_get_loop():
-    with _SH_INIT:
-        if _SH["loop"] is None:
-            loop = asyncio.new_event_loop()
-            t = threading.Thread(target=loop.run_forever, daemon=True, name="shazam-loop")
-            t.start()
-            _SH["loop"] = loop
-        return _SH["loop"]
 
 
 def _sh_warm():
     try:
-        _sh_get_loop()
         from shazamio import Shazam  # noqa: F401  (import گرم می‌شه)
     except Exception:
         pass
 
 
 async def _shazam_async(path):
-    if _SH["obj"] is None:
-        from shazamio import Shazam
-        _SH["obj"] = Shazam()
-    s = _SH["obj"]
+    from shazamio import Shazam
+    s = Shazam()
     fn = getattr(s, "recognize", None) or getattr(s, "recognize_song")
     return await asyncio.wait_for(fn(path), SHAZAM_TIMEOUT)
 
@@ -428,20 +422,17 @@ def _shazam(path):
     if time.time() < _SH["until"]:
         return [], False
     out, ok = None, False
-    loop = _sh_get_loop()
+    t_start = time.time()
     with _SH_SEM:
         for attempt in (1, 2):
-            fut = asyncio.run_coroutine_threadsafe(_shazam_async(path), loop)
             try:
-                out = fut.result(SHAZAM_TIMEOUT + 5)
+                out = asyncio.run(_shazam_async(path))
                 ok = True
                 break
             except (asyncio.TimeoutError, TimeoutError):
-                fut.cancel()
-                log.warning("shazam timeout")
+                log.warning("shazam timeout (%.0fs)", time.time() - t_start)
                 break
             except Exception as e:
-                fut.cancel()
                 log.warning("shazam failed (try %d): %s", attempt, str(e)[:120])
                 if "No module named" in str(e):
                     break
