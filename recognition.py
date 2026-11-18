@@ -34,7 +34,7 @@ recognition.py - v16 (یک فایل کامل، جای recognition.py قبلی؛ 
   WHISPER_BEAM=1 (برای دقت بیشتر ۳ یا ۵؛ کندتر)  WHISPER_PRELOAD=1
   FAST_W=1.0  FAST_GRACE=2  SOFT_LAUNCH=4  LYRICS_DELAY=2  SHAZAM_TIMEOUT=20  SHAZAM_THREADS=3
   FP_STRONG=60  FP_STRONG2=20  FP_WEAK_MIN=12  LOCAL_PIECES=3
-  HUM_CAP=0.6  LAST_RESORT=1  LAST_RESORT_PIECES=2  VAR_WORKERS=6  DB_PATH
+  HUM_CAP=0.6  LAST_RESORT=1  LAST_RESORT_PIECES=2  VAR_WORKERS=2 LAST_RESORT_BUDGET=25 WHISPER_LOOSE=1  DB_PATH
 """
 import asyncio
 import base64
@@ -85,10 +85,12 @@ WHISPER_LANG = os.environ.get("WHISPER_LANG", "").strip()
 WHISPER_MAX_PIECES = int(_f("WHISPER_MAX_PIECES", 2))
 WHISPER_WAIT = _f("WHISPER_WAIT", 45)
 WHISPER_PRELOAD = os.environ.get("WHISPER_PRELOAD", "1") == "1"
+WHISPER_LOOSE = os.environ.get("WHISPER_LOOSE", "1") == "1"
 SHAZAM_THREADS = max(1, int(_f("SHAZAM_THREADS", 3)))
 LAST_RESORT = os.environ.get("LAST_RESORT", "1") == "1"
 LAST_RESORT_PIECES = max(1, int(_f("LAST_RESORT_PIECES", 2)))
-VAR_WORKERS = max(1, int(_f("VAR_WORKERS", 6)))
+VAR_WORKERS = max(1, int(_f("VAR_WORKERS", 2)))          # روی ۲ هسته بیشتر از ۲ ffmpeg همزمان Shazam رو گرسنه می‌کنه
+LAST_RESORT_BUDGET = _f("LAST_RESORT_BUDGET", 25)
 ACR_TIMEOUT = 15
 SHAZAM_TIMEOUT = _f("SHAZAM_TIMEOUT", 8)          # هر تلاش؛ اتصال گیرکرده رها و دوباره امتحان می‌شه
 SHAZAM_TRIES = max(1, int(_f("SHAZAM_TRIES", 2)))
@@ -131,7 +133,7 @@ def init(load_accounts, local_fn=None, words_fn=None):
     if words_fn and WHISPER_MODEL and WHISPER_PRELOAD:
         threading.Thread(target=_get_whisper, daemon=True, name="whisper-load").start()
     threading.Thread(target=_sh_warm, daemon=True, name="shazam-warm").start()
-    log.info("recognition v16.5: local=%s lyrics=%s whisper=%s",
+    log.info("recognition v16.6: local=%s lyrics=%s whisper=%s",
              bool(local_fn), bool(words_fn), WHISPER_MODEL or "off")
 
 
@@ -503,43 +505,63 @@ def _get_whisper():
         return _WH["m"]
 
 
-def _transcribe(path, lang=None):
-    """-> (text, زبان تشخیص‌داده‌شده یا None)"""
-    model = _get_whisper()
-    if model is None:
-        return "", None
-    kw = dict(vad_filter=True, vad_parameters=dict(min_silence_duration_ms=300),
-              beam_size=max(1, int(_f("WHISPER_BEAM", 1))),
-              condition_on_previous_text=False, temperature=0.0)
-    lang = WHISPER_LANG or lang
+def _whisper_pass(model, path, lang, vad, strict):
+    kw = dict(beam_size=max(1, int(_f("WHISPER_BEAM", 1))),
+              condition_on_previous_text=False, temperature=0.0, vad_filter=bool(vad))
+    if vad:
+        kw["vad_parameters"] = dict(min_silence_duration_ms=300)
     if lang:
         kw["language"] = lang
+    nsp, lp, cr = (0.6, -1.3, 2.4) if strict else (0.9, -1.7, 2.6)
+    segs, info = model.transcribe(path, **kw)
+    kept = []
+    drop = {"no_speech": 0, "logprob": 0, "compress": 0, "halluc": 0}
+    for s_ in segs:
+        t = (getattr(s_, "text", "") or "").strip()
+        if not t:
+            continue
+        if getattr(s_, "no_speech_prob", 0) >= nsp:
+            drop["no_speech"] += 1
+            continue
+        if getattr(s_, "avg_logprob", 0) < lp:
+            drop["logprob"] += 1
+            continue
+        if getattr(s_, "compression_ratio", 0) > cr:
+            drop["compress"] += 1
+            continue
+        if len(t) < 60 and _HALLU_SEG.search(t):
+            drop["halluc"] += 1
+            continue
+        kept.append(t)
+    return " ".join(kept).strip(), info, drop
+
+
+def _transcribe(path, lang=None):
+    """-> (text, زبان تشخیص‌داده‌شده یا None, loose)
+    پاس اول: با VAD و فیلتر سخت‌گیر (مناسب ویس). اگه چیزی نشنید، پاس دوم: بدون VAD و فیلتر نرم‌تر
+    (VAD گاهی آواز با موزیک رو «غیرگفتار» می‌دونه و کل صدا رو حذف می‌کنه)."""
+    model = _get_whisper()
+    if model is None:
+        return "", None, False
+    lang = WHISPER_LANG or lang
     try:
         with _WH_RUN:
-            segs, info = model.transcribe(path, **kw)
-            kept = []
-            for s in segs:
-                t = (getattr(s, "text", "") or "").strip()
-                if not t:
-                    continue
-                if getattr(s, "no_speech_prob", 0) >= 0.6:
-                    continue
-                if getattr(s, "avg_logprob", 0) < -1.3:
-                    continue
-                if getattr(s, "compression_ratio", 0) > 2.4:
-                    continue
-                if len(t) < 60 and _HALLU_SEG.search(t):
-                    continue
-                kept.append(t)
-            text = " ".join(kept).strip()
+            text, info, drop = _whisper_pass(model, path, lang, vad=True, strict=True)
+            loose = False
+            log.info("whisper pass1 (vad): %d chars, dropped=%s, lang=%s(%.2f)", len(text), drop,
+                     getattr(info, "language", None), getattr(info, "language_probability", 0) or 0)
+            if not text and WHISPER_LOOSE:
+                text, info, drop = _whisper_pass(model, path, lang, vad=False, strict=False)
+                loose = True
+                log.info("whisper pass2 (no vad): %d chars, dropped=%s", len(text), drop)
             det = None
             if text and not WHISPER_LANG and not lang:
                 if getattr(info, "language_probability", 0) >= 0.85 and getattr(info, "language", None):
                     det = info.language
-            return text, det
+            return text, det, loose
     except Exception as e:
         log.warning("whisper failed: %s", str(e)[:150])
-    return "", None
+    return "", None, False
 
 
 def _usable_words(text):
@@ -589,7 +611,7 @@ def _lyrics_vote(paths, stop=None):
     for i, p in enumerate(paths[:max(1, WHISPER_MAX_PIECES)]):
         if stop is not None and stop.is_set():
             return [], True
-        text, det = _transcribe(p, lang)
+        text, det, loose = _transcribe(p, lang)
         lang = lang or det
         ws = _usable_words(text)
         if not ws:
@@ -599,6 +621,8 @@ def _lyrics_vote(paths, stop=None):
         song, n = _find_by_words(ws)
         if song:
             w = 0.9 if n >= 10 else (0.8 if n >= 8 else 0.6)
+            if loose:
+                w = min(w, 0.78)       # متن پاس دوم (بدون VAD) کمی کم‌اطمینان‌تره
             return [{"src": "lyrics", "title": song["title"], "artist": song.get("artist") or "",
                      "w": w, "dur": None, "link": song.get("link"),
                      "yt": None, "path": p, "idx": i}], True
@@ -921,8 +945,9 @@ def _ask_engines(paths, rejected, items, stop):
             vfuts = {_VPOOL.submit(_try_variant, p, k, rejected): ("variant", p, j) for p, j, k in tasks}
             futs.update(vfuts)
             pending = set(vfuts)
-            while pending and time.time() < deadline:
-                done, pending = wait(pending, timeout=left(), return_when=FIRST_COMPLETED)
+            lr_end = min(deadline, time.time() + LAST_RESORT_BUDGET)
+            while pending and time.time() < lr_end:
+                done, pending = wait(pending, timeout=max(0.2, lr_end - time.time()), return_when=FIRST_COMPLETED)
                 if not done:
                     break
                 harvest(vfuts)
