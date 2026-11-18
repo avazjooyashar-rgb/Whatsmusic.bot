@@ -90,8 +90,9 @@ LAST_RESORT = os.environ.get("LAST_RESORT", "1") == "1"
 LAST_RESORT_PIECES = max(1, int(_f("LAST_RESORT_PIECES", 2)))
 VAR_WORKERS = max(1, int(_f("VAR_WORKERS", 6)))
 ACR_TIMEOUT = 15
-SHAZAM_TIMEOUT = _f("SHAZAM_TIMEOUT", 10)
-SHAZAM_COOLDOWN = _f("SHAZAM_COOLDOWN", 300)
+SHAZAM_TIMEOUT = _f("SHAZAM_TIMEOUT", 8)          # هر تلاش؛ اتصال گیرکرده رها و دوباره امتحان می‌شه
+SHAZAM_TRIES = max(1, int(_f("SHAZAM_TRIES", 2)))
+SHAZAM_COOLDOWN = _f("SHAZAM_COOLDOWN", 120)
 FAST_W = _f("FAST_W", 1.0)
 FAST_GRACE = _f("FAST_GRACE", 2)
 SOFT_LAUNCH = _f("SOFT_LAUNCH", 4)
@@ -129,7 +130,7 @@ def init(load_accounts, local_fn=None, words_fn=None):
     if words_fn and WHISPER_MODEL and WHISPER_PRELOAD:
         threading.Thread(target=_get_whisper, daemon=True, name="whisper-load").start()
     threading.Thread(target=_sh_warm, daemon=True, name="shazam-warm").start()
-    log.info("recognition v16.2: local=%s lyrics=%s whisper=%s",
+    log.info("recognition v16.3: local=%s lyrics=%s whisper=%s",
              bool(local_fn), bool(words_fn), WHISPER_MODEL or "off")
 
 
@@ -425,14 +426,14 @@ def _shazam(path):
     out, ok = None, False
     t_start = time.time()
     with _SH_SEM:
-        for attempt in (1, 2):
+        for attempt in range(1, SHAZAM_TRIES + 1):
             try:
                 out = asyncio.run(_shazam_async(path))
                 ok = True
                 break
             except (asyncio.TimeoutError, TimeoutError):
-                log.warning("shazam timeout (%.0fs)", time.time() - t_start)
-                break
+                log.warning("shazam timeout (try %d, %.0fs)", attempt, time.time() - t_start)
+                continue
             except Exception as e:
                 log.warning("shazam failed (try %d): %s", attempt, str(e)[:120])
                 if "No module named" in str(e):
@@ -443,7 +444,7 @@ def _shazam(path):
             _SH["fails"] = 0
         else:
             _SH["fails"] += 1
-            if _SH["fails"] >= 2:
+            if _SH["fails"] >= 3:
                 _SH["until"] = time.time() + SHAZAM_COOLDOWN
                 _SH["fails"] = 0
                 log.warning("shazam disabled for %ds after repeated failures (server IP may be blocked/slow)",
