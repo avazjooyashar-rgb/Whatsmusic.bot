@@ -2530,6 +2530,8 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return await on_lyrics(q, data)
         if data.startswith("lang:"):
             return await on_lang_button(q, data)
+        if data.startswith("ck:"):
+            return await on_ck(q, data)
         await q.answer()
     except Exception:
         log.exception("button %s failed", data[:20])
@@ -2611,8 +2613,13 @@ def _cookie_rows(text: str):
         if not l.strip() or (l.startswith("#") and not l.startswith("#HttpOnly_")):
             continue
         parts = l.split("\t")
-        if len(parts) == 7:
-            out.append(((parts[0].replace("#HttpOnly_", "").lstrip(".").lower(), parts[2], parts[5]), l))
+        if len(parts) != 7:
+            continue
+        try:
+            l.encode("latin-1")     # a cookie with other characters (e.g. Persian) breaks yt-dlp's Cookie header
+        except UnicodeEncodeError:
+            continue
+        out.append(((parts[0].replace("#HttpOnly_", "").lstrip(".").lower(), parts[2], parts[5]), l))
     return out
 
 
@@ -2624,6 +2631,152 @@ def merge_cookie_text(old: str, new: str) -> str:
     new_keys = {k for k, _ in new_rows}
     keep = [l for k, l in _cookie_rows(old) if k not in new_keys]
     return "# Netscape HTTP Cookie File\n" + "\n".join(keep + [l for _, l in new_rows]) + "\n"
+
+
+# --- admin cookie panel: /cookies -> status (with a live login check), delete per site, then upload a fresh file ---
+_CK_SITES = {
+    "yt": ("یوتیوب", ("youtube.com", "google.com"), _YT_LOGIN_COOKIES),
+    "ig": ("اینستاگرام", ("instagram.com",), {"sessionid"}),
+}
+_CK_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+
+def _ck_domain_ok(domain: str, suffixes) -> bool:
+    d = (domain or "").replace("#HttpOnly_", "").lstrip(".").lower()
+    return any(d == s or d.endswith("." + s) for s in suffixes)
+
+
+def _cookie_jar():
+    jar = http.cookiejar.MozillaCookieJar(COOKIES)
+    jar.load(ignore_discard=True, ignore_expires=True)
+    return jar
+
+
+def _live_ig(jar):
+    """True = logged in, False = Instagram says logged out, None = could not tell."""
+    try:
+        s = requests.Session()
+        s.cookies = jar
+        csrf = next((c.value for c in jar if c.name == "csrftoken" and "instagram" in c.domain), "")
+        s.headers.update({"User-Agent": _CK_UA, "X-IG-App-ID": IG_APP_ID, "X-Requested-With": "XMLHttpRequest",
+                          "X-CSRFToken": csrf, "Referer": "https://www.instagram.com/"})
+        r = s.get("https://www.instagram.com/api/v1/accounts/current_user/?edit=true", timeout=15)
+        j = r.json()
+        if isinstance(j, dict) and j.get("user"):
+            return True
+        if isinstance(j, dict) and (j.get("message") == "login_required" or j.get("logout_reason") is not None):
+            return False
+    except Exception as e:
+        log.info("instagram live check: %s", str(e)[:100])
+    return None
+
+
+def _live_yt(jar):
+    try:
+        r = requests.get("https://www.youtube.com/", cookies=jar, timeout=15,
+                         headers={"User-Agent": _CK_UA, "Accept-Language": "en-US,en;q=0.9"})
+        if '"LOGGED_IN":true' in r.text:
+            return True
+        if '"LOGGED_IN":false' in r.text:
+            return False
+    except Exception as e:
+        log.info("youtube live check: %s", str(e)[:100])
+    return None
+
+
+def cookie_status_text() -> str:
+    if not os.path.exists(COOKIES):
+        return "🍪 فایل کوکی وجود ندارد.\nفایل cookies.txt را همین‌جا بفرست."
+    try:
+        jar = _cookie_jar()
+    except Exception as e:
+        return f"🍪 فایل کوکی خراب است ({str(e)[:80]}).\nپاکش کن و فایل تازه بفرست."
+    now = time.time()
+    lines = [f"🍪 وضعیت کوکی‌ها (فایل {(now - os.path.getmtime(COOKIES)) / 3600:.0f} ساعت پیش عوض شده)", ""]
+    live = {"yt": _live_yt, "ig": _live_ig}
+    for key, (name, suffixes, login_names) in _CK_SITES.items():
+        mine = [c for c in jar if _ck_domain_ok(c.domain, suffixes)]
+        logins = [c for c in mine if c.name in login_names]
+        if not mine:
+            lines.append(f"{name}: ❌ هیچ کوکی‌ای نیست")
+            continue
+        if not logins:
+            state = "❌ کوکی لاگین ندارد"
+        elif all(c.expires and c.expires < now for c in logins):
+            state = "❌ منقضی شده"
+        else:
+            state = "✅ کوکی لاگین دارد"
+        res = live[key](jar)
+        check = {True: "✅ لاگین است", False: "❌ لاگین نیست (باطل شده)", None: "❔ نامشخص"}[res]
+        lines.append(f"{name}: {len(mine)} کوکی | {state} | بررسی زنده: {check}")
+    lines += ["", "برای عوض کردن: اول خرابش را پاک کن، بعد فایل تازه را همین‌جا بفرست."]
+    return "\n".join(lines)
+
+
+def cookie_delete(which: str) -> int:
+    """Removes every cookie of a site ('yt' / 'ig' / 'all') from the file. -> how many were removed."""
+    suffixes = tuple(s for k, (_n, ss, _l) in _CK_SITES.items() if which in (k, "all") for s in ss)
+    if not suffixes or not os.path.exists(COOKIES):
+        return 0
+    kept, removed = [], 0
+    with open(COOKIES, encoding="utf-8", errors="replace") as f:
+        for l in f.read().replace("\r\n", "\n").split("\n"):
+            parts = l.split("\t")
+            if len(parts) == 7 and _ck_domain_ok(parts[0], suffixes):
+                removed += 1
+            elif l.strip():
+                kept.append(l)
+    if not kept or not kept[0].startswith("#"):
+        kept.insert(0, "# Netscape HTTP Cookie File")
+    tmp = COOKIES + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(kept) + "\n")
+    os.replace(tmp, COOKIES)
+    return removed
+
+
+def ck_keyboard():
+    return Markup([
+        [Btn("🔄 بررسی دوباره", callback_data="ck:status")],
+        [Btn("🗑 پاک کردن یوتیوب", callback_data="ck:del:yt"),
+         Btn("🗑 پاک کردن اینستاگرام", callback_data="ck:del:ig")],
+        [Btn("🗑 پاک کردن همه", callback_data="ck:del:all")],
+    ])
+
+
+async def cmd_cookies(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or user.id not in ADMIN_IDS or not update.message:
+        return
+    wait_msg = await update.message.reply_text("⏳ در حال بررسی…")
+    text = await asyncio.to_thread(cookie_status_text)
+    await wait_msg.edit_text(text, reply_markup=ck_keyboard())
+
+
+async def on_ck(q, data: str):
+    if q.from_user.id not in ADMIN_IDS:
+        return await q.answer("⛔", show_alert=True)
+    parts = data.split(":")
+    act = parts[1] if len(parts) > 1 else "status"
+    which = parts[2] if len(parts) > 2 else "all"
+    names = {"yt": "یوتیوب", "ig": "اینستاگرام", "all": "همه‌ی کوکی‌ها"}
+    if act == "del" and which in names:
+        await q.answer()
+        return await q.edit_message_text(
+            f"مطمئنی کوکی «{names[which]}» پاک شود؟",
+            reply_markup=Markup([[Btn("✅ بله، پاک کن", callback_data=f"ck:yes:{which}"),
+                                  Btn("❌ نه", callback_data="ck:status")]]))
+    if act == "yes" and which in names:
+        n = await asyncio.to_thread(cookie_delete, which)
+        await q.answer(f"{n} کوکی پاک شد")
+    else:
+        await q.answer("در حال بررسی…")
+    text = await asyncio.to_thread(cookie_status_text)
+    try:
+        await q.edit_message_text(text, reply_markup=ck_keyboard())
+    except Exception:
+        pass
 
 
 async def on_cookies_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2647,12 +2800,14 @@ async def on_cookies_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if err:
             await msg.reply_text(f"❌ ذخیره نشد: {err}")
             return
+        old_text = ""
         if os.path.exists(COOKIES):
             try:
                 with open(COOKIES, encoding="utf-8", errors="replace") as f:
-                    text = merge_cookie_text(f.read(), text)
+                    old_text = f.read()
             except OSError:
                 pass
+        text = merge_cookie_text(old_text, text)      # also drops cookie lines yt-dlp cannot send
         text = text.replace("\r\n", "\n").replace("\r", "\n")
         rows, names, _e = parse_cookie_file(text)
         tmp = COOKIES + ".tmp"
@@ -2667,7 +2822,8 @@ async def on_cookies_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ig = "ok" if "sessionid" in names else "MISSING"
         await msg.reply_text(f"✅ cookies.txt ذخیره شد (ادغام با قبلی): {rows} کوکی | "
                              f"youtube login: {login} | instagram: {ig}\n"
-                             "پیام فایل پاک شد. حالا یک آهنگ را امتحان کن.")
+                             "پیام فایل پاک شد. با دکمه‌ی «بررسی دوباره» لاگین را زنده چک کن.",
+                             reply_markup=ck_keyboard())
         log.info("cookies.txt replaced by an admin upload: %d cookies, youtube login %s", rows, login[:2])
     except Exception:
         log.exception("cookies upload failed")
@@ -2743,6 +2899,7 @@ def main():
     except Exception:
         log.exception("learn_forward not loaded - forwarding songs to teach the bot is off")
     app.add_handler(CommandHandler(["start", "lang"], cmd_start))
+    app.add_handler(CommandHandler("cookies", cmd_cookies))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(InlineQueryHandler(on_inline))
     app.add_handler(MessageHandler(
@@ -2759,4 +2916,3 @@ def main():
 
 if __name__ == "__main__":
     main()
- 
