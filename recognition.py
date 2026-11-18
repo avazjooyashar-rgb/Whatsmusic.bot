@@ -131,7 +131,7 @@ def init(load_accounts, local_fn=None, words_fn=None):
     if words_fn and WHISPER_MODEL and WHISPER_PRELOAD:
         threading.Thread(target=_get_whisper, daemon=True, name="whisper-load").start()
     threading.Thread(target=_sh_warm, daemon=True, name="shazam-warm").start()
-    log.info("recognition v16.4: local=%s lyrics=%s whisper=%s",
+    log.info("recognition v16.5: local=%s lyrics=%s whisper=%s",
              bool(local_fn), bool(words_fn), WHISPER_MODEL or "off")
 
 
@@ -261,6 +261,7 @@ def ask_local_full(paths, rejected=()):
         if r and r.get("track_id") is not None:
             by.setdefault(r["track_id"], []).append((i, p, r))
     if not by:
+        log.info("local db: no match (%d pieces)", len(pieces))
         return None, []
     tid, lst = max(by.items(), key=lambda kv: (len(kv[1]), max(x[2]["score"] for x in kv[1])))
     mx = max(x[2]["score"] for x in lst)
@@ -385,8 +386,11 @@ def _acr(path):
             _ACC_ERR[acc["id"]] = 0
         code = (j.get("status") or {}).get("code")
         if code == 0:
-            return _acr_parse(j), True
+            parsed = _acr_parse(j)
+            log.info("acr #%s ok: %s", acc["id"], [(c["src"], c["title"], round(c["w"], 2)) for c in parsed[:4]])
+            return parsed, True
         if code in (1001, 2000, 2001, 2002, 2003, 2004, 2005):
+            log.info("acr #%s: no match (status %s)", acc["id"], code)
             return [], True
         if code == 3003:
             _ACC_BLOCK[acc["id"]] = time.time() + 1800
@@ -571,7 +575,9 @@ def _find_by_words(ws):
             log.warning("lyrics search failed: %s", e)
             continue
         if song and song.get("title"):
+            log.info("lyrics search found: %s - %s (%d words)", song.get("artist"), song["title"], len(t))
             return song, len(t)
+    log.info("lyrics search: no match (%d words)", len(ws))
     return None, 0
 
 
@@ -587,6 +593,7 @@ def _lyrics_vote(paths, stop=None):
         lang = lang or det
         ws = _usable_words(text)
         if not ws:
+            log.info("lyrics: piece %d unusable (heard %d chars)", i, len(text))
             continue
         log.info("lyrics heard (%d words): %s", len(ws), text[:90])
         song, n = _find_by_words(ws)
@@ -747,8 +754,22 @@ def _try_variant(path, kind, rejected):
 # ======================================================================================
 def ask_engines(paths, rejected=(), _unused1=None, _unused2=None, extra=None):
     stop = threading.Event()
+    t0 = time.time()
     try:
-        return _ask_engines(paths, set(rejected or ()), list(extra or []), stop)
+        sizes = []
+        for p in list(paths)[:MAX_PIECES]:
+            try:
+                sizes.append(os.path.getsize(p) // 1024)
+            except OSError:
+                sizes.append(-1)
+        log.info("START pieces(KB)=%s", sizes)
+        res = _ask_engines(paths, set(rejected or ()), list(extra or []), stop)
+        if res:
+            log.info("RESULT (%.1fs): %s - %s [%s]", time.time() - t0, res.get("artist"), res.get("title"),
+                     res.get("engine"))
+        else:
+            log.info("RESULT (%.1fs): NOT FOUND", time.time() - t0)
+        return res
     finally:
         stop.set()
 
