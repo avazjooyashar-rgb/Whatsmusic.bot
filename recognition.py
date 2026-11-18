@@ -90,7 +90,8 @@ LAST_RESORT = os.environ.get("LAST_RESORT", "1") == "1"
 LAST_RESORT_PIECES = max(1, int(_f("LAST_RESORT_PIECES", 2)))
 VAR_WORKERS = max(1, int(_f("VAR_WORKERS", 6)))
 ACR_TIMEOUT = 15
-SHAZAM_TIMEOUT = _f("SHAZAM_TIMEOUT", 20)
+SHAZAM_TIMEOUT = _f("SHAZAM_TIMEOUT", 10)
+SHAZAM_COOLDOWN = _f("SHAZAM_COOLDOWN", 300)
 FAST_W = _f("FAST_W", 1.0)
 FAST_GRACE = _f("FAST_GRACE", 2)
 SOFT_LAUNCH = _f("SOFT_LAUNCH", 4)
@@ -128,7 +129,7 @@ def init(load_accounts, local_fn=None, words_fn=None):
     if words_fn and WHISPER_MODEL and WHISPER_PRELOAD:
         threading.Thread(target=_get_whisper, daemon=True, name="whisper-load").start()
     threading.Thread(target=_sh_warm, daemon=True, name="shazam-warm").start()
-    log.info("recognition v16.1: local=%s lyrics=%s whisper=%s",
+    log.info("recognition v16.2: local=%s lyrics=%s whisper=%s",
              bool(local_fn), bool(words_fn), WHISPER_MODEL or "off")
 
 
@@ -442,9 +443,11 @@ def _shazam(path):
             _SH["fails"] = 0
         else:
             _SH["fails"] += 1
-            if _SH["fails"] >= 4:
-                _SH["until"] = time.time() + 60
+            if _SH["fails"] >= 2:
+                _SH["until"] = time.time() + SHAZAM_COOLDOWN
                 _SH["fails"] = 0
+                log.warning("shazam disabled for %ds after repeated failures (server IP may be blocked/slow)",
+                            SHAZAM_COOLDOWN)
     if not ok:
         return [], False
     t = (out or {}).get("track")
@@ -459,7 +462,7 @@ def _shazam(path):
 # ======================================================================================
 # متن ترانه: صدا -> متن (Whisper) -> پیدا کردن ترانه از روی کلمات
 # ======================================================================================
-_WH = {"m": None, "fail": False, "lang": None}
+_WH = {"m": None, "fail": False}
 _WH_LOCK = threading.Lock()
 _WH_RUN = threading.Lock()
 _HALLU_SEG = re.compile(
@@ -486,10 +489,11 @@ def _get_whisper():
         return _WH["m"]
 
 
-def _transcribe(path, lang=None) -> str:
+def _transcribe(path, lang=None):
+    """-> (text, زبان تشخیص‌داده‌شده یا None)"""
     model = _get_whisper()
     if model is None:
-        return ""
+        return "", None
     kw = dict(vad_filter=True, vad_parameters=dict(min_silence_duration_ms=300),
               beam_size=max(1, int(_f("WHISPER_BEAM", 1))),
               condition_on_previous_text=False, temperature=0.0)
@@ -514,14 +518,14 @@ def _transcribe(path, lang=None) -> str:
                     continue
                 kept.append(t)
             text = " ".join(kept).strip()
-            # زبانِ تشخیص‌داده‌شده برای تکه‌ی بعدی قفل می‌شه (سریع‌تر + دقیق‌تر)
-            if text and not WHISPER_LANG and not _WH["lang"]:
-                if getattr(info, "language_probability", 0) >= 0.7 and getattr(info, "language", None):
-                    _WH["lang"] = info.language
-            return text
+            det = None
+            if text and not WHISPER_LANG and not lang:
+                if getattr(info, "language_probability", 0) >= 0.85 and getattr(info, "language", None):
+                    det = info.language
+            return text, det
     except Exception as e:
         log.warning("whisper failed: %s", str(e)[:150])
-    return ""
+    return "", None
 
 
 def _usable_words(text):
@@ -565,10 +569,12 @@ def _lyrics_vote(paths, stop=None):
     wf = _cfg["words"]
     if not wf or not WHISPER_MODEL:
         return [], True
+    lang = None            # قفل زبان فقط داخل همین درخواست (بین کاربرها قفل نمی‌مونه)
     for i, p in enumerate(paths[:max(1, WHISPER_MAX_PIECES)]):
         if stop is not None and stop.is_set():
             return [], True
-        text = _transcribe(p, _WH["lang"])
+        text, det = _transcribe(p, lang)
+        lang = lang or det
         ws = _usable_words(text)
         if not ws:
             continue
@@ -875,7 +881,8 @@ def _ask_engines(paths, rejected, items, stop):
             return _to_song(groups)
         tie = bool(groups and groups[0]["w"] >= GUESS_MIN_W)
 
-        if LAST_RESORT and time.time() < deadline:
+        shazam_up = time.time() >= _SH["until"]
+        if LAST_RESORT and time.time() < deadline and (shazam_up or _cfg["local"]):
             tasks = [(pieces[0], 0, k) for k in _PRIMARY_VARIANTS]
             for j in range(1, min(LAST_RESORT_PIECES, len(pieces))):
                 tasks += [(pieces[j], j, k) for k in _EXTRA_PIECE_VARIANTS]
