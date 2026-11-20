@@ -34,7 +34,7 @@ recognition.py - v16 (یک فایل کامل، جای recognition.py قبلی؛ 
   WHISPER_BEAM=1 (برای دقت بیشتر ۳ یا ۵؛ کندتر)  WHISPER_PRELOAD=1
   FAST_W=1.0  FAST_GRACE=2  SOFT_LAUNCH=4  LYRICS_DELAY=2  SHAZAM_TIMEOUT=20  SHAZAM_THREADS=3
   FP_STRONG=60  FP_STRONG2=20  FP_WEAK_MIN=12  LOCAL_PIECES=3
-  DEBUG_KEEP_DIR=/tmp/dbg (فقط عیب‌یابی)  HUM_CAP=0.6  LAST_RESORT=1  LAST_RESORT_PIECES=2  VAR_WORKERS=2 LAST_RESORT_BUDGET=15 WHISPER_LOOSE=1  DB_PATH
+  GROQ_API_KEY= GROQ_MODEL=whisper-large-v3 (اختیاری)  DEBUG_KEEP_DIR=/tmp/dbg (فقط عیب‌یابی)  HUM_CAP=0.6  LAST_RESORT=1  LAST_RESORT_PIECES=2  VAR_WORKERS=2 LAST_RESORT_BUDGET=15 WHISPER_LOOSE=1  DB_PATH
 """
 import asyncio
 import base64
@@ -86,6 +86,9 @@ WHISPER_MAX_PIECES = int(_f("WHISPER_MAX_PIECES", 2))
 WHISPER_WAIT = _f("WHISPER_WAIT", 45)
 WHISPER_PRELOAD = os.environ.get("WHISPER_PRELOAD", "1") == "1"
 WHISPER_LOOSE = os.environ.get("WHISPER_LOOSE", "1") == "1"
+GROQ_KEY = os.environ.get("GROQ_API_KEY", "").strip()      # اختیاری: Whisper large-v3 میزبانی‌شده (دقیق‌تر + CPU سرور رو مصرف نمی‌کنه)
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "whisper-large-v3").strip()
+GROQ_TIMEOUT = _f("GROQ_TIMEOUT", 25)
 SHAZAM_THREADS = max(1, int(_f("SHAZAM_THREADS", 3)))
 LAST_RESORT = os.environ.get("LAST_RESORT", "1") == "1"
 LAST_RESORT_PIECES = max(1, int(_f("LAST_RESORT_PIECES", 2)))
@@ -133,8 +136,8 @@ def init(load_accounts, local_fn=None, words_fn=None):
     if words_fn and WHISPER_MODEL and WHISPER_PRELOAD:
         threading.Thread(target=_get_whisper, daemon=True, name="whisper-load").start()
     threading.Thread(target=_sh_warm, daemon=True, name="shazam-warm").start()
-    log.info("recognition v16.8: local=%s lyrics=%s whisper=%s",
-             bool(local_fn), bool(words_fn), WHISPER_MODEL or "off")
+    log.info("recognition v16.9: local=%s lyrics=%s whisper=%s",
+             bool(local_fn), bool(words_fn), ("groq+" if GROQ_KEY else "") + (WHISPER_MODEL or "off"))
 
 
 # ======================================================================================
@@ -536,14 +539,52 @@ def _whisper_pass(model, path, lang, vad, strict):
     return " ".join(kept).strip(), info, drop
 
 
+def _groq_transcribe(path, lang=None):
+    """Whisper large-v3 از Groq (API سازگار با OpenAI). -> متن (ممکنه خالی) یا None اگه درخواست شکست خورد."""
+    try:
+        data = {"model": GROQ_MODEL, "temperature": "0", "response_format": "verbose_json"}
+        if lang:
+            data["language"] = lang
+        with open(path, "rb") as f:
+            r = _SESS.post("https://api.groq.com/openai/v1/audio/transcriptions",
+                           headers={"Authorization": f"Bearer {GROQ_KEY}"}, data=data,
+                           files={"file": (os.path.basename(path), f)}, timeout=GROQ_TIMEOUT)
+        if r.status_code != 200:
+            log.warning("groq asr HTTP %s: %s", r.status_code, r.text[:150].replace("\n", " "))
+            return None
+        j = r.json()
+        segs = j.get("segments")
+        if segs:
+            kept = []
+            for sg in segs:
+                t = (sg.get("text") or "").strip()
+                if not t or (sg.get("no_speech_prob") or 0) >= 0.9 or (sg.get("compression_ratio") or 0) > 2.6:
+                    continue
+                if len(t) < 60 and _HALLU_SEG.search(t):
+                    continue
+                kept.append(t)
+            text = " ".join(kept).strip()
+        else:
+            text = (j.get("text") or "").strip()
+        log.info("groq asr (%s): %d chars", GROQ_MODEL, len(text))
+        return text
+    except Exception as e:
+        log.warning("groq asr failed: %s", str(e)[:150])
+        return None
+
+
 def _transcribe(path, lang=None, skip_vad=False):
     """-> (text, زبان تشخیص‌داده‌شده یا None, loose)
     پاس اول: با VAD و فیلتر سخت‌گیر (مناسب ویس). اگه چیزی نشنید، پاس دوم: بدون VAD و فیلتر نرم‌تر
     (VAD گاهی آواز با موزیک رو «غیرگفتار» می‌دونه و کل صدا رو حذف می‌کنه)."""
+    lang = WHISPER_LANG or lang
+    if GROQ_KEY:
+        gt = _groq_transcribe(path, lang)
+        if gt:
+            return gt, None, False
     model = _get_whisper()
     if model is None:
         return "", None, False
-    lang = WHISPER_LANG or lang
     try:
         with _WH_RUN:
             text, loose = "", False
@@ -606,7 +647,7 @@ def _find_by_words(ws):
 
 def _lyrics_vote(paths, stop=None):
     wf = _cfg["words"]
-    if not wf or not WHISPER_MODEL:
+    if not wf or not (WHISPER_MODEL or GROQ_KEY):
         return [], True
     lang = None            # قفل زبان فقط داخل همین درخواست (بین کاربرها قفل نمی‌مونه)
     skip_vad = False       # اگه تکه‌ی قبلی فقط با پاس دوم متن داد، برای بعدی پاس VAD رو تکرار نمی‌کنیم
@@ -827,7 +868,7 @@ def _ask_engines(paths, rejected, items, stop):
         return None
     t0 = time.time()
     deadline = t0 + TOTAL_TIMEOUT
-    use_lyrics = bool(_cfg["words"] and WHISPER_MODEL)
+    use_lyrics = bool(_cfg["words"] and (WHISPER_MODEL or GROQ_KEY))
 
     answered = failed = 0
     futs = {}
