@@ -88,7 +88,8 @@ WHISPER_PRELOAD = os.environ.get("WHISPER_PRELOAD", "1") == "1"
 WHISPER_LOOSE = os.environ.get("WHISPER_LOOSE", "1") == "1"
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "").strip()      # اختیاری: Whisper large-v3 میزبانی‌شده (دقیق‌تر + CPU سرور رو مصرف نمی‌کنه)
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "whisper-large-v3").strip()
-GROQ_TIMEOUT = _f("GROQ_TIMEOUT", 25)
+GROQ_TIMEOUT = _f("GROQ_TIMEOUT", 12)
+GROQ_FALLBACK_LOCAL = os.environ.get("GROQ_FALLBACK_LOCAL", "0") == "1"   # اگه Groq جواب داد ولی متن خالی بود، Whisper محلی هم امتحان بشه؟
 SHAZAM_THREADS = max(1, int(_f("SHAZAM_THREADS", 3)))
 LAST_RESORT = os.environ.get("LAST_RESORT", "1") == "1"
 LAST_RESORT_PIECES = max(1, int(_f("LAST_RESORT_PIECES", 2)))
@@ -136,7 +137,7 @@ def init(load_accounts, local_fn=None, words_fn=None):
     if words_fn and WHISPER_MODEL and WHISPER_PRELOAD:
         threading.Thread(target=_get_whisper, daemon=True, name="whisper-load").start()
     threading.Thread(target=_sh_warm, daemon=True, name="shazam-warm").start()
-    log.info("recognition v16.9: local=%s lyrics=%s whisper=%s",
+    log.info("recognition v16.10: local=%s lyrics=%s whisper=%s",
              bool(local_fn), bool(words_fn), ("groq+" if GROQ_KEY else "") + (WHISPER_MODEL or "off"))
 
 
@@ -582,6 +583,8 @@ def _transcribe(path, lang=None, skip_vad=False):
         gt = _groq_transcribe(path, lang)
         if gt:
             return gt, None, False
+        if gt is not None and not GROQ_FALLBACK_LOCAL:
+            return "", None, False       # Groq جواب داد و چیزی نشنید (مثلاً فقط موزیکه): Whisper محلیِ کند رو تکرار نمی‌کنیم
     model = _get_whisper()
     if model is None:
         return "", None, False
