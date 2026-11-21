@@ -82,7 +82,7 @@ HUM_CAP = _f("HUM_CAP", 0.6)
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small").strip()
 WHISPER_COMPUTE = os.environ.get("WHISPER_COMPUTE", "int8").strip() or "int8"
 WHISPER_LANG = os.environ.get("WHISPER_LANG", "").strip()
-WHISPER_MAX_PIECES = int(_f("WHISPER_MAX_PIECES", 2))
+WHISPER_MAX_PIECES = int(_f("WHISPER_MAX_PIECES", 3))
 WHISPER_WAIT = _f("WHISPER_WAIT", 45)
 WHISPER_PRELOAD = os.environ.get("WHISPER_PRELOAD", "1") == "1"
 WHISPER_LOOSE = os.environ.get("WHISPER_LOOSE", "1") == "1"
@@ -138,7 +138,7 @@ def init(load_accounts, local_fn=None, words_fn=None):
     if words_fn and WHISPER_MODEL and WHISPER_PRELOAD:
         threading.Thread(target=_get_whisper, daemon=True, name="whisper-load").start()
     threading.Thread(target=_sh_warm, daemon=True, name="shazam-warm").start()
-    log.info("recognition v16.11: local=%s lyrics=%s whisper=%s",
+    log.info("recognition v16.13: local=%s lyrics=%s whisper=%s",
              bool(local_fn), bool(words_fn), ("groq+" if GROQ_KEY else "") + (WHISPER_MODEL or "off"))
 
 
@@ -614,7 +614,7 @@ def _usable_words(text):
     if not text:
         return []
     ws = re.findall(r"\w+", fold(text))
-    if len(ws) < 5 or len(set(ws)) / len(ws) < 0.35:
+    if len(ws) < 4 or len(set(ws)) / len(ws) < 0.35:
         return []
     # تکرار پشت‌سرهمِ یک کلمه (۴ بار یا بیشتر) = hallucination
     run = 1
@@ -658,6 +658,7 @@ def _lyrics_vote(paths, stop=None):
     if not wf or not (WHISPER_MODEL or GROQ_KEY):
         return [], True
     lang = None            # قفل زبان فقط داخل همین درخواست (بین کاربرها قفل نمی‌مونه)
+    all_ws = []
     skip_vad = False       # اگه تکه‌ی قبلی فقط با پاس دوم متن داد، برای بعدی پاس VAD رو تکرار نمی‌کنیم
     for i, p in enumerate(paths[:max(1, WHISPER_MAX_PIECES)]):
         if stop is not None and stop.is_set():
@@ -669,7 +670,8 @@ def _lyrics_vote(paths, stop=None):
         if not ws:
             log.info("lyrics: piece %d unusable (heard %d chars)", i, len(text))
             continue
-        log.info("lyrics heard (%d words): %s", len(ws), text[:90])
+        log.info("lyrics heard (%d words): %s", len(ws), text[:200])
+        all_ws.extend(ws)
         song, n = _find_by_words(ws)
         if song:
             w = 0.9 if n >= 10 else (0.8 if n >= 8 else 0.6)
@@ -678,6 +680,14 @@ def _lyrics_vote(paths, stop=None):
             return [{"src": "lyrics", "title": song["title"], "artist": song.get("artist") or "",
                      "w": w, "dur": None, "link": song.get("link"),
                      "yt": None, "path": p, "idx": i}], True
+    # هیچ تکه‌ای تنهایی جواب نداد: کلمه‌های همه‌ی تکه‌ها با هم (کلمه‌ی بیشتر = تطبیق قوی‌تر با ترانه)
+    if len(all_ws) >= 10 and not (stop is not None and stop.is_set()):
+        log.info("lyrics: trying all %d words of the pieces together", len(all_ws))
+        song, n = _find_by_words(all_ws)
+        if song:
+            return [{"src": "lyrics", "title": song["title"], "artist": song.get("artist") or "",
+                     "w": 0.85, "dur": None, "link": song.get("link"),
+                     "yt": None, "path": paths[0], "idx": 0}], True
     return [], True
 
 
@@ -964,6 +974,18 @@ def _ask_engines(paths, rejected, items, stop):
             now = time.time()
             if groups and groups[0]["w"] >= EARLY_W and groups[0]["w"] - second >= EARLY_GAP:
                 return _to_song(groups)
+            if len(groups) >= 2 and not online_pending() and st["launched"] >= min(2, len(pieces)):
+                # دو موتور آنلاین (ACR و Shazam) هر دو جواب قوی دادن ولی اسم‌ها فرق داره (مثلاً فارسی/لاتین).
+                # صبر برای ترانه یا آخرین راه فایده‌ای نداره: همین حالا قبول می‌شه.
+                g1, g2 = groups[0], groups[1]
+                strong = lambda g: g["w"] >= FAST_W and any(x in g["srcs"] for x in _ONLINE)
+                if strong(g1) and strong(g2):
+                    pick = g1
+                    if "shazam" in g2["srcs"] and "shazam" not in g1["srcs"] and g1["w"] - g2["w"] <= 0.3:
+                        pick = g2          # اسم Shazam معمولاً تمیزتره؛ اسم ACR به‌عنوان گزینه‌ی «آهنگ اشتباه» می‌مونه
+                    log.info("two strong online answers with different names: accepting '%s' (other: '%s')",
+                             pick["items"][0]["title"], (g2 if pick is g1 else g1)["items"][0]["title"])
+                    return _to_song([pick] + [g for g in groups if g is not pick])
             if _single_fast(groups, second):
                 # همه‌ی موتورهای آنلاین شروع‌شده جواب دادن و کسی مخالف نیست -> بدون صبر
                 if not online_pending() and st["launched"] >= min(2, len(pieces)):
