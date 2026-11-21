@@ -89,6 +89,7 @@ WHISPER_LOOSE = os.environ.get("WHISPER_LOOSE", "1") == "1"
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "").strip()      # اختیاری: Whisper large-v3 میزبانی‌شده (دقیق‌تر + CPU سرور رو مصرف نمی‌کنه)
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "whisper-large-v3").strip()
 GROQ_TIMEOUT = _f("GROQ_TIMEOUT", 12)
+LYRICS_SEARCH_BUDGET = _f("LYRICS_SEARCH_BUDGET", 15)
 GROQ_FALLBACK_LOCAL = os.environ.get("GROQ_FALLBACK_LOCAL", "0") == "1"   # اگه Groq جواب داد ولی متن خالی بود، Whisper محلی هم امتحان بشه؟
 SHAZAM_THREADS = max(1, int(_f("SHAZAM_THREADS", 3)))
 LAST_RESORT = os.environ.get("LAST_RESORT", "1") == "1"
@@ -137,7 +138,7 @@ def init(load_accounts, local_fn=None, words_fn=None):
     if words_fn and WHISPER_MODEL and WHISPER_PRELOAD:
         threading.Thread(target=_get_whisper, daemon=True, name="whisper-load").start()
     threading.Thread(target=_sh_warm, daemon=True, name="shazam-warm").start()
-    log.info("recognition v16.10: local=%s lyrics=%s whisper=%s",
+    log.info("recognition v16.11: local=%s lyrics=%s whisper=%s",
              bool(local_fn), bool(words_fn), ("groq+" if GROQ_KEY else "") + (WHISPER_MODEL or "off"))
 
 
@@ -635,7 +636,11 @@ def _word_tries(ws):
 
 def _find_by_words(ws):
     wf = _cfg["words"]
+    t_begin = time.time()
     for t in _word_tries(ws):
+        if time.time() - t_begin > LYRICS_SEARCH_BUDGET:      # جستجوی ترانه تو bot.py می‌تونه تا ۳۰ ثانیه طول بکشه؛ تلاش بعدی شروع نشه
+            log.info("lyrics search: budget (%.0fs) used up", LYRICS_SEARCH_BUDGET)
+            break
         try:
             song = wf(t)
         except Exception as e:
