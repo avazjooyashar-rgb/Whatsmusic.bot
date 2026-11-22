@@ -34,7 +34,7 @@ recognition.py - v16 (یک فایل کامل، جای recognition.py قبلی؛ 
   WHISPER_BEAM=1 (برای دقت بیشتر ۳ یا ۵؛ کندتر)  WHISPER_PRELOAD=1
   FAST_W=1.0  FAST_GRACE=2  SOFT_LAUNCH=4  LYRICS_DELAY=2  SHAZAM_TIMEOUT=20  SHAZAM_THREADS=3
   FP_STRONG=60  FP_STRONG2=20  FP_WEAK_MIN=12  LOCAL_PIECES=3
-  HUM_CAP=0.6  LAST_RESORT=1  LAST_RESORT_PIECES=2  VAR_WORKERS=6  DB_PATH
+  GROQ_API_KEY= GROQ_MODEL=whisper-large-v3 (اختیاری)  DEBUG_KEEP_DIR=/tmp/dbg (فقط عیب‌یابی)  HUM_CAP=0.6  LAST_RESORT=1  LAST_RESORT_PIECES=2  VAR_WORKERS=2 LAST_RESORT_BUDGET=15 WHISPER_LOOSE=1  DB_PATH
 """
 import asyncio
 import base64
@@ -82,15 +82,26 @@ HUM_CAP = _f("HUM_CAP", 0.6)
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small").strip()
 WHISPER_COMPUTE = os.environ.get("WHISPER_COMPUTE", "int8").strip() or "int8"
 WHISPER_LANG = os.environ.get("WHISPER_LANG", "").strip()
-WHISPER_MAX_PIECES = int(_f("WHISPER_MAX_PIECES", 2))
+WHISPER_MAX_PIECES = int(_f("WHISPER_MAX_PIECES", 3))
 WHISPER_WAIT = _f("WHISPER_WAIT", 45)
 WHISPER_PRELOAD = os.environ.get("WHISPER_PRELOAD", "1") == "1"
+WHISPER_LOOSE = os.environ.get("WHISPER_LOOSE", "1") == "1"
+GROQ_KEY = os.environ.get("GROQ_API_KEY", "").strip()      # اختیاری: Whisper large-v3 میزبانی‌شده (دقیق‌تر + CPU سرور رو مصرف نمی‌کنه)
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "whisper-large-v3").strip()
+GROQ_TIMEOUT = _f("GROQ_TIMEOUT", 12)
+LYRICS_SEARCH_BUDGET = _f("LYRICS_SEARCH_BUDGET", 15)
+LYRICS_FINAL_WAIT = _f("LYRICS_FINAL_WAIT", 10)
+GROQ_FALLBACK_LOCAL = os.environ.get("GROQ_FALLBACK_LOCAL", "0") == "1"   # اگه Groq جواب داد ولی متن خالی بود، Whisper محلی هم امتحان بشه؟
 SHAZAM_THREADS = max(1, int(_f("SHAZAM_THREADS", 3)))
 LAST_RESORT = os.environ.get("LAST_RESORT", "1") == "1"
 LAST_RESORT_PIECES = max(1, int(_f("LAST_RESORT_PIECES", 2)))
-VAR_WORKERS = max(1, int(_f("VAR_WORKERS", 6)))
+VAR_WORKERS = max(1, int(_f("VAR_WORKERS", 2)))          # روی ۲ هسته بیشتر از ۲ ffmpeg همزمان Shazam رو گرسنه می‌کنه
+LAST_RESORT_BUDGET = _f("LAST_RESORT_BUDGET", 15)
 ACR_TIMEOUT = 15
-SHAZAM_TIMEOUT = _f("SHAZAM_TIMEOUT", 20)
+SHAZAM_TIMEOUT = _f("SHAZAM_TIMEOUT", 8)          # هر تلاش؛ اتصال گیرکرده رها و دوباره امتحان می‌شه
+SHAZAM_TRIES = max(1, int(_f("SHAZAM_TRIES", 2)))
+SHAZAM_COOLDOWN = _f("SHAZAM_COOLDOWN", 120)
+SHAZAM_VARIANT_KINDS = {k.strip() for k in os.environ.get("SHAZAM_VARIANT_KINDS", "clean,slow,fast").split(",") if k.strip()}
 FAST_W = _f("FAST_W", 1.0)
 FAST_GRACE = _f("FAST_GRACE", 2)
 SOFT_LAUNCH = _f("SOFT_LAUNCH", 4)
@@ -128,8 +139,8 @@ def init(load_accounts, local_fn=None, words_fn=None):
     if words_fn and WHISPER_MODEL and WHISPER_PRELOAD:
         threading.Thread(target=_get_whisper, daemon=True, name="whisper-load").start()
     threading.Thread(target=_sh_warm, daemon=True, name="shazam-warm").start()
-    log.info("recognition v16: local=%s lyrics=%s whisper=%s",
-             bool(local_fn), bool(words_fn), WHISPER_MODEL or "off")
+    log.info("recognition v16.14: local=%s lyrics=%s whisper=%s",
+             bool(local_fn), bool(words_fn), ("groq+" if GROQ_KEY else "") + (WHISPER_MODEL or "off"))
 
 
 # ======================================================================================
@@ -258,6 +269,7 @@ def ask_local_full(paths, rejected=()):
         if r and r.get("track_id") is not None:
             by.setdefault(r["track_id"], []).append((i, p, r))
     if not by:
+        log.info("local db: no match (%d pieces)", len(pieces))
         return None, []
     tid, lst = max(by.items(), key=lambda kv: (len(kv[1]), max(x[2]["score"] for x in kv[1])))
     mx = max(x[2]["score"] for x in lst)
@@ -318,6 +330,14 @@ def _acc_fail(acc_id):
             _ACC_ERR[acc_id] = 0
 
 
+def _num(x, default=0.0) -> float:
+    """ACRCloud بعضی فیلدها (duration_ms, score) رو گاهی رشته می‌فرسته."""
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return default
+
+
 def _acr_parse(j) -> list:
     out = []
     md = j.get("metadata") or {}
@@ -328,8 +348,8 @@ def _acr_parse(j) -> list:
             ext = m.get("external_metadata") or {}
             sp = ((ext.get("spotify") or {}).get("track") or {}).get("id")
             yt = (ext.get("youtube") or {}).get("vid")
-            ms = m.get("duration_ms") or 0
-            score = float(m.get("score") or 0) / 100
+            ms = _num(m.get("duration_ms"))
+            score = _num(m.get("score")) / 100
             if kind == "humming":
                 w = min(HUM_CAP, score * 0.7)      # ملودی تنها هرگز قبول نمی‌شه
                 src = "hum"
@@ -374,8 +394,11 @@ def _acr(path):
             _ACC_ERR[acc["id"]] = 0
         code = (j.get("status") or {}).get("code")
         if code == 0:
-            return _acr_parse(j), True
+            parsed = _acr_parse(j)
+            log.info("acr #%s ok: %s", acc["id"], [(c["src"], c["title"], round(c["w"], 2)) for c in parsed[:4]])
+            return parsed, True
         if code in (1001, 2000, 2001, 2002, 2003, 2004, 2005):
+            log.info("acr #%s: no match (status %s)", acc["id"], code)
             return [], True
         if code == 3003:
             _ACC_BLOCK[acc["id"]] = time.time() + 1800
@@ -389,74 +412,67 @@ def _acr(path):
 
 
 # ======================================================================================
-# Shazam (event-loop دائمی + یک نمونه‌ی مشترک)
+# Shazam (هر تماس لوپ مخصوص خودش رو داره؛ تماس‌ها موازی‌ان و هم‌دیگه رو بلاک نمی‌کنن)
 # ======================================================================================
-_SH = {"fails": 0, "until": 0.0, "loop": None, "obj": None}
-_SH_INIT = threading.Lock()
+_SH = {"fails": 0, "until": 0.0}
 _SH_SEM = threading.Semaphore(SHAZAM_THREADS)
-
-
-def _sh_get_loop():
-    with _SH_INIT:
-        if _SH["loop"] is None:
-            loop = asyncio.new_event_loop()
-            t = threading.Thread(target=loop.run_forever, daemon=True, name="shazam-loop")
-            t.start()
-            _SH["loop"] = loop
-        return _SH["loop"]
 
 
 def _sh_warm():
     try:
-        _sh_get_loop()
         from shazamio import Shazam  # noqa: F401  (import گرم می‌شه)
     except Exception:
         pass
 
 
 async def _shazam_async(path):
-    if _SH["obj"] is None:
-        from shazamio import Shazam
-        _SH["obj"] = Shazam()
-    s = _SH["obj"]
+    from shazamio import Shazam
+    s = Shazam()
     fn = getattr(s, "recognize", None) or getattr(s, "recognize_song")
     return await asyncio.wait_for(fn(path), SHAZAM_TIMEOUT)
 
 
-def _shazam(path):
-    """-> (items, answered)"""
+def _shazam(path, variant=False):
+    """-> (items, answered)
+    variant=True: نسخه‌ی دستکاری‌شده؛ یک تلاش، و شکستش حساب breaker نمی‌شه."""
     if time.time() < _SH["until"]:
         return [], False
     out, ok = None, False
-    loop = _sh_get_loop()
+    tries = 1 if variant else SHAZAM_TRIES
+    t_start = time.time()
     with _SH_SEM:
-        for attempt in (1, 2):
-            fut = asyncio.run_coroutine_threadsafe(_shazam_async(path), loop)
+        for attempt in range(1, tries + 1):
             try:
-                out = fut.result(SHAZAM_TIMEOUT + 5)
+                out = asyncio.run(_shazam_async(path))
                 ok = True
                 break
             except (asyncio.TimeoutError, TimeoutError):
-                fut.cancel()
-                log.warning("shazam timeout")
-                break
+                log.warning("shazam timeout (try %d, %.0fs)", attempt, time.time() - t_start)
+                continue
             except Exception as e:
-                fut.cancel()
                 log.warning("shazam failed (try %d): %s", attempt, str(e)[:120])
                 if "No module named" in str(e):
                     break
                 time.sleep(0.3)
-    with _LOCK:
-        if ok:
-            _SH["fails"] = 0
-        else:
-            _SH["fails"] += 1
-            if _SH["fails"] >= 4:
-                _SH["until"] = time.time() + 60
+    if variant:
+        if not ok:
+            return [], False
+    else:
+        with _LOCK:
+            if ok:
                 _SH["fails"] = 0
+            else:
+                _SH["fails"] += 1
+            if _SH["fails"] >= 3:
+                _SH["until"] = time.time() + SHAZAM_COOLDOWN
+                _SH["fails"] = 0
+                log.warning("shazam disabled for %ds after repeated failures (server IP may be blocked/slow)",
+                            SHAZAM_COOLDOWN)
     if not ok:
         return [], False
     t = (out or {}).get("track")
+    log.info("shazam %s (%.1fs): %s", "variant" if variant else "ok", time.time() - t_start,
+             (t or {}).get("title") or "no match")
     if not t or not t.get("title"):
         return [], True
     imgs = t.get("images") or {}
@@ -468,7 +484,7 @@ def _shazam(path):
 # ======================================================================================
 # متن ترانه: صدا -> متن (Whisper) -> پیدا کردن ترانه از روی کلمات
 # ======================================================================================
-_WH = {"m": None, "fail": False, "lang": None}
+_WH = {"m": None, "fail": False}
 _WH_LOCK = threading.Lock()
 _WH_RUN = threading.Lock()
 _HALLU_SEG = re.compile(
@@ -495,49 +511,111 @@ def _get_whisper():
         return _WH["m"]
 
 
-def _transcribe(path, lang=None) -> str:
-    model = _get_whisper()
-    if model is None:
-        return ""
-    kw = dict(vad_filter=True, vad_parameters=dict(min_silence_duration_ms=300),
-              beam_size=max(1, int(_f("WHISPER_BEAM", 1))),
-              condition_on_previous_text=False, temperature=0.0)
-    lang = WHISPER_LANG or lang
+def _whisper_pass(model, path, lang, vad, strict):
+    kw = dict(beam_size=max(1, int(_f("WHISPER_BEAM", 1))),
+              condition_on_previous_text=False, temperature=0.0, vad_filter=bool(vad))
+    if vad:
+        kw["vad_parameters"] = dict(min_silence_duration_ms=300)
     if lang:
         kw["language"] = lang
+    nsp, lp, cr = (0.6, -1.3, 2.4) if strict else (0.9, -1.7, 2.6)
+    segs, info = model.transcribe(path, **kw)
+    kept = []
+    drop = {"no_speech": 0, "logprob": 0, "compress": 0, "halluc": 0}
+    for s_ in segs:
+        t = (getattr(s_, "text", "") or "").strip()
+        if not t:
+            continue
+        if getattr(s_, "no_speech_prob", 0) >= nsp:
+            drop["no_speech"] += 1
+            continue
+        if getattr(s_, "avg_logprob", 0) < lp:
+            drop["logprob"] += 1
+            continue
+        if getattr(s_, "compression_ratio", 0) > cr:
+            drop["compress"] += 1
+            continue
+        if len(t) < 60 and _HALLU_SEG.search(t):
+            drop["halluc"] += 1
+            continue
+        kept.append(t)
+    return " ".join(kept).strip(), info, drop
+
+
+def _groq_transcribe(path, lang=None):
+    """Whisper large-v3 از Groq (API سازگار با OpenAI). -> متن (ممکنه خالی) یا None اگه درخواست شکست خورد."""
     try:
-        with _WH_RUN:
-            segs, info = model.transcribe(path, **kw)
+        data = {"model": GROQ_MODEL, "temperature": "0", "response_format": "verbose_json"}
+        if lang:
+            data["language"] = lang
+        with open(path, "rb") as f:
+            r = _SESS.post("https://api.groq.com/openai/v1/audio/transcriptions",
+                           headers={"Authorization": f"Bearer {GROQ_KEY}"}, data=data,
+                           files={"file": (os.path.basename(path), f)}, timeout=GROQ_TIMEOUT)
+        if r.status_code != 200:
+            log.warning("groq asr HTTP %s: %s", r.status_code, r.text[:150].replace("\n", " "))
+            return None
+        j = r.json()
+        segs = j.get("segments")
+        if segs:
             kept = []
-            for s in segs:
-                t = (getattr(s, "text", "") or "").strip()
-                if not t:
-                    continue
-                if getattr(s, "no_speech_prob", 0) >= 0.6:
-                    continue
-                if getattr(s, "avg_logprob", 0) < -1.3:
-                    continue
-                if getattr(s, "compression_ratio", 0) > 2.4:
+            for sg in segs:
+                t = (sg.get("text") or "").strip()
+                if not t or (sg.get("no_speech_prob") or 0) >= 0.9 or (sg.get("compression_ratio") or 0) > 2.6:
                     continue
                 if len(t) < 60 and _HALLU_SEG.search(t):
                     continue
                 kept.append(t)
             text = " ".join(kept).strip()
-            # زبانِ تشخیص‌داده‌شده برای تکه‌ی بعدی قفل می‌شه (سریع‌تر + دقیق‌تر)
-            if text and not WHISPER_LANG and not _WH["lang"]:
-                if getattr(info, "language_probability", 0) >= 0.7 and getattr(info, "language", None):
-                    _WH["lang"] = info.language
-            return text
+        else:
+            text = (j.get("text") or "").strip()
+        log.info("groq asr (%s): %d chars", GROQ_MODEL, len(text))
+        return text
+    except Exception as e:
+        log.warning("groq asr failed: %s", str(e)[:150])
+        return None
+
+
+def _transcribe(path, lang=None, skip_vad=False):
+    """-> (text, زبان تشخیص‌داده‌شده یا None, loose)
+    پاس اول: با VAD و فیلتر سخت‌گیر (مناسب ویس). اگه چیزی نشنید، پاس دوم: بدون VAD و فیلتر نرم‌تر
+    (VAD گاهی آواز با موزیک رو «غیرگفتار» می‌دونه و کل صدا رو حذف می‌کنه)."""
+    lang = WHISPER_LANG or lang
+    if GROQ_KEY:
+        gt = _groq_transcribe(path, lang)
+        if gt:
+            return gt, None, False
+        if gt is not None and not GROQ_FALLBACK_LOCAL:
+            return "", None, False       # Groq جواب داد و چیزی نشنید (مثلاً فقط موزیکه): Whisper محلیِ کند رو تکرار نمی‌کنیم
+    model = _get_whisper()
+    if model is None:
+        return "", None, False
+    try:
+        with _WH_RUN:
+            text, loose = "", False
+            if not skip_vad:
+                text, info, drop = _whisper_pass(model, path, lang, vad=True, strict=True)
+                log.info("whisper pass1 (vad): %d chars, dropped=%s, lang=%s(%.2f)", len(text), drop,
+                         getattr(info, "language", None), getattr(info, "language_probability", 0) or 0)
+            if not text and (WHISPER_LOOSE or skip_vad):
+                text, info, drop = _whisper_pass(model, path, lang, vad=False, strict=False)
+                loose = True
+                log.info("whisper pass2 (no vad): %d chars, dropped=%s", len(text), drop)
+            det = None
+            if text and not WHISPER_LANG and not lang:
+                if getattr(info, "language_probability", 0) >= 0.85 and getattr(info, "language", None):
+                    det = info.language
+            return text, det, loose
     except Exception as e:
         log.warning("whisper failed: %s", str(e)[:150])
-    return ""
+    return "", None, False
 
 
 def _usable_words(text):
     if not text:
         return []
     ws = re.findall(r"\w+", fold(text))
-    if len(ws) < 5 or len(set(ws)) / len(ws) < 0.35:
+    if len(ws) < 4 or len(set(ws)) / len(ws) < 0.35:
         return []
     # تکرار پشت‌سرهمِ یک کلمه (۴ بار یا بیشتر) = hallucination
     run = 1
@@ -559,35 +637,58 @@ def _word_tries(ws):
 
 def _find_by_words(ws):
     wf = _cfg["words"]
+    t_begin = time.time()
     for t in _word_tries(ws):
+        if time.time() - t_begin > LYRICS_SEARCH_BUDGET:      # جستجوی ترانه تو bot.py می‌تونه تا ۳۰ ثانیه طول بکشه؛ تلاش بعدی شروع نشه
+            log.info("lyrics search: budget (%.0fs) used up", LYRICS_SEARCH_BUDGET)
+            break
         try:
             song = wf(t)
         except Exception as e:
             log.warning("lyrics search failed: %s", e)
             continue
         if song and song.get("title"):
+            log.info("lyrics search found: %s - %s (%d words)", song.get("artist"), song["title"], len(t))
             return song, len(t)
+    log.info("lyrics search: no match (%d words)", len(ws))
     return None, 0
 
 
 def _lyrics_vote(paths, stop=None):
     wf = _cfg["words"]
-    if not wf or not WHISPER_MODEL:
+    if not wf or not (WHISPER_MODEL or GROQ_KEY):
         return [], True
+    lang = None            # قفل زبان فقط داخل همین درخواست (بین کاربرها قفل نمی‌مونه)
+    all_ws = []
+    skip_vad = False       # اگه تکه‌ی قبلی فقط با پاس دوم متن داد، برای بعدی پاس VAD رو تکرار نمی‌کنیم
     for i, p in enumerate(paths[:max(1, WHISPER_MAX_PIECES)]):
         if stop is not None and stop.is_set():
             return [], True
-        text = _transcribe(p, _WH["lang"])
+        text, det, loose = _transcribe(p, lang, skip_vad)
+        lang = lang or det
+        skip_vad = skip_vad or loose
         ws = _usable_words(text)
         if not ws:
+            log.info("lyrics: piece %d unusable (heard %d chars)", i, len(text))
             continue
-        log.info("lyrics heard (%d words): %s", len(ws), text[:90])
+        log.info("lyrics heard (%d words): %s", len(ws), text[:200])
+        all_ws.extend(ws)
         song, n = _find_by_words(ws)
         if song:
             w = 0.9 if n >= 10 else (0.8 if n >= 8 else 0.6)
+            if loose:
+                w = min(w, 0.78)       # متن پاس دوم (بدون VAD) کمی کم‌اطمینان‌تره
             return [{"src": "lyrics", "title": song["title"], "artist": song.get("artist") or "",
                      "w": w, "dur": None, "link": song.get("link"),
                      "yt": None, "path": p, "idx": i}], True
+    # هیچ تکه‌ای تنهایی جواب نداد: کلمه‌های همه‌ی تکه‌ها با هم (کلمه‌ی بیشتر = تطبیق قوی‌تر با ترانه)
+    if len(all_ws) >= 10 and not (stop is not None and stop.is_set()):
+        log.info("lyrics: trying all %d words of the pieces together", len(all_ws))
+        song, n = _find_by_words(all_ws)
+        if song:
+            return [{"src": "lyrics", "title": song["title"], "artist": song.get("artist") or "",
+                     "w": 0.85, "dur": None, "link": song.get("link"),
+                     "yt": None, "path": paths[0], "idx": 0}], True
     return [], True
 
 
@@ -688,8 +789,8 @@ _VARIANTS = {
     "pitch_up": "aresample=44100,asetrate=49500,atempo=0.8909,aresample=44100",
     "pitch_down": "aresample=44100,asetrate=39289,atempo=1.1225,aresample=44100",
 }
-_PRIMARY_VARIANTS = ("clean", "denoise", "tempo_down", "tempo_up", "pitch_up", "pitch_down",
-                     "slow", "fast", "vocal", "slow2", "fast2")
+_PRIMARY_VARIANTS = ("slow", "fast", "clean", "tempo_down", "tempo_up", "pitch_up", "pitch_down",
+                     "denoise", "vocal", "slow2", "fast2")
 _EXTRA_PIECE_VARIANTS = ("clean", "tempo_down", "pitch_up")
 
 
@@ -715,11 +816,12 @@ def _try_variant(path, kind, rejected):
         log.info("variant %s failed: %s", kind, str(e)[:100])
         return [], False
     try:
-        got, ok = _shazam(v)
-        answered = ok
-        for c in got:
-            c["w"] = 0.9
-        items += got
+        if kind in SHAZAM_VARIANT_KINDS:      # فقط چند نسخه‌ی مهم به Shazam می‌رن؛ ریزش درخواست باعث گیرکردنش می‌شد
+            got, ok = _shazam(v, variant=True)
+            answered = ok
+            for c in got:
+                c["w"] = 0.9
+            items += got
         if _cfg["local"]:
             r = _local_piece(v, rejected)
             if r and r.get("score", 0) >= FP_WEAK_MIN:
@@ -739,8 +841,33 @@ def _try_variant(path, kind, rejected):
 # ======================================================================================
 def ask_engines(paths, rejected=(), _unused1=None, _unused2=None, extra=None):
     stop = threading.Event()
+    t0 = time.time()
     try:
-        return _ask_engines(paths, set(rejected or ()), list(extra or []), stop)
+        sizes = []
+        for p in list(paths)[:MAX_PIECES]:
+            try:
+                sizes.append(os.path.getsize(p) // 1024)
+            except OSError:
+                sizes.append(-1)
+        log.info("START pieces(KB)=%s", sizes)
+        dbg = os.environ.get("DEBUG_KEEP_DIR", "").strip()
+        if dbg:                      # فقط برای عیب‌یابی: تکه‌های صدا رو نگه می‌داره تا دستی تست بشن
+            try:
+                import shutil
+                os.makedirs(dbg, exist_ok=True)
+                stamp = time.strftime("%H%M%S")
+                for i, p in enumerate(list(paths)[:MAX_PIECES]):
+                    shutil.copy(p, os.path.join(dbg, f"{stamp}_p{i}{os.path.splitext(p)[1] or '.mp3'}"))
+                log.info("DEBUG pieces saved: %s/%s_p*", dbg, stamp)
+            except Exception as e:
+                log.info("DEBUG save failed: %s", str(e)[:100])
+        res = _ask_engines(paths, set(rejected or ()), list(extra or []), stop)
+        if res:
+            log.info("RESULT (%.1fs): %s - %s [%s]", time.time() - t0, res.get("artist"), res.get("title"),
+                     res.get("engine"))
+        else:
+            log.info("RESULT (%.1fs): NOT FOUND", time.time() - t0)
+        return res
     finally:
         stop.set()
 
@@ -760,7 +887,7 @@ def _ask_engines(paths, rejected, items, stop):
         return None
     t0 = time.time()
     deadline = t0 + TOTAL_TIMEOUT
-    use_lyrics = bool(_cfg["words"] and WHISPER_MODEL)
+    use_lyrics = bool(_cfg["words"] and (WHISPER_MODEL or GROQ_KEY))
 
     answered = failed = 0
     futs = {}
@@ -848,6 +975,18 @@ def _ask_engines(paths, rejected, items, stop):
             now = time.time()
             if groups and groups[0]["w"] >= EARLY_W and groups[0]["w"] - second >= EARLY_GAP:
                 return _to_song(groups)
+            if len(groups) >= 2 and not online_pending() and st["launched"] >= min(2, len(pieces)):
+                # دو موتور آنلاین (ACR و Shazam) هر دو جواب قوی دادن ولی اسم‌ها فرق داره (مثلاً فارسی/لاتین).
+                # صبر برای ترانه یا آخرین راه فایده‌ای نداره: همین حالا قبول می‌شه.
+                g1, g2 = groups[0], groups[1]
+                strong = lambda g: g["w"] >= FAST_W and any(x in g["srcs"] for x in _ONLINE)
+                if strong(g1) and strong(g2):
+                    pick = g1
+                    if "shazam" in g2["srcs"] and "shazam" not in g1["srcs"] and g1["w"] - g2["w"] <= 0.3:
+                        pick = g2          # اسم Shazam معمولاً تمیزتره؛ اسم ACR به‌عنوان گزینه‌ی «آهنگ اشتباه» می‌مونه
+                    log.info("two strong online answers with different names: accepting '%s' (other: '%s')",
+                             pick["items"][0]["title"], (g2 if pick is g1 else g1)["items"][0]["title"])
+                    return _to_song([pick] + [g for g in groups if g is not pick])
             if _single_fast(groups, second):
                 # همه‌ی موتورهای آنلاین شروع‌شده جواب دادن و کسی مخالف نیست -> بدون صبر
                 if not online_pending() and st["launched"] >= min(2, len(pieces)):
@@ -884,23 +1023,39 @@ def _ask_engines(paths, rejected, items, stop):
             return _to_song(groups)
         tie = bool(groups and groups[0]["w"] >= GUESS_MIN_W)
 
-        if LAST_RESORT and time.time() < deadline:
+        shazam_up = time.time() >= _SH["until"]
+        if LAST_RESORT and time.time() < deadline and (shazam_up or _cfg["local"]):
             tasks = [(pieces[0], 0, k) for k in _PRIMARY_VARIANTS]
             for j in range(1, min(LAST_RESORT_PIECES, len(pieces))):
                 tasks += [(pieces[j], j, k) for k in _EXTRA_PIECE_VARIANTS]
             vfuts = {_VPOOL.submit(_try_variant, p, k, rejected): ("variant", p, j) for p, j, k in tasks}
             futs.update(vfuts)
             pending = set(vfuts)
-            while pending and time.time() < deadline:
-                done, pending = wait(pending, timeout=left(), return_when=FIRST_COMPLETED)
-                if not done:
-                    break
+            lr_end = min(deadline, time.time() + LAST_RESORT_BUDGET)
+            while (pending or (st["lyr"] is not None and not st["lyr_taken"])) and time.time() < lr_end:
+                # نتیجه‌ی ترانه هم همین‌جا برداشته می‌شه: اگه حین آخرین راه تموم شد، دور ریخته نمی‌شه
+                w_set = set(pending)
+                lyr = st["lyr"]
+                if lyr is not None and not st["lyr_taken"] and not lyr.done():
+                    w_set.add(lyr)
+                if not w_set:
+                    take_lyrics()
+                else:
+                    done, _nd = wait(w_set, timeout=max(0.2, lr_end - time.time()), return_when=FIRST_COMPLETED)
+                    pending = {f for f in pending if not f.done()}
+                    take_lyrics()
+                    if not done:
+                        break
                 harvest(vfuts)
                 groups, second = _decide(items, rejected)
                 if groups and groups[0]["w"] >= GUESS_MIN_W and groups[0]["w"] - second >= LAST_GAP:
                     log.info("found by the last resort (early): %s", groups[0]["items"][0]["title"])
                     return _to_song(groups)
             harvest(vfuts)
+            # اگه کار ترانه هنوز تموم نشده، چند ثانیه‌ی کوتاه آخر هم صبر می‌کنیم
+            if st["lyr"] is not None and not st["lyr_taken"] and not st["lyr"].done():
+                wait([st["lyr"]], timeout=max(0.0, min(deadline - time.time(), LYRICS_FINAL_WAIT)))
+            take_lyrics()
             groups, second = _decide(items, rejected)
             if groups and groups[0]["w"] >= GUESS_MIN_W:
                 log.info("found by the last resort: %s", groups[0]["items"][0]["title"])
