@@ -34,7 +34,7 @@ recognition.py - v16 (یک فایل کامل، جای recognition.py قبلی؛ 
   WHISPER_BEAM=1 (برای دقت بیشتر ۳ یا ۵؛ کندتر)  WHISPER_PRELOAD=1
   FAST_W=1.0  FAST_GRACE=2  SOFT_LAUNCH=4  LYRICS_DELAY=2  SHAZAM_TIMEOUT=20  SHAZAM_THREADS=3
   FP_STRONG=60  FP_STRONG2=20  FP_WEAK_MIN=12  LOCAL_PIECES=3
-  GROQ_API_KEY= GROQ_MODEL=whisper-large-v3 (اختیاری)  DEBUG_KEEP_DIR=/tmp/dbg (فقط عیب‌یابی)  HUM_CAP=0.6  LAST_RESORT=1  LAST_RESORT_PIECES=2  VAR_WORKERS=2 LAST_RESORT_BUDGET=15 WHISPER_LOOSE=1  DB_PATH
+  GROQ_API_KEY= GROQ_MODEL=whisper-large-v3 (اختیاری)  DEBUG_KEEP_DIR=/tmp/dbg (فقط عیب‌یابی)  HUM_CAP=0.6  LAST_RESORT=1  LAST_RESORT_PIECES=2  VAR_WORKERS=2 LAST_RESORT_BUDGET=8 WHISPER_LOOSE=1  DB_PATH
 """
 import asyncio
 import base64
@@ -47,6 +47,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -96,7 +97,7 @@ SHAZAM_THREADS = max(1, int(_f("SHAZAM_THREADS", 3)))
 LAST_RESORT = os.environ.get("LAST_RESORT", "1") == "1"
 LAST_RESORT_PIECES = max(1, int(_f("LAST_RESORT_PIECES", 2)))
 VAR_WORKERS = max(1, int(_f("VAR_WORKERS", 2)))          # روی ۲ هسته بیشتر از ۲ ffmpeg همزمان Shazam رو گرسنه می‌کنه
-LAST_RESORT_BUDGET = _f("LAST_RESORT_BUDGET", 15)
+LAST_RESORT_BUDGET = _f("LAST_RESORT_BUDGET", 8)
 ACR_TIMEOUT = 15
 SHAZAM_TIMEOUT = _f("SHAZAM_TIMEOUT", 8)          # هر تلاش؛ اتصال گیرکرده رها و دوباره امتحان می‌شه
 SHAZAM_TRIES = max(1, int(_f("SHAZAM_TRIES", 2)))
@@ -136,10 +137,13 @@ def _accepts_exclude(fn):
 def init(load_accounts, local_fn=None, words_fn=None):
     _cfg["load"], _cfg["local"], _cfg["words"] = load_accounts, local_fn, words_fn
     _cfg["local_excl"] = _accepts_exclude(local_fn)
+    v2 = _install_text_search(words_fn) if words_fn else None
+    if v2:
+        _cfg["words"] = v2
     if words_fn and WHISPER_MODEL and WHISPER_PRELOAD:
         threading.Thread(target=_get_whisper, daemon=True, name="whisper-load").start()
     threading.Thread(target=_sh_warm, daemon=True, name="shazam-warm").start()
-    log.info("recognition v16.15: local=%s lyrics=%s whisper=%s",
+    log.info("recognition v16.17: local=%s lyrics=%s whisper=%s",
              bool(local_fn), bool(words_fn), ("groq+" if GROQ_KEY else "") + (WHISPER_MODEL or "off"))
 
 
@@ -353,6 +357,7 @@ def _acr_parse(j) -> list:
             if kind == "humming":
                 w = min(HUM_CAP, score * 0.7)      # ملودی تنها هرگز قبول نمی‌شه
                 src = "hum"
+                log.info("acr hum: '%s' raw score=%s -> w=%.2f", m["title"], m.get("score"), w)
             elif kind == "music":
                 w = min(1.1, score * 1.15)
                 src = "acr"
@@ -690,6 +695,152 @@ def _lyrics_vote(paths, stop=None):
                      "w": 0.85, "dur": None, "link": song.get("link"),
                      "yt": None, "path": paths[0], "idx": 0}], True
     return [], True
+
+
+# ======================================================================================
+# جستجوی متنیِ رتبه‌بندی‌شده: خودکار روی bot.py نصب می‌شه (تو bot.py هیچ تغییری لازم نیست)
+#   - متن ترانه (تایپ‌شده یا از Whisper/Groq) با غلط املایی هم رتبه‌بندی می‌شه
+#   - اگه جواب قطعی نبود ولی چند کاندیدای معقول بود، لیست «شاید یکی از این‌ها» نشون داده می‌شه (به‌جای «پیدا نشد»)
+#   خاموش‌کردن: TEXT_SEARCH_V2=0
+# ======================================================================================
+_TEXT_V2 = os.environ.get("TEXT_SEARCH_V2", "1") == "1"
+_MAYBE = {"fa": "🔍 شاید یکی از این آهنگ‌ها باشه:", "en": "🔍 Maybe one of these songs:",
+          "tr": "🔍 Belki bu şarkılardan biridir:", "ar": "🔍 ربما تكون إحدى هذه الأغاني:",
+          "ru": "🔍 Возможно, это одна из этих песен:"}
+_TEXT_NEEDED = ("yt_search", "get_lyrics", "_parse_yt_title", "_fuzzy_overlap", "_lyr_windows", "_lyr_hook",
+                "_lyr_search_window", "_lyr_check", "_LYR_POOL", "fold", "send_result", "add_sample", "CANDS",
+                "cand_keyboard")
+
+
+def _confident(mod, c) -> bool:
+    return (c["ratio"] >= getattr(mod, "LYR_MIN_OVERLAP", 0.5)
+            and c["hits"] >= getattr(mod, "LYR_MIN_HITS", 4))
+
+
+def _rank_by_words(mod, words, early=True):
+    """کلمه‌ها -> [{"ratio","hits","artist","title"}] مرتب از بهترین؛ فقط کاندیدهایی که ترانه‌شون پیدا و مقایسه شد.
+    خط لوله‌ای: به‌محض تموم شدن جستجوی هر پنجره، ترانه‌ی کاندیدهاش گرفته می‌شه (منتظر بقیه‌ی پنجره‌ها نمی‌مونه)،
+    و اگه یه کاندیدای خیلی قوی پیدا شد (early=True) همون لحظه تموم می‌شه."""
+    ws = [w for w in words if len(w) > 1]
+    if len(ws) < 4:
+        return []
+    wins = mod._lyr_windows(ws)
+    hook = mod._lyr_hook(ws)
+    if hook:                         # عبارت تکراری (کوروس/اسم آهنگ) اول جستجو می‌شه
+        wins = [hook] + wins
+    pool = mod._LYR_POOL
+    s_futs = {pool.submit(mod._lyr_search_window, w): w for w in wins}
+    allf = set(s_futs)
+    items_seen, pairs, verified = set(), set(), []
+    n_items = 0
+    t_cap = time.time() + float(getattr(mod, "LYR_TIMEOUT", 12)) * 1.5
+    strong_r = max(0.7, getattr(mod, "LYR_MIN_OVERLAP", 0.5))
+    strong_h = max(5, getattr(mod, "LYR_MIN_HITS", 4) + 1)
+    stop_now = False
+    while allf and not stop_now and time.time() < t_cap:
+        done, _nd = wait(allf, timeout=max(0.1, t_cap - time.time()), return_when=FIRST_COMPLETED)
+        if not done:
+            break
+        for f in done:
+            allf.discard(f)
+            try:
+                res = f.result()
+            except Exception:
+                continue
+            if f in s_futs:
+                for it in (res or [])[:6]:
+                    if n_items >= 14:
+                        break
+                    if not it.get("id") or it["id"] in items_seen:
+                        continue
+                    items_seen.add(it["id"])
+                    n_items += 1
+                    a, t = mod._parse_yt_title(it.get("title"), it.get("channel") or it.get("uploader") or "")
+                    for artist, name in ((a, t), (t, a)):
+                        key = (mod.fold(artist), mod.fold(name))
+                        if artist and name and key not in pairs:
+                            pairs.add(key)
+                            allf.add(pool.submit(mod._lyr_check, artist, name, ws))
+            elif res:
+                verified.append(res)       # (ratio, hits, artist, name)
+                if early and res[0] >= strong_r and res[1] >= strong_h:
+                    stop_now = True
+    for f in allf:
+        f.cancel()
+    verified.sort(key=lambda r: (r[0], r[1]), reverse=True)
+    out, seen_t = [], set()
+    for ratio, hits, artist, name in verified:
+        k = title_key(name)
+        if k in seen_t:
+            continue
+        seen_t.add(k)
+        out.append({"ratio": ratio, "hits": hits, "artist": artist, "title": name})
+    return out
+
+
+async def _try_lyrics_search_v2(mod, msg, text, lang) -> bool:
+    words = re.findall(r"\w+", mod.fold(text))
+    ranked = await asyncio.to_thread(_rank_by_words, mod, words)
+    if not ranked:
+        return False
+    best = ranked[0]
+    log.info("text search: best %s - %s | overlap=%.2f hits=%d | %d candidates", best["artist"], best["title"],
+             best["ratio"], best["hits"], len(ranked))
+    if _confident(mod, best):
+        song = {"title": best["title"], "artist": best["artist"], "link": None}
+        await mod.send_result(msg, song, lang, "x", wrong=False)
+        return True
+    # قطعی نیست: فقط برای متن بلند و تطبیق نسبی واقعی، لیست «شاید» نشون بده (جستجوی اسم آهنگ مختل نشه)
+    good = [c for c in ranked if c["ratio"] >= 0.3 and c["hits"] >= 3][:8]
+    if len(words) < 7 or not good:
+        return False
+    cands = [{"title": c["title"], "artist": c["artist"], "dur": None, "link": None, "yt": None, "cover": None}
+             for c in good]
+    sid = uuid.uuid4().hex[:10]
+    await asyncio.to_thread(mod.add_sample, sid, "")
+    mod.CANDS[sid] = {"alts": [], "cur": None, "list": cands, "created": time.time()}
+    await msg.reply_text(_MAYBE.get(lang, _MAYBE["en"]), reply_markup=mod.cand_keyboard(sid, cands))
+    return True
+
+
+def _install_text_search(words_fn):
+    """-> تابع جستجوی کلمه‌ی جدید (برای مسیر صوتی) یا None. تابع‌های bot.py رو جای‌گزین می‌کنه؛ هر مشکلی = بی‌صدا رد می‌شه."""
+    if not _TEXT_V2:
+        return None
+    try:
+        mod = sys.modules.get(getattr(words_fn, "__module__", "") or "")
+        if mod is None:
+            return None
+        missing = [n for n in _TEXT_NEEDED if not hasattr(mod, n)]
+        if missing:
+            log.info("text search v2 skipped, bot.py lacks: %s", missing)
+            return None
+        orig_try = getattr(mod, "try_lyrics_search", None)
+
+        def find_v2(words):
+            ranked = _rank_by_words(mod, words)
+            if not ranked:
+                return None
+            b = ranked[0]
+            log.info("lyrics search best: %s - %s | overlap=%.2f hits=%d", b["artist"], b["title"],
+                     b["ratio"], b["hits"])
+            if _confident(mod, b):
+                return {"title": b["title"], "artist": b["artist"], "link": None}
+            return None
+
+        async def try_v2(msg, text, lang):
+            try:
+                return await _try_lyrics_search_v2(mod, msg, text, lang)
+            except Exception:
+                log.exception("text search v2 failed, using the old one")
+                return await orig_try(msg, text, lang) if orig_try else False
+
+        mod.try_lyrics_search = try_v2
+        log.info("text search v2 installed on %s", mod.__name__)
+        return find_v2
+    except Exception:
+        log.exception("text search v2 install failed")
+        return None
 
 
 # ======================================================================================
