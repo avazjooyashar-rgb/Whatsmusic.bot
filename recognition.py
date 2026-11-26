@@ -1,5 +1,10 @@
 """
-recognition.py - v16.18 (یک فایل کامل، جای recognition.py قبلی؛ bot.py بدون تغییر کار می‌کنه)
+recognition.py - v16.19 (یک فایل کامل، جای recognition.py قبلی؛ bot.py بدون تغییر کار می‌کنه)
+
+تغییرهای v16.19 نسبت به v16.18:
+  - اگه جواب قطعی نبود ولی متن ترانه تطبیق نسبی (overlap>=0.35 و >=2 تطابق) داشت، بهترین حدس با گزینه‌های «آهنگ اشتباه»
+    داده می‌شه (به‌جای «پیدا نشد»). خاموش‌کردن: LYRICS_GUESS=0  آستانه‌ها: LYR_GUESS_OVERLAP LYR_GUESS_HITS LYR_GUESS_W
+  - رونویسی‌های تقریباً تکراری (شباهت >= 85٪) دوباره جستجو نمی‌شن
 
 تغییرهای v16.18 نسبت به v16.17:
   متن ترانه (Groq / Whisper):
@@ -100,6 +105,10 @@ GROQ_PROMPT = os.environ.get("GROQ_PROMPT", "متن ترانه‌ی فارسی �
 GROQ_TIMEOUT = _f("GROQ_TIMEOUT", 12)
 LYRICS_SEARCH_BUDGET = _f("LYRICS_SEARCH_BUDGET", 15)
 LYRICS_FINAL_WAIT = _f("LYRICS_FINAL_WAIT", 10)
+LYRICS_GUESS = os.environ.get("LYRICS_GUESS", "1") == "1"      # جواب قطعی نبود: بهترین حدس متنی رو (با گزینه‌های «آهنگ اشتباه») بده، به‌جای «پیدا نشد»
+LYR_GUESS_OVERLAP = _f("LYR_GUESS_OVERLAP", 0.35)
+LYR_GUESS_HITS = int(_f("LYR_GUESS_HITS", 2))
+LYR_GUESS_W = _f("LYR_GUESS_W", 0.55)
 GROQ_FALLBACK_LOCAL = os.environ.get("GROQ_FALLBACK_LOCAL", "0") == "1"   # اگه Groq جواب داد ولی متن خالی بود، Whisper محلی هم امتحان بشه؟
 SHAZAM_THREADS = max(1, int(_f("SHAZAM_THREADS", 3)))
 LAST_RESORT = os.environ.get("LAST_RESORT", "1") == "1"
@@ -152,7 +161,7 @@ def init(load_accounts, local_fn=None, words_fn=None):
     if words_fn and WHISPER_MODEL and WHISPER_PRELOAD:
         threading.Thread(target=_get_whisper, daemon=True, name="whisper-load").start()
     threading.Thread(target=_sh_warm, daemon=True, name="shazam-warm").start()
-    log.info("recognition v16.18: local=%s lyrics=%s whisper=%s",
+    log.info("recognition v16.19: local=%s lyrics=%s whisper=%s",
              bool(local_fn), bool(words_fn), ("groq+" if GROQ_KEY else "") + (WHISPER_MODEL or "off"))
 
 
@@ -725,8 +734,10 @@ def _word_tries(ws):
 
 
 def _find_by_words(ws):
+    """-> (song, n_words). song["loose"]=True یعنی حدس ضعیف (تطبیق ناقص)؛ فقط اگه هیچ تطبیق قطعی‌ای پیدا نشه برمی‌گرده."""
     wf = _cfg["words"]
     t_begin = time.time()
+    loose, loose_n = None, 0
     for t in _word_tries(ws):
         if time.time() - t_begin > LYRICS_SEARCH_BUDGET:      # جستجوی ترانه تو bot.py می‌تونه تا ۳۰ ثانیه طول بکشه؛ تلاش بعدی شروع نشه
             log.info("lyrics search: budget (%.0fs) used up", LYRICS_SEARCH_BUDGET)
@@ -737,8 +748,16 @@ def _find_by_words(ws):
             log.warning("lyrics search failed: %s", e)
             continue
         if song and song.get("title"):
+            if song.get("loose"):
+                if loose is None or song.get("ratio", 0) > loose.get("ratio", 0):
+                    loose, loose_n = song, len(t)
+                continue
             log.info("lyrics search found: %s - %s (%d words)", song.get("artist"), song["title"], len(t))
             return song, len(t)
+    if loose is not None:
+        log.info("lyrics search: weak guess %s - %s (overlap=%.2f)", loose.get("artist"), loose["title"],
+                 loose.get("ratio", 0))
+        return loose, loose_n
     log.info("lyrics search: no match (%d words)", len(ws))
     return None, 0
 
@@ -771,6 +790,8 @@ def _lyrics_vote(paths, stop=None):
         return [], True
     lang = None            # قفل زبان فقط داخل همین درخواست (بین کاربرها قفل نمی‌مونه)
     all_ws = []
+    tried = []
+    guess = None           # بهترین حدس ضعیف: (song, path, idx)
     skip_vad = False       # اگه تکه‌ی قبلی فقط با پاس دوم متن داد، برای بعدی پاس VAD رو تکرار نمی‌کنیم
     for i, p in enumerate(paths[:max(1, WHISPER_MAX_PIECES)]):
         if stop is not None and stop.is_set():
@@ -783,6 +804,11 @@ def _lyrics_vote(paths, stop=None):
             if not ws:
                 log.info("lyrics: piece %d candidate unusable (heard %d chars)", i, len(text))
                 continue
+            key = " ".join(ws)
+            if any(difflib.SequenceMatcher(None, key, k).ratio() >= 0.85 for k in tried):
+                log.info("lyrics: piece %d candidate is almost identical to a tried one, skipping", i)
+                continue
+            tried.append(key)
             lang = lang or det
             skip_vad = skip_vad or loose
             log.info("lyrics heard (%d words): %s", len(ws), text[:200])
@@ -790,6 +816,10 @@ def _lyrics_vote(paths, stop=None):
                 all_ws.extend(ws)      # فقط نسخه‌ی اصلی هر تکه تو جستجوی ترکیبی میاد
                 primary_done = True
             song, n = _find_by_words(ws)
+            if song and song.get("loose"):
+                if guess is None or song.get("ratio", 0) > guess[0].get("ratio", 0):
+                    guess = (song, p, i)
+                continue
             if song:
                 w = 0.9 if n >= 10 else (0.8 if n >= 8 else 0.6)
                 if loose:
@@ -801,10 +831,19 @@ def _lyrics_vote(paths, stop=None):
     if len(all_ws) >= 10 and not (stop is not None and stop.is_set()):
         log.info("lyrics: trying all %d words of the pieces together", len(all_ws))
         song, n = _find_by_words(all_ws)
-        if song:
+        if song and song.get("loose"):
+            if guess is None or song.get("ratio", 0) > guess[0].get("ratio", 0):
+                guess = (song, paths[0], 0)
+        elif song:
             return [{"src": "lyrics", "title": song["title"], "artist": song.get("artist") or "",
                      "w": 0.85, "dur": None, "link": song.get("link"),
                      "yt": None, "path": paths[0], "idx": 0}], True
+    if guess is not None:
+        gs, gp, gi = guess
+        # وزن کم: تنهایی قبول نمی‌شه؛ فقط اگه چیز بهتری پیدا نشد، آخر کار به‌عنوان حدس داده می‌شه
+        return [{"src": "lyrics", "title": gs["title"], "artist": gs.get("artist") or "",
+                 "w": LYR_GUESS_W, "dur": None, "link": gs.get("link"),
+                 "yt": None, "path": gp, "idx": gi, "loose": True}], True
     return [], True
 
 
@@ -937,6 +976,9 @@ def _install_text_search(words_fn):
                      b["ratio"], b["hits"])
             if _confident(mod, b):
                 return {"title": b["title"], "artist": b["artist"], "link": None}
+            if LYRICS_GUESS and b["ratio"] >= LYR_GUESS_OVERLAP and b["hits"] >= LYR_GUESS_HITS:
+                return {"title": b["title"], "artist": b["artist"], "link": None,
+                        "loose": True, "ratio": b["ratio"]}
             return None
 
         async def try_v2(msg, text, lang):
@@ -1340,6 +1382,13 @@ def _ask_engines(paths, rejected, items, stop):
 
         if tie:
             return _to_song(_decide(items, rejected)[0])
+        groups, second = _decide(items, rejected)
+        if (LYRICS_GUESS and groups and "lyrics" in groups[0]["srcs"]
+                and groups[0]["w"] >= LYR_GUESS_W - 1e-6 and groups[0]["w"] - second >= 0.1):
+            log.info("no confident answer: returning the best lyrics guess: %s", groups[0]["items"][0]["title"])
+            song = _to_song(groups)
+            song["guess"] = True
+            return song
         if answered == 0 and failed > 0:
             raise NoAccounts("no engine answered")
         return None
