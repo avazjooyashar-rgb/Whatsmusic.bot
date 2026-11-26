@@ -1,5 +1,9 @@
 """
-recognition.py - v16.19 (یک فایل کامل، جای recognition.py قبلی؛ bot.py بدون تغییر کار می‌کنه)
+recognition.py - v16.20 (یک فایل کامل، جای recognition.py قبلی؛ bot.py بدون تغییر کار می‌کنه)
+
+تغییرهای v16.20 نسبت به v16.19:
+  - حدس ضعیف متن ترانه همون لحظه ذخیره می‌شه؛ اگه جستجوی ترانه دیر تموم شد (مثل ۴۲ ثانیه)، دیگه دور ریخته نمی‌شه
+  - کاندیدهای بعدی هم به‌عنوان گزینه‌ی «آهنگ اشتباه» همراه حدس داده می‌شن
 
 تغییرهای v16.19 نسبت به v16.18:
   - اگه جواب قطعی نبود ولی متن ترانه تطبیق نسبی (overlap>=0.35 و >=2 تطابق) داشت، بهترین حدس با گزینه‌های «آهنگ اشتباه»
@@ -161,7 +165,7 @@ def init(load_accounts, local_fn=None, words_fn=None):
     if words_fn and WHISPER_MODEL and WHISPER_PRELOAD:
         threading.Thread(target=_get_whisper, daemon=True, name="whisper-load").start()
     threading.Thread(target=_sh_warm, daemon=True, name="shazam-warm").start()
-    log.info("recognition v16.19: local=%s lyrics=%s whisper=%s",
+    log.info("recognition v16.20: local=%s lyrics=%s whisper=%s",
              bool(local_fn), bool(words_fn), ("groq+" if GROQ_KEY else "") + (WHISPER_MODEL or "off"))
 
 
@@ -784,7 +788,19 @@ def _piece_cands(p, lang, skip_vad, first):
             yield (r[0], None, False)
 
 
-def _lyrics_vote(paths, stop=None):
+def _guess_items(gs, gp, gi):
+    """حدس ضعیف + چند کاندیدای بعدی (برای دکمه‌ی «آهنگ اشتباه»)؛ وزن‌ها کمه تا تنهایی قبول نشن."""
+    out = [{"src": "lyrics", "title": gs["title"], "artist": gs.get("artist") or "", "w": LYR_GUESS_W,
+            "dur": None, "link": gs.get("link"), "yt": None, "path": gp, "idx": gi, "loose": True}]
+    for k, o in enumerate((gs.get("others") or [])[:3]):
+        out.append({"src": "lyrics", "title": o["title"], "artist": o.get("artist") or "",
+                    "w": max(0.1, LYR_GUESS_W - 0.12 * (k + 1)), "dur": None, "link": None, "yt": None,
+                    "path": gp, "idx": gi, "loose": True})
+    return out
+
+
+def _lyrics_vote(paths, stop=None, partial=None):
+    """partial: لیست مشترک؛ هر حدس ضعیف همون لحظه توش گذاشته می‌شه تا اگه کار ترانه دیر تموم شد، دور ریخته نشه."""
     wf = _cfg["words"]
     if not wf or not (WHISPER_MODEL or GROQ_KEY):
         return [], True
@@ -819,6 +835,8 @@ def _lyrics_vote(paths, stop=None):
             if song and song.get("loose"):
                 if guess is None or song.get("ratio", 0) > guess[0].get("ratio", 0):
                     guess = (song, p, i)
+                    if partial is not None:
+                        partial[:] = _guess_items(*guess)
                 continue
             if song:
                 w = 0.9 if n >= 10 else (0.8 if n >= 8 else 0.6)
@@ -834,16 +852,15 @@ def _lyrics_vote(paths, stop=None):
         if song and song.get("loose"):
             if guess is None or song.get("ratio", 0) > guess[0].get("ratio", 0):
                 guess = (song, paths[0], 0)
+                if partial is not None:
+                    partial[:] = _guess_items(*guess)
         elif song:
             return [{"src": "lyrics", "title": song["title"], "artist": song.get("artist") or "",
                      "w": 0.85, "dur": None, "link": song.get("link"),
                      "yt": None, "path": paths[0], "idx": 0}], True
     if guess is not None:
-        gs, gp, gi = guess
         # وزن کم: تنهایی قبول نمی‌شه؛ فقط اگه چیز بهتری پیدا نشد، آخر کار به‌عنوان حدس داده می‌شه
-        return [{"src": "lyrics", "title": gs["title"], "artist": gs.get("artist") or "",
-                 "w": LYR_GUESS_W, "dur": None, "link": gs.get("link"),
-                 "yt": None, "path": gp, "idx": gi, "loose": True}], True
+        return _guess_items(*guess), True
     return [], True
 
 
@@ -977,8 +994,10 @@ def _install_text_search(words_fn):
             if _confident(mod, b):
                 return {"title": b["title"], "artist": b["artist"], "link": None}
             if LYRICS_GUESS and b["ratio"] >= LYR_GUESS_OVERLAP and b["hits"] >= LYR_GUESS_HITS:
+                others = [{"title": c["title"], "artist": c["artist"]} for c in ranked[1:4]
+                          if c["ratio"] >= 0.3 and c["hits"] >= 2]
                 return {"title": b["title"], "artist": b["artist"], "link": None,
-                        "loose": True, "ratio": b["ratio"]}
+                        "loose": True, "ratio": b["ratio"], "others": others}
             return None
 
         async def try_v2(msg, text, lang):
@@ -1208,6 +1227,7 @@ def _ask_engines(paths, rejected, items, stop):
     use_lyrics = bool(_cfg["words"] and (WHISPER_MODEL or GROQ_KEY))
 
     answered = failed = 0
+    partial = []          # حدس ضعیفِ متن ترانه که کارش هنوز تموم نشده
     futs = {}
     acr_f = {}
     sh_f = {}
@@ -1236,7 +1256,7 @@ def _ask_engines(paths, rejected, items, stop):
 
     def start_lyrics():
         if use_lyrics and st["lyr"] is None:
-            st["lyr"] = _WPOOL.submit(_lyrics_vote, pieces, stop)
+            st["lyr"] = _WPOOL.submit(_lyrics_vote, pieces, stop, partial)
 
     def take_lyrics(block=False):
         lyr = st["lyr"]
@@ -1382,6 +1402,9 @@ def _ask_engines(paths, rejected, items, stop):
 
         if tie:
             return _to_song(_decide(items, rejected)[0])
+        if not st["lyr_taken"] and partial:
+            items.extend(list(partial))        # کار ترانه هنوز تموم نشده: همون حدسی که تا الان داره رو بردار
+            st["lyr_taken"] = True
         groups, second = _decide(items, rejected)
         if (LYRICS_GUESS and groups and "lyrics" in groups[0]["srcs"]
                 and groups[0]["w"] >= LYR_GUESS_W - 1e-6 and groups[0]["w"] - second >= 0.1):
