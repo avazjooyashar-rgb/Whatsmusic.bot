@@ -1,19 +1,19 @@
 """
-recognition.py - v16 (یک فایل کامل، جای recognition.py قبلی؛ bot.py بدون تغییر کار می‌کنه)
+recognition.py - v16.18 (یک فایل کامل، جای recognition.py قبلی؛ bot.py بدون تغییر کار می‌کنه)
 
-تغییرهای v16 نسبت به v15:
-  سرعت:
-  - Shazam حالا یک event-loop دائمی و یک نمونه‌ی Shazam مشترک داره (دیگه هر بار asyncio.run نمی‌زنه)
-  - Shazam برای هر سه تکه از همون لحظه‌ی اول موازی شروع می‌شه (رایگانه)
-  - اگه همه‌ی موتورهای آنلاینِ شروع‌شده جواب دادن و جواب قوی و بدون مخالفه، بدون صبر (grace) فوری قبول می‌شه
-  - Whisper: زبان بعد از اولین تکه قفل می‌شه (تکه‌ی دوم سریع‌تر)، و منتظر کامل شدن نمی‌مونه؛ نتیجه‌اش همون لحظه برداشته می‌شه
-  - نسخه‌های «آخرین راه» تو /dev/shm (RAM) ساخته می‌شن و شش‌تا همزمان
-  - SOFT_LAUNCH=4 (قبلاً ۶): تکه‌ی بعدیِ ACR زودتر شروع می‌شه
-  دقت:
-  - نسخه‌های جدید آخرین راه که سرعت رو عوض می‌کنن ولی پیچ رو نه (tempo)، و پیچ رو عوض می‌کنن ولی سرعت رو نه (pitch ±2)؛
-    برای کاور/اجرای کندتر-تندتر یا کلید متفاوت
-  - بونس ترکیبی: متن ترانه + دیتابیس خودت / ملودی / موتور آنلاین هم‌نظر بشن، اطمینان بالاتر می‌ره
-  - متن ترانه: کلمه‌های تکراریِ بیش از حد (hallucination) بهتر فیلتر می‌شن
+تغییرهای v16.18 نسبت به v16.17:
+  متن ترانه (Groq / Whisper):
+  - Groq دو بار صدا زده می‌شه: یک بار با زبان فارسی + prompt (برای فارسی/لری)، یک بار با تشخیص خودکار
+    (برای آهنگ‌های غیرفارسی). هر دو نتیجه به ترتیب اولویت جستجو می‌شن
+  - اگه هیچ‌کدوم جواب نداد: نسخه‌ی «فقط صدای خواننده» (vocal) هم یک بار به Groq می‌ره
+  - خطای 429 گروک: یک بار با تأخیر دوباره امتحان می‌شه
+  - فیلتر hallucination قوی‌تر (ریمکس، ترجمه، تکرار خود prompt)؛ تکرار ترانه‌ای (نه نه نه) دیگه کل متن رو دور نمی‌ریزه
+  - جستجوی نیمه‌نیمه از ۱۰ کلمه به بالا (قبلاً ۱۴)
+  ملودی (humming):
+  - تا ۵ نتیجه‌ی ملودی از ACR خونده می‌شه و رتبه‌ی پایین‌تر وزن کمتر داره
+  - نسخه‌های تمیز/صدای خواننده به ACR هم می‌رن (ملودی روی صدای تمیز خیلی بهتر جواب می‌ده)
+  - اگه ملودی روی نسخه‌ی اصلی و نسخه‌ی تمیز، هر دو یک آهنگ رو نشون بدن، وزنش بالاتر می‌ره (رأی چندگانه)
+  - نسخه‌های clean/vocal اول اجرا می‌شن (قبلاً آخر صف بودن)، و بودجه‌ی آخرین راه ۱۲ ثانیه شد
 
 دانلود (تو همین فایل): mp3 با کاور + تگ، موازی و کش‌شده
     fut = recognition.start_download(song["title"], song["artist"], dur=song.get("dur"),
@@ -34,7 +34,10 @@ recognition.py - v16 (یک فایل کامل، جای recognition.py قبلی؛ 
   WHISPER_BEAM=1 (برای دقت بیشتر ۳ یا ۵؛ کندتر)  WHISPER_PRELOAD=1
   FAST_W=1.0  FAST_GRACE=2  SOFT_LAUNCH=4  LYRICS_DELAY=2  SHAZAM_TIMEOUT=20  SHAZAM_THREADS=3
   FP_STRONG=60  FP_STRONG2=20  FP_WEAK_MIN=12  LOCAL_PIECES=3
-  GROQ_API_KEY= GROQ_MODEL=whisper-large-v3 (اختیاری)  DEBUG_KEEP_DIR=/tmp/dbg (فقط عیب‌یابی)  HUM_CAP=0.6  LAST_RESORT=1  LAST_RESORT_PIECES=2  VAR_WORKERS=2 LAST_RESORT_BUDGET=8 WHISPER_LOOSE=1  DB_PATH
+  GROQ_API_KEY= GROQ_MODEL=whisper-large-v3 GROQ_LANG=fa GROQ_PROMPT="متن ترانه‌ی فارسی و لری"
+  HUM_CAP=0.6 HUM_VOTE_BONUS=0.2 HUM_VOTE_CAP=0.4 ACR_VARIANT_KINDS=clean,vocal (خالی = خاموش؛ هر کدوم یک سهمیه‌ی ACR)
+  DEBUG_KEEP_DIR=/tmp/dbg (فقط عیب‌یابی)  LAST_RESORT=1  LAST_RESORT_PIECES=2  VAR_WORKERS=2
+  LAST_RESORT_BUDGET=12 WHISPER_LOOSE=1  DB_PATH
 """
 import asyncio
 import base64
@@ -80,6 +83,9 @@ FP_STRONG_SINGLE = _f("FP_STRONG_SINGLE", 45)
 FP_WEAK_MIN = _f("FP_WEAK_MIN", 12)
 LOCAL_PIECES = max(1, int(_f("LOCAL_PIECES", 3)))
 HUM_CAP = _f("HUM_CAP", 0.6)
+HUM_VOTE_BONUS = _f("HUM_VOTE_BONUS", 0.2)
+HUM_VOTE_CAP = _f("HUM_VOTE_CAP", 0.4)
+ACR_VARIANT_KINDS = {k.strip() for k in os.environ.get("ACR_VARIANT_KINDS", "clean,vocal").split(",") if k.strip()}
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small").strip()
 WHISPER_COMPUTE = os.environ.get("WHISPER_COMPUTE", "int8").strip() or "int8"
 WHISPER_LANG = os.environ.get("WHISPER_LANG", "").strip()
@@ -89,6 +95,8 @@ WHISPER_PRELOAD = os.environ.get("WHISPER_PRELOAD", "1") == "1"
 WHISPER_LOOSE = os.environ.get("WHISPER_LOOSE", "1") == "1"
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "").strip()      # اختیاری: Whisper large-v3 میزبانی‌شده (دقیق‌تر + CPU سرور رو مصرف نمی‌کنه)
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "whisper-large-v3").strip()
+GROQ_LANG = os.environ.get("GROQ_LANG", "fa").strip()
+GROQ_PROMPT = os.environ.get("GROQ_PROMPT", "متن ترانه‌ی فارسی و لری").strip()
 GROQ_TIMEOUT = _f("GROQ_TIMEOUT", 12)
 LYRICS_SEARCH_BUDGET = _f("LYRICS_SEARCH_BUDGET", 15)
 LYRICS_FINAL_WAIT = _f("LYRICS_FINAL_WAIT", 10)
@@ -97,7 +105,7 @@ SHAZAM_THREADS = max(1, int(_f("SHAZAM_THREADS", 3)))
 LAST_RESORT = os.environ.get("LAST_RESORT", "1") == "1"
 LAST_RESORT_PIECES = max(1, int(_f("LAST_RESORT_PIECES", 2)))
 VAR_WORKERS = max(1, int(_f("VAR_WORKERS", 2)))          # روی ۲ هسته بیشتر از ۲ ffmpeg همزمان Shazam رو گرسنه می‌کنه
-LAST_RESORT_BUDGET = _f("LAST_RESORT_BUDGET", 8)
+LAST_RESORT_BUDGET = _f("LAST_RESORT_BUDGET", 12)
 ACR_TIMEOUT = 15
 SHAZAM_TIMEOUT = _f("SHAZAM_TIMEOUT", 8)          # هر تلاش؛ اتصال گیرکرده رها و دوباره امتحان می‌شه
 SHAZAM_TRIES = max(1, int(_f("SHAZAM_TRIES", 2)))
@@ -116,6 +124,7 @@ MAX_PIECES = 3
 _POOL = ThreadPoolExecutor(max_workers=12, thread_name_prefix="rec")
 _WPOOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="whisper")
 _VPOOL = ThreadPoolExecutor(max_workers=VAR_WORKERS, thread_name_prefix="variant")
+_GPOOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="groq")
 _SESS = requests.Session()
 _SESS.mount("https://", HTTPAdapter(pool_connections=4, pool_maxsize=12))
 _cfg = {"load": None, "local": None, "words": None, "local_excl": False}
@@ -143,7 +152,7 @@ def init(load_accounts, local_fn=None, words_fn=None):
     if words_fn and WHISPER_MODEL and WHISPER_PRELOAD:
         threading.Thread(target=_get_whisper, daemon=True, name="whisper-load").start()
     threading.Thread(target=_sh_warm, daemon=True, name="shazam-warm").start()
-    log.info("recognition v16.17: local=%s lyrics=%s whisper=%s",
+    log.info("recognition v16.18: local=%s lyrics=%s whisper=%s",
              bool(local_fn), bool(words_fn), ("groq+" if GROQ_KEY else "") + (WHISPER_MODEL or "off"))
 
 
@@ -346,7 +355,8 @@ def _acr_parse(j) -> list:
     out = []
     md = j.get("metadata") or {}
     for kind in ("custom_files", "music", "humming"):
-        for m in (md.get(kind) or [])[:3]:
+        limit = 5 if kind == "humming" else 3          # ملودی: تا ۵ کاندیدا، رتبه‌ی پایین‌تر وزن کمتر
+        for rank, m in enumerate((md.get(kind) or [])[:limit]):
             if not m.get("title"):
                 continue
             ext = m.get("external_metadata") or {}
@@ -355,9 +365,9 @@ def _acr_parse(j) -> list:
             ms = _num(m.get("duration_ms"))
             score = _num(m.get("score")) / 100
             if kind == "humming":
-                w = min(HUM_CAP, score * 0.7)      # ملودی تنها هرگز قبول نمی‌شه
+                w = min(HUM_CAP, score * 0.7) * (1.0 - 0.08 * rank)      # ملودی تنها هرگز قبول نمی‌شه
                 src = "hum"
-                log.info("acr hum: '%s' raw score=%s -> w=%.2f", m["title"], m.get("score"), w)
+                log.info("acr hum #%d: '%s' raw score=%s -> w=%.2f", rank + 1, m["title"], m.get("score"), w)
             elif kind == "music":
                 w = min(1.1, score * 1.15)
                 src = "acr"
@@ -487,14 +497,15 @@ def _shazam(path, variant=False):
 
 
 # ======================================================================================
-# متن ترانه: صدا -> متن (Whisper) -> پیدا کردن ترانه از روی کلمات
+# متن ترانه: صدا -> متن (Groq / Whisper) -> پیدا کردن ترانه از روی کلمات
 # ======================================================================================
 _WH = {"m": None, "fail": False}
 _WH_LOCK = threading.Lock()
 _WH_RUN = threading.Lock()
 _HALLU_SEG = re.compile(
     r"thanks? for watching|thank you|subtitles?|amara\.org|subscribe|www\.|\.com|"
-    r"زیرنویس|تماشا کردی|تماشا کردین|ممنون از تماشا|اشتراک|لایک کنید", re.I)
+    r"زیرنویس|تماشا کردی|تماشا کردین|ممنون از تماشا|اشتراک|لایک کنید|ترجمه|مشترک شو|ریمی?کس|"
+    r"^\W*موسیقی\W*$", re.I)
 
 
 def _get_whisper():
@@ -547,20 +558,37 @@ def _whisper_pass(model, path, lang, vad, strict):
     return " ".join(kept).strip(), info, drop
 
 
-def _groq_transcribe(path, lang=None):
-    """Whisper large-v3 از Groq (API سازگار با OpenAI). -> متن (ممکنه خالی) یا None اگه درخواست شکست خورد."""
+def _fa_ratio(text):
+    """نسبت حروف فارسی/عربی به کل حروف متن"""
+    letters = [c for c in (text or "") if c.isalpha()]
+    if not letters:
+        return 0.0
+    return sum(1 for c in letters if "\u0600" <= c <= "\u06ff") / len(letters)
+
+
+def _groq_call(path, lang, prompt):
+    """یک درخواست به Groq. -> (متن, زبان تشخیص‌داده‌شده) یا None اگه درخواست شکست خورد."""
     try:
         data = {"model": GROQ_MODEL, "temperature": "0", "response_format": "verbose_json"}
         if lang:
             data["language"] = lang
-        with open(path, "rb") as f:
-            r = _SESS.post("https://api.groq.com/openai/v1/audio/transcriptions",
-                           headers={"Authorization": f"Bearer {GROQ_KEY}"}, data=data,
-                           files={"file": (os.path.basename(path), f)}, timeout=GROQ_TIMEOUT)
+        if prompt:
+            data["prompt"] = prompt
+        r = None
+        for attempt in (0, 1):
+            with open(path, "rb") as f:
+                r = _SESS.post("https://api.groq.com/openai/v1/audio/transcriptions",
+                               headers={"Authorization": f"Bearer {GROQ_KEY}"}, data=data,
+                               files={"file": (os.path.basename(path), f)}, timeout=GROQ_TIMEOUT)
+            if r.status_code == 429 and attempt == 0:
+                time.sleep(2.0)
+                continue
+            break
         if r.status_code != 200:
             log.warning("groq asr HTTP %s: %s", r.status_code, r.text[:150].replace("\n", " "))
             return None
         j = r.json()
+        pe = fold(prompt)[:14] if prompt else ""
         segs = j.get("segments")
         if segs:
             kept = []
@@ -570,28 +598,60 @@ def _groq_transcribe(path, lang=None):
                     continue
                 if len(t) < 60 and _HALLU_SEG.search(t):
                     continue
+                if pe and pe in fold(t):          # خود prompt تو خروجی تکرار شده = hallucination
+                    continue
                 kept.append(t)
             text = " ".join(kept).strip()
         else:
             text = (j.get("text") or "").strip()
-        log.info("groq asr (%s): %d chars", GROQ_MODEL, len(text))
-        return text
+        log.info("groq asr (lang=%s, heard=%s): %d chars", lang or "auto", j.get("language"), len(text))
+        return text, (j.get("language") or "")
     except Exception as e:
         log.warning("groq asr failed: %s", str(e)[:150])
         return None
 
 
-def _transcribe(path, lang=None, skip_vad=False):
-    """-> (text, زبان تشخیص‌داده‌شده یا None, loose)
-    پاس اول: با VAD و فیلتر سخت‌گیر (مناسب ویس). اگه چیزی نشنید، پاس دوم: بدون VAD و فیلتر نرم‌تر
+def _groq_candidates(path, lang=None):
+    """-> [(text, det, loose)] بهترین اول | [] اگه چیزی نشنید | None اگه همه‌ی درخواست‌ها شکست خوردن.
+    بدون زبان قفل‌شده: یک بار فارسی+prompt و یک بار خودکار، موازی."""
+    if lang:
+        jobs = [(lang, GROQ_PROMPT if lang == "fa" else "")]
+    else:
+        jobs = [(GROQ_LANG or None, GROQ_PROMPT if GROQ_LANG == "fa" else "")]
+        if GROQ_LANG:
+            jobs.append((None, ""))
+    futs = [_GPOOL.submit(_groq_call, path, l, pr) for l, pr in jobs]
+    res = [f.result() for f in futs]
+    if all(r is None for r in res):
+        return None
+    outs = []
+    for (l, _pr), r in zip(jobs, res):
+        if r and r[0]:
+            outs.append({"text": r[0], "lang": l, "det": (r[1] or "").lower()})
+    if len(outs) == 2:
+        a, b = outs
+        if fold(a["text"]) == fold(b["text"]):
+            outs = [a]
+        elif b["det"] == "english" and _fa_ratio(b["text"]) < 0.3:
+            outs = [b, a]          # آهنگ انگلیسی واقعی: نسخه‌ی خودکار اول
+    final = []
+    for o in outs:
+        det = "fa" if (o["lang"] == "fa" and _fa_ratio(o["text"]) >= 0.6) else None
+        final.append((o["text"], det, False))
+    return final
+
+
+def _groq_transcribe(path, lang=None):
+    """سازگار با کد قدیمی: فقط بهترین متن"""
+    c = _groq_candidates(path, lang)
+    if c is None:
+        return None
+    return c[0][0] if c else ""
+
+
+def _transcribe_local(path, lang=None, skip_vad=False):
+    """Whisper محلی. پاس اول: با VAD و فیلتر سخت‌گیر. اگه چیزی نشنید، پاس دوم: بدون VAD و فیلتر نرم‌تر
     (VAD گاهی آواز با موزیک رو «غیرگفتار» می‌دونه و کل صدا رو حذف می‌کنه)."""
-    lang = WHISPER_LANG or lang
-    if GROQ_KEY:
-        gt = _groq_transcribe(path, lang)
-        if gt:
-            return gt, None, False
-        if gt is not None and not GROQ_FALLBACK_LOCAL:
-            return "", None, False       # Groq جواب داد و چیزی نشنید (مثلاً فقط موزیکه): Whisper محلیِ کند رو تکرار نمی‌کنیم
     model = _get_whisper()
     if model is None:
         return "", None, False
@@ -616,25 +676,49 @@ def _transcribe(path, lang=None, skip_vad=False):
     return "", None, False
 
 
+def _transcribe(path, lang=None, skip_vad=False):
+    """سازگار با کد قدیمی -> (text, زبان تشخیص‌داده‌شده یا None, loose)"""
+    c = _transcribe_multi(path, lang, skip_vad)
+    return c[0] if c else ("", None, False)
+
+
+def _transcribe_multi(path, lang=None, skip_vad=False):
+    """-> [(text, det, loose), ...] به ترتیب اولویت"""
+    lang = WHISPER_LANG or lang
+    if GROQ_KEY:
+        c = _groq_candidates(path, lang)
+        if c:
+            return c
+        if c is not None and not GROQ_FALLBACK_LOCAL:
+            return []       # Groq جواب داد و چیزی نشنید (مثلاً فقط موزیکه): Whisper محلیِ کند رو تکرار نمی‌کنیم
+    t, det, loose = _transcribe_local(path, lang, skip_vad)
+    return [(t, det, loose)] if t else []
+
+
 def _usable_words(text):
     if not text:
         return []
     ws = re.findall(r"\w+", fold(text))
-    if len(ws) < 4 or len(set(ws)) / len(ws) < 0.35:
+    out, run = [], 0
+    for w in ws:
+        if out and w == out[-1]:
+            run += 1
+            if run >= 7:
+                return []          # ۸ بار پشت‌سرهم = hallucination
+            if run >= 2:
+                continue           # تکرار ترانه‌ای (نه نه نه) به ۲ بار فشرده می‌شه
+        else:
+            run = 0
+        out.append(w)
+    if len(out) < 4 or len(set(out)) / len(out) < 0.3:
         return []
-    # تکرار پشت‌سرهمِ یک کلمه (۴ بار یا بیشتر) = hallucination
-    run = 1
-    for a, b in zip(ws, ws[1:]):
-        run = run + 1 if a == b else 1
-        if run >= 4:
-            return []
-    return ws
+    return out
 
 
 def _word_tries(ws):
     """کل کلمات و دو نیمه (پنجره‌بندی رو خود find_song_by_words بات انجام می‌ده)."""
     tries = [ws]
-    if len(ws) >= 14:
+    if len(ws) >= 10:
         h = len(ws) // 2
         tries += [ws[:h], ws[h:]]
     return tries
@@ -659,6 +743,28 @@ def _find_by_words(ws):
     return None, 0
 
 
+def _piece_cands(p, lang, skip_vad, first):
+    """کاندیدهای متن یک تکه (تنبل: اگه اولی ترانه رو پیدا کرد، بقیه اجرا نمی‌شن)."""
+    for c in _transcribe_multi(p, lang, skip_vad):
+        yield c
+    if GROQ_KEY and first:        # آخرین تلاش: صدای فیلترشده (خواننده بالا، موزیک پایین)
+        v, r = None, None
+        try:
+            v = _variant(p, "vocal")
+            r = _groq_call(v, lang or GROQ_LANG or None, GROQ_PROMPT if (lang or GROQ_LANG) == "fa" else "")
+        except Exception as e:
+            log.info("vocal retry failed: %s", str(e)[:100])
+        finally:
+            if v:
+                try:
+                    os.remove(v)
+                except OSError:
+                    pass
+        if r and r[0]:
+            log.info("lyrics: trying the vocal-filtered version")
+            yield (r[0], None, False)
+
+
 def _lyrics_vote(paths, stop=None):
     wf = _cfg["words"]
     if not wf or not (WHISPER_MODEL or GROQ_KEY):
@@ -669,23 +775,28 @@ def _lyrics_vote(paths, stop=None):
     for i, p in enumerate(paths[:max(1, WHISPER_MAX_PIECES)]):
         if stop is not None and stop.is_set():
             return [], True
-        text, det, loose = _transcribe(p, lang, skip_vad)
-        lang = lang or det
-        skip_vad = skip_vad or loose
-        ws = _usable_words(text)
-        if not ws:
-            log.info("lyrics: piece %d unusable (heard %d chars)", i, len(text))
-            continue
-        log.info("lyrics heard (%d words): %s", len(ws), text[:200])
-        all_ws.extend(ws)
-        song, n = _find_by_words(ws)
-        if song:
-            w = 0.9 if n >= 10 else (0.8 if n >= 8 else 0.6)
-            if loose:
-                w = min(w, 0.78)       # متن پاس دوم (بدون VAD) کمی کم‌اطمینان‌تره
-            return [{"src": "lyrics", "title": song["title"], "artist": song.get("artist") or "",
-                     "w": w, "dur": None, "link": song.get("link"),
-                     "yt": None, "path": p, "idx": i}], True
+        primary_done = False
+        for text, det, loose in _piece_cands(p, lang, skip_vad, i == 0):
+            if stop is not None and stop.is_set():
+                return [], True
+            ws = _usable_words(text)
+            if not ws:
+                log.info("lyrics: piece %d candidate unusable (heard %d chars)", i, len(text))
+                continue
+            lang = lang or det
+            skip_vad = skip_vad or loose
+            log.info("lyrics heard (%d words): %s", len(ws), text[:200])
+            if not primary_done:
+                all_ws.extend(ws)      # فقط نسخه‌ی اصلی هر تکه تو جستجوی ترکیبی میاد
+                primary_done = True
+            song, n = _find_by_words(ws)
+            if song:
+                w = 0.9 if n >= 10 else (0.8 if n >= 8 else 0.6)
+                if loose:
+                    w = min(w, 0.78)       # متن پاس دوم (بدون VAD) کمی کم‌اطمینان‌تره
+                return [{"src": "lyrics", "title": song["title"], "artist": song.get("artist") or "",
+                         "w": w, "dur": None, "link": song.get("link"),
+                         "yt": None, "path": p, "idx": i}], True
     # هیچ تکه‌ای تنهایی جواب نداد: کلمه‌های همه‌ی تکه‌ها با هم (کلمه‌ی بیشتر = تطبیق قوی‌تر با ترانه)
     if len(all_ws) >= 10 and not (stop is not None and stop.is_set()):
         log.info("lyrics: trying all %d words of the pieces together", len(all_ws))
@@ -868,6 +979,11 @@ def _group(items):
         bonus = sum(min(0.6, 0.3 * (len(s) - 1)) for s in pieces.values())
         if len(per) >= 3:
             bonus += 0.25
+        # ملودی: اگه روی نسخه‌ی اصلی و نسخه(های) تمیز/صدای خواننده، همه یک آهنگ رو نشون بدن = رأی چندگانه
+        if "hum" in per:
+            hum_variants = {c.get("vk") for c in g if c["src"] == "hum" and c.get("vk")}
+            if hum_variants:
+                bonus += min(HUM_VOTE_CAP, HUM_VOTE_BONUS * len(hum_variants))
         # هم‌نظری متن ترانه با یک منبع مستقل (صدا + متن = دو نوع شاهد متفاوت)
         if "lyrics" in per:
             if "local" in per:
@@ -940,8 +1056,9 @@ _VARIANTS = {
     "pitch_up": "aresample=44100,asetrate=49500,atempo=0.8909,aresample=44100",
     "pitch_down": "aresample=44100,asetrate=39289,atempo=1.1225,aresample=44100",
 }
-_PRIMARY_VARIANTS = ("slow", "fast", "clean", "tempo_down", "tempo_up", "pitch_up", "pitch_down",
-                     "denoise", "vocal", "slow2", "fast2")
+# clean و vocal اول: هم برای ملودی (ACR) مفیدن هم برای Shazam/دیتابیس
+_PRIMARY_VARIANTS = ("clean", "vocal", "slow", "fast", "tempo_down", "tempo_up", "pitch_up", "pitch_down",
+                     "denoise", "slow2", "fast2")
 _EXTRA_PIECE_VARIANTS = ("clean", "tempo_down", "pitch_up")
 
 
@@ -979,6 +1096,14 @@ def _try_variant(path, kind, rejected):
                 items.append({"src": "local", "title": r["title"], "artist": r["artist"], "dur": r.get("duration"),
                               "link": None, "yt": None, "w": 0.9 if r["score"] >= 40 else min(0.7, r["score"] / 70)})
                 answered = True
+        if kind in ACR_VARIANT_KINDS and _accounts():
+            # ملودی/ACR روی صدای تمیز یا فقط-خواننده خیلی بهتر جواب می‌ده؛ هر نسخه یک سهمیه‌ی ACR مصرف می‌کنه
+            got, ok = _acr(v)
+            answered = answered or ok
+            for c in got:
+                c["vk"] = kind
+                c["w"] = min(c["w"], 0.9)
+            items += got
     finally:
         try:
             os.remove(v)
@@ -1175,7 +1300,7 @@ def _ask_engines(paths, rejected, items, stop):
         tie = bool(groups and groups[0]["w"] >= GUESS_MIN_W)
 
         shazam_up = time.time() >= _SH["until"]
-        if LAST_RESORT and time.time() < deadline and (shazam_up or _cfg["local"]):
+        if LAST_RESORT and time.time() < deadline and (shazam_up or _cfg["local"] or ACR_VARIANT_KINDS):
             tasks = [(pieces[0], 0, k) for k in _PRIMARY_VARIANTS]
             for j in range(1, min(LAST_RESORT_PIECES, len(pieces))):
                 tasks += [(pieces[j], j, k) for k in _EXTRA_PIECE_VARIANTS]
@@ -1207,6 +1332,7 @@ def _ask_engines(paths, rejected, items, stop):
             if st["lyr"] is not None and not st["lyr_taken"] and not st["lyr"].done():
                 wait([st["lyr"]], timeout=max(0.0, min(deadline - time.time(), LYRICS_FINAL_WAIT)))
             take_lyrics()
+            show("last-resort")
             groups, second = _decide(items, rejected)
             if groups and groups[0]["w"] >= GUESS_MIN_W:
                 log.info("found by the last resort: %s", groups[0]["items"][0]["title"])
