@@ -1,5 +1,9 @@
 """
-recognition.py - v16.20 (یک فایل کامل، جای recognition.py قبلی؛ bot.py بدون تغییر کار می‌کنه)
+recognition.py - v16.21 (یک فایل کامل، جای recognition.py قبلی؛ bot.py بدون تغییر کار می‌کنه)
+
+تغییرهای v16.21 نسبت به v16.20:
+  - مثل بات اصلی: اگه ترانه‌ی هیچ کاندیدایی تأیید نشد، نتیجه‌های بالای جستجو (تأییدنشده) به‌عنوان حدس/لیست «شاید» داده می‌شن
+    (هم برای متن تایپ‌شده، هم برای صدا). خاموش‌کردن: LYRICS_SEARCH_GUESS=0
 
 تغییرهای v16.20 نسبت به v16.19:
   - حدس ضعیف متن ترانه همون لحظه ذخیره می‌شه؛ اگه جستجوی ترانه دیر تموم شد (مثل ۴۲ ثانیه)، دیگه دور ریخته نمی‌شه
@@ -113,6 +117,8 @@ LYRICS_GUESS = os.environ.get("LYRICS_GUESS", "1") == "1"      # جواب قطع
 LYR_GUESS_OVERLAP = _f("LYR_GUESS_OVERLAP", 0.35)
 LYR_GUESS_HITS = int(_f("LYR_GUESS_HITS", 2))
 LYR_GUESS_W = _f("LYR_GUESS_W", 0.55)
+LYR_SEARCH_W = _f("LYR_SEARCH_W", 0.5)
+LYRICS_SEARCH_GUESS = os.environ.get("LYRICS_SEARCH_GUESS", "1") == "1"   # تطبیق ترانه‌ای نبود: نتیجه‌های بالای جستجو (مثل بات اصلی) به‌عنوان حدس/لیست «شاید»
 GROQ_FALLBACK_LOCAL = os.environ.get("GROQ_FALLBACK_LOCAL", "0") == "1"   # اگه Groq جواب داد ولی متن خالی بود، Whisper محلی هم امتحان بشه؟
 SHAZAM_THREADS = max(1, int(_f("SHAZAM_THREADS", 3)))
 LAST_RESORT = os.environ.get("LAST_RESORT", "1") == "1"
@@ -165,7 +171,7 @@ def init(load_accounts, local_fn=None, words_fn=None):
     if words_fn and WHISPER_MODEL and WHISPER_PRELOAD:
         threading.Thread(target=_get_whisper, daemon=True, name="whisper-load").start()
     threading.Thread(target=_sh_warm, daemon=True, name="shazam-warm").start()
-    log.info("recognition v16.20: local=%s lyrics=%s whisper=%s",
+    log.info("recognition v16.21: local=%s lyrics=%s whisper=%s",
              bool(local_fn), bool(words_fn), ("groq+" if GROQ_KEY else "") + (WHISPER_MODEL or "off"))
 
 
@@ -790,11 +796,12 @@ def _piece_cands(p, lang, skip_vad, first):
 
 def _guess_items(gs, gp, gi):
     """حدس ضعیف + چند کاندیدای بعدی (برای دکمه‌ی «آهنگ اشتباه»)؛ وزن‌ها کمه تا تنهایی قبول نشن."""
-    out = [{"src": "lyrics", "title": gs["title"], "artist": gs.get("artist") or "", "w": LYR_GUESS_W,
+    w0 = LYR_SEARCH_W if gs.get("unverified") else LYR_GUESS_W     # نتیجه‌ی جستجوی تأییدنشده کم‌اعتمادتره
+    out = [{"src": "lyrics", "title": gs["title"], "artist": gs.get("artist") or "", "w": w0,
             "dur": None, "link": gs.get("link"), "yt": None, "path": gp, "idx": gi, "loose": True}]
     for k, o in enumerate((gs.get("others") or [])[:3]):
         out.append({"src": "lyrics", "title": o["title"], "artist": o.get("artist") or "",
-                    "w": max(0.1, LYR_GUESS_W - 0.12 * (k + 1)), "dur": None, "link": None, "yt": None,
+                    "w": max(0.1, w0 - 0.12 * (k + 1)), "dur": None, "link": None, "yt": None,
                     "path": gp, "idx": gi, "loose": True})
     return out
 
@@ -879,12 +886,17 @@ _TEXT_NEEDED = ("yt_search", "get_lyrics", "_parse_yt_title", "_fuzzy_overlap", 
                 "cand_keyboard")
 
 
+def _cand_key(artist, title) -> str:
+    """کلید یکتا برای کاندیدا: عنوان + خواننده (دو آهنگ هم‌اسم با دو خواننده‌ی مختلف یکی حساب نشن)"""
+    return title_key(title) + "|" + re.sub(r"[\W_]+", "", fold(first_artist(artist)))
+
+
 def _confident(mod, c) -> bool:
     return (c["ratio"] >= getattr(mod, "LYR_MIN_OVERLAP", 0.5)
             and c["hits"] >= getattr(mod, "LYR_MIN_HITS", 4))
 
 
-def _rank_by_words(mod, words, early=True):
+def _rank_by_words(mod, words, early=True, raw=None):
     """کلمه‌ها -> [{"ratio","hits","artist","title"}] مرتب از بهترین؛ فقط کاندیدهایی که ترانه‌شون پیدا و مقایسه شد.
     خط لوله‌ای: به‌محض تموم شدن جستجوی هر پنجره، ترانه‌ی کاندیدهاش گرفته می‌شه (منتظر بقیه‌ی پنجره‌ها نمی‌مونه)،
     و اگه یه کاندیدای خیلی قوی پیدا شد (early=True) همون لحظه تموم می‌شه."""
@@ -897,6 +909,8 @@ def _rank_by_words(mod, words, early=True):
         wins = [hook] + wins
     pool = mod._LYR_POOL
     s_futs = {pool.submit(mod._lyr_search_window, w): w for w in wins}
+    order = {f: i for i, f in enumerate(s_futs)}
+    by_win = {}
     allf = set(s_futs)
     items_seen, pairs, verified = set(), set(), []
     n_items = 0
@@ -915,6 +929,7 @@ def _rank_by_words(mod, words, early=True):
             except Exception:
                 continue
             if f in s_futs:
+                by_win[order[f]] = list(res or [])
                 for it in (res or [])[:6]:
                     if n_items >= 14:
                         break
@@ -934,6 +949,20 @@ def _rank_by_words(mod, words, early=True):
                     stop_now = True
     for f in allf:
         f.cancel()
+    if raw is not None:
+        # نتیجه‌های خامِ جستجو (تأییدنشده)، به ترتیب پنجره: عبارت تکراری/کوروس اول
+        seen_r = set()
+        for idx in sorted(by_win):
+            for it in by_win[idx][:3]:
+                try:
+                    a, t = mod._parse_yt_title(it.get("title"), it.get("channel") or it.get("uploader") or "")
+                except Exception:
+                    continue
+                k = _cand_key(a, t)
+                if not t or not title_key(t) or k in seen_r:
+                    continue
+                seen_r.add(k)
+                raw.append({"artist": a or "", "title": t})
     verified.sort(key=lambda r: (r[0], r[1]), reverse=True)
     out, seen_t = [], set()
     for ratio, hits, artist, name in verified:
@@ -947,22 +976,33 @@ def _rank_by_words(mod, words, early=True):
 
 async def _try_lyrics_search_v2(mod, msg, text, lang) -> bool:
     words = re.findall(r"\w+", mod.fold(text))
-    ranked = await asyncio.to_thread(_rank_by_words, mod, words)
-    if not ranked:
-        return False
-    best = ranked[0]
-    log.info("text search: best %s - %s | overlap=%.2f hits=%d | %d candidates", best["artist"], best["title"],
-             best["ratio"], best["hits"], len(ranked))
-    if _confident(mod, best):
-        song = {"title": best["title"], "artist": best["artist"], "link": None}
-        await mod.send_result(msg, song, lang, "x", wrong=False)
-        return True
-    # قطعی نیست: فقط برای متن بلند و تطبیق نسبی واقعی، لیست «شاید» نشون بده (جستجوی اسم آهنگ مختل نشه)
+    raw = []
+    ranked = await asyncio.to_thread(_rank_by_words, mod, words, True, raw)
+    if ranked:
+        best = ranked[0]
+        log.info("text search: best %s - %s | overlap=%.2f hits=%d | %d candidates", best["artist"], best["title"],
+                 best["ratio"], best["hits"], len(ranked))
+        if _confident(mod, best):
+            song = {"title": best["title"], "artist": best["artist"], "link": None}
+            await mod.send_result(msg, song, lang, "x", wrong=False)
+            return True
+    # قطعی نیست: فقط برای متن بلند، لیست «شاید» نشون بده (جستجوی اسم آهنگ مختل نشه).
+    # اول کاندیدهای تأییدشده‌ی نسبی، بعد نتیجه‌های بالای جستجو (مثل بات اصلی)
     good = [c for c in ranked if c["ratio"] >= 0.3 and c["hits"] >= 3][:8]
-    if len(words) < 7 or not good:
-        return False
     cands = [{"title": c["title"], "artist": c["artist"], "dur": None, "link": None, "yt": None, "cover": None}
              for c in good]
+    if LYRICS_SEARCH_GUESS:
+        seen_c = {_cand_key(c["artist"], c["title"]) for c in cands}
+        for r in raw:
+            if len(cands) >= 8:
+                break
+            k = _cand_key(r["artist"], r["title"])
+            if title_key(r["title"]) and k not in seen_c:
+                seen_c.add(k)
+                cands.append({"title": r["title"], "artist": r["artist"], "dur": None, "link": None,
+                              "yt": None, "cover": None})
+    if len(words) < 7 or not cands:
+        return False
     sid = uuid.uuid4().hex[:10]
     await asyncio.to_thread(mod.add_sample, sid, "")
     mod.CANDS[sid] = {"alts": [], "cur": None, "list": cands, "created": time.time()}
@@ -985,19 +1025,24 @@ def _install_text_search(words_fn):
         orig_try = getattr(mod, "try_lyrics_search", None)
 
         def find_v2(words):
-            ranked = _rank_by_words(mod, words)
-            if not ranked:
-                return None
-            b = ranked[0]
-            log.info("lyrics search best: %s - %s | overlap=%.2f hits=%d", b["artist"], b["title"],
-                     b["ratio"], b["hits"])
-            if _confident(mod, b):
-                return {"title": b["title"], "artist": b["artist"], "link": None}
-            if LYRICS_GUESS and b["ratio"] >= LYR_GUESS_OVERLAP and b["hits"] >= LYR_GUESS_HITS:
-                others = [{"title": c["title"], "artist": c["artist"]} for c in ranked[1:4]
-                          if c["ratio"] >= 0.3 and c["hits"] >= 2]
-                return {"title": b["title"], "artist": b["artist"], "link": None,
-                        "loose": True, "ratio": b["ratio"], "others": others}
+            raw = []
+            ranked = _rank_by_words(mod, words, True, raw)
+            if ranked:
+                b = ranked[0]
+                log.info("lyrics search best: %s - %s | overlap=%.2f hits=%d", b["artist"], b["title"],
+                         b["ratio"], b["hits"])
+                if _confident(mod, b):
+                    return {"title": b["title"], "artist": b["artist"], "link": None}
+                if LYRICS_GUESS and b["ratio"] >= LYR_GUESS_OVERLAP and b["hits"] >= LYR_GUESS_HITS:
+                    others = [{"title": c["title"], "artist": c["artist"]} for c in ranked[1:4]
+                              if c["ratio"] >= 0.3 and c["hits"] >= 2]
+                    return {"title": b["title"], "artist": b["artist"], "link": None,
+                            "loose": True, "ratio": b["ratio"], "others": others}
+            if LYRICS_GUESS and LYRICS_SEARCH_GUESS and raw and len(words) >= 5:
+                log.info("lyrics search: no verified match, using the top search results as a guess: %s",
+                         [r["title"] for r in raw[:3]])
+                return {"title": raw[0]["title"], "artist": raw[0]["artist"], "link": None, "loose": True,
+                        "ratio": 0.0, "unverified": True, "others": raw[1:4]}
             return None
 
         async def try_v2(msg, text, lang):
@@ -1407,7 +1452,7 @@ def _ask_engines(paths, rejected, items, stop):
             st["lyr_taken"] = True
         groups, second = _decide(items, rejected)
         if (LYRICS_GUESS and groups and "lyrics" in groups[0]["srcs"]
-                and groups[0]["w"] >= LYR_GUESS_W - 1e-6 and groups[0]["w"] - second >= 0.1):
+                and groups[0]["w"] >= min(LYR_GUESS_W, LYR_SEARCH_W) - 1e-6 and groups[0]["w"] - second >= 0.1):
             log.info("no confident answer: returning the best lyrics guess: %s", groups[0]["items"][0]["title"])
             song = _to_song(groups)
             song["guess"] = True
