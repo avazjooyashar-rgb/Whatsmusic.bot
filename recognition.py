@@ -1,5 +1,10 @@
 """
-recognition.py - v16.23 (یک فایل کامل، جای recognition.py قبلی؛ bot.py بدون تغییر کار می‌کنه)
+recognition.py - v16.24 (یک فایل کامل، جای recognition.py قبلی؛ bot.py بدون تغییر کار می‌کنه)
+
+تغییرهای v16.24 نسبت به v16.23:
+  - صدا (پیانو/بی‌کلام): نتیجه‌ی خامِ جستجوی یوتیوب دیگه به‌عنوان جواب داده نمی‌شه (AUDIO_SEARCH_GUESS=1 برای برگردوندن)؛
+    لیست «شاید» برای متن تایپ‌شده مثل قبل کار می‌کنه
+  - عنوان‌های کامپایل/اسپم (best music، trending، playlist، mix، ...) از نتیجه‌های جستجوی تأییدنشده حذف می‌شن
 
 تغییرهای v16.23 نسبت به v16.22 (بخش متن ترانه دست نخورده):
   - ملودی: امتیاز >= 0.85 سقف وزن بالاتر (HUM_CAP_STRONG=0.7)؛ ملودی تنها هنوز قبول نمی‌شه، ولی با هر شاهد دوم (تکه‌ی دیگه/ترانه) قبول می‌شه
@@ -132,6 +137,7 @@ LYR_GUESS_OVERLAP = _f("LYR_GUESS_OVERLAP", 0.35)
 LYR_GUESS_HITS = int(_f("LYR_GUESS_HITS", 2))
 LYR_GUESS_W = _f("LYR_GUESS_W", 0.55)
 LYR_SEARCH_W = _f("LYR_SEARCH_W", 0.5)
+AUDIO_SEARCH_GUESS = os.environ.get("AUDIO_SEARCH_GUESS", "0") == "1"   # صدا: نتیجه‌ی جستجوی تأییدنشده هم به‌عنوان جواب؟ (پیش‌فرض نه: برای پیانو/بی‌کلام آهنگ بی‌ربط می‌داد)
 LYRICS_SEARCH_GUESS = os.environ.get("LYRICS_SEARCH_GUESS", "1") == "1"   # تطبیق ترانه‌ای نبود: نتیجه‌های بالای جستجو (مثل بات اصلی) به‌عنوان حدس/لیست «شاید»
 GROQ_FALLBACK_LOCAL = os.environ.get("GROQ_FALLBACK_LOCAL", "0") == "1"   # اگه Groq جواب داد ولی متن خالی بود، Whisper محلی هم امتحان بشه؟
 SHAZAM_THREADS = max(1, int(_f("SHAZAM_THREADS", 3)))
@@ -188,7 +194,7 @@ def init(load_accounts, local_fn=None, words_fn=None):
     if words_fn and WHISPER_MODEL and WHISPER_PRELOAD:
         threading.Thread(target=_get_whisper, daemon=True, name="whisper-load").start()
     threading.Thread(target=_sh_warm, daemon=True, name="shazam-warm").start()
-    log.info("recognition v16.23: local=%s lyrics=%s whisper=%s",
+    log.info("recognition v16.24: local=%s lyrics=%s whisper=%s",
              bool(local_fn), bool(words_fn), ("groq+" if GROQ_KEY else "") + (WHISPER_MODEL or "off"))
 
 
@@ -861,6 +867,8 @@ def _lyrics_vote(paths, stop=None, partial=None):
                 all_ws.extend(ws)      # فقط نسخه‌ی اصلی هر تکه تو جستجوی ترکیبی میاد
                 primary_done = True
             song, n = _find_by_words(ws)
+            if song and song.get("unverified") and not AUDIO_SEARCH_GUESS:
+                song = None        # صدا: فقط تطبیق ترانه‌ای (تأییدشده یا نسبی)؛ نتیجه‌ی خامِ جستجو نه
             if song and song.get("loose"):
                 if guess is None or song.get("ratio", 0) > guess[0].get("ratio", 0):
                     guess = (song, p, i)
@@ -878,6 +886,8 @@ def _lyrics_vote(paths, stop=None, partial=None):
     if len(all_ws) >= 10 and not (stop is not None and stop.is_set()):
         log.info("lyrics: trying all %d words of the pieces together", len(all_ws))
         song, n = _find_by_words(all_ws)
+        if song and song.get("unverified") and not AUDIO_SEARCH_GUESS:
+            song = None
         if song and song.get("loose"):
             if guess is None or song.get("ratio", 0) > guess[0].get("ratio", 0):
                 guess = (song, paths[0], 0)
@@ -906,6 +916,16 @@ _MAYBE = {"fa": "🔍 شاید یکی از این آهنگ‌ها باشه:", "e
 _TEXT_NEEDED = ("yt_search", "get_lyrics", "_parse_yt_title", "_fuzzy_overlap", "_lyr_windows", "_lyr_hook",
                 "_lyr_search_window", "_lyr_check", "_LYR_POOL", "fold", "send_result", "add_sample", "CANDS",
                 "cand_keyboard")
+
+
+_JUNK = re.compile(r"best music|trending|playlist|compilation|non[- ]?stop|\bmix\b|full album|"
+                   r"\d+\s*(?:hours?|hrs?)\b|\bhours?\b|study|relax|sleep|بهترین آهنگ|ساعت", re.I)
+
+
+def _junk_candidate(artist, title) -> bool:
+    """عنوان‌های کامپایل/اسپم یوتیوب (مثل «Month best music worldwide on piano Trending songs») آهنگ نیستن"""
+    return (len(title or "") > 80 or len(artist or "") > 60
+            or bool(_JUNK.search(fold(title or ""))) or bool(_JUNK.search(fold(artist or ""))))
 
 
 def _cand_key(artist, title) -> str:
@@ -981,7 +1001,7 @@ def _rank_by_words(mod, words, early=True, raw=None):
                 except Exception:
                     continue
                 k = _cand_key(a, t)
-                if not t or not title_key(t) or k in seen_r:
+                if not t or not title_key(t) or k in seen_r or _junk_candidate(a, t):
                     continue
                 seen_r.add(k)
                 raw.append({"artist": a or "", "title": t})
