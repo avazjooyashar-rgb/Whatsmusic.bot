@@ -1,5 +1,11 @@
 """
-recognition.py - v16.24 (یک فایل کامل، جای recognition.py قبلی؛ bot.py بدون تغییر کار می‌کنه)
+recognition.py - v16.25 (یک فایل کامل، جای recognition.py قبلی؛ bot.py بدون تغییر کار می‌کنه)
+
+تغییرهای v16.25 نسبت به v16.24 (متن ترانه دست‌نخورده):
+  - ملودی: امتیاز خیلی قوی (وزن >= HUM_SOLO_W=0.66) بدون رقیب = قبول فوری؛ امتیاز نسبتاً قوی (>= HUM_SOLO_MIN=0.55) = آخر کار
+    به‌عنوان حدس (با «آهنگ اشتباه»). خاموش: HUM_SOLO=0
+  - دانلود: جستجو با چند شکل (خواننده‌ی اول، بدون پرانتز، فقط اسم آهنگ)؛ اگه یه ویدیو خطا داد نفر بعدی؛
+    اگه لینک ACR کار نکرد جستجو؛ علت خطا تو پیام ثبت می‌شه
 
 تغییرهای v16.24 نسبت به v16.23:
   - صدا (پیانو/بی‌کلام): نتیجه‌ی خامِ جستجوی یوتیوب دیگه به‌عنوان جواب داده نمی‌شه (AUDIO_SEARCH_GUESS=1 برای برگردوندن)؛
@@ -114,6 +120,9 @@ FP_WEAK_MIN = _f("FP_WEAK_MIN", 12)
 LOCAL_PIECES = max(1, int(_f("LOCAL_PIECES", 3)))
 HUM_CAP = _f("HUM_CAP", 0.6)
 HUM_CAP_STRONG = _f("HUM_CAP_STRONG", 0.7)   # سقف وزن ملودی وقتی امتیازش >= 0.85 باشه
+HUM_SOLO = os.environ.get("HUM_SOLO", "1") == "1"       # ملودیِ خیلی قوی بدون رقیب: بدون شاهد دوم هم قبول
+HUM_SOLO_W = _f("HUM_SOLO_W", 0.66)     # وزن >= این (امتیاز ملودی ~0.88+): قبول فوری
+HUM_SOLO_MIN = _f("HUM_SOLO_MIN", 0.55)  # وزن >= این (امتیاز ~0.73+): آخر کار به‌عنوان حدس (با «آهنگ اشتباه») داده می‌شه
 HUM_MIN = _f("HUM_MIN", 0.3)            # امتیاز ملودی (۰..۱) کمتر از این = نویز، نادیده گرفته می‌شه
 HUM_VOTE_BONUS = _f("HUM_VOTE_BONUS", 0.2)
 HUM_VOTE_CAP = _f("HUM_VOTE_CAP", 0.4)
@@ -194,7 +203,7 @@ def init(load_accounts, local_fn=None, words_fn=None):
     if words_fn and WHISPER_MODEL and WHISPER_PRELOAD:
         threading.Thread(target=_get_whisper, daemon=True, name="whisper-load").start()
     threading.Thread(target=_sh_warm, daemon=True, name="shazam-warm").start()
-    log.info("recognition v16.24: local=%s lyrics=%s whisper=%s",
+    log.info("recognition v16.25: local=%s lyrics=%s whisper=%s",
              bool(local_fn), bool(words_fn), ("groq+" if GROQ_KEY else "") + (WHISPER_MODEL or "off"))
 
 
@@ -1475,6 +1484,11 @@ def _ask_engines(paths, rejected, items, stop):
             wait(waitset, timeout=min(0.3, left()), return_when=FIRST_COMPLETED)
         harvest(futs)
 
+        groups, second = _decide(items + (list(partial) if (partial and not st["lyr_taken"]) else []), rejected)
+        if (HUM_SOLO and groups and set(groups[0]["srcs"]) <= {"hum"}
+                and groups[0]["w"] >= HUM_SOLO_W - 1e-6 and groups[0]["w"] - second >= 0.3):
+            log.info("strong melody match, no competitor: %s", groups[0]["items"][0]["title"])
+            return _to_song(groups)
         start_lyrics()
         take_lyrics(block=True)
         groups, second = _decide(items, rejected)
@@ -1531,6 +1545,12 @@ def _ask_engines(paths, rejected, items, stop):
         if (LYRICS_GUESS and groups and "lyrics" in groups[0]["srcs"]
                 and groups[0]["w"] >= min(LYR_GUESS_W, LYR_SEARCH_W) - 1e-6 and groups[0]["w"] - second >= 0.1):
             log.info("no confident answer: returning the best lyrics guess: %s", groups[0]["items"][0]["title"])
+            song = _to_song(groups)
+            song["guess"] = True
+            return song
+        if (HUM_SOLO and groups and set(groups[0]["srcs"]) <= {"hum"}
+                and groups[0]["w"] >= HUM_SOLO_MIN - 1e-6 and groups[0]["w"] - second >= 0.3):
+            log.info("only a melody match, returning it as a guess: %s", groups[0]["items"][0]["title"])
             song = _to_song(groups)
             song["guess"] = True
             return song
@@ -1620,15 +1640,21 @@ def _ydl(**kw):
     return yt_dlp.YoutubeDL(o)
 
 
-def pick_video(title, artist, dur=None, want_variant=False):
-    """بهترین نتیجه‌ی یوتیوب: کانال «- Topic» (نسخه‌ی رسمی)، نزدیک‌ترین مدت، بدون ریمیکس/لایو."""
-    q = f"ytsearch6:{artist} {title}"
-    with _ydl(extract_flat="in_playlist") as y:
-        info = y.extract_info(q, download=False)
-    best, best_s = None, -1e9
-    for e in (info or {}).get("entries") or []:
-        if not e or not e.get("id"):
-            continue
+def _search_queries(title, artist):
+    """چند شکل جستجو: اسم کامل، فقط خواننده‌ی اول، بدون پرانتز، فقط اسم آهنگ (برای اسم‌های عجیب/چندخواننده‌ای)"""
+    fa = first_artist(artist) or artist or ""
+    t_clean = re.sub(r"\s+", " ", _BRACKETS.sub(" ", title or "")).strip() or (title or "")
+    out = []
+    for q in (f"{artist} {title}", f"{fa} {t_clean}", f"{t_clean} {fa} audio", t_clean):
+        q = q.strip()
+        if q and q not in out:
+            out.append(q)
+    return out
+
+
+def _score_entries(entries, title, artist, dur, want_variant):
+    res = []
+    for e in entries:
         t, ch, d = e.get("title") or "", e.get("channel") or e.get("uploader") or "", e.get("duration")
         s = 0.0
         if ch.endswith("- Topic"):
@@ -1645,10 +1671,33 @@ def pick_video(title, artist, dur=None, want_variant=False):
             s -= min(abs(d - dur), 120) / 6
         elif d and d > 900:
             s -= 6
-        if s > best_s:
-            best, best_s = e, s
-    return f"https://www.youtube.com/watch?v={best['id']}" if best else None
+        res.append((s, e))
+    return res
 
+
+def pick_videos(title, artist, dur=None, want_variant=False, n=3):
+    """چند نتیجه‌ی یوتیوب به ترتیب امتیاز. اگه جستجوی اول چیزِ مرتبطی نداد، شکل‌های دیگه‌ی جستجو امتحان می‌شن."""
+    seen, ranked = set(), []
+    for q in _search_queries(title, artist):
+        try:
+            with _ydl(extract_flat="in_playlist") as y:
+                info = y.extract_info(f"ytsearch6:{q}", download=False)
+        except Exception as e:
+            log.info("video search failed (%s): %s", q[:40], str(e)[:100])
+            continue
+        entries = [e for e in ((info or {}).get("entries") or []) if e and e.get("id") and e["id"] not in seen]
+        seen.update(e["id"] for e in entries)
+        ranked += _score_entries(entries, title, artist, dur, want_variant)
+        if ranked and max(r[0] for r in ranked) >= 2.0:      # اسم آهنگ یا خواننده تو عنوان/کانال هست: کافیه
+            break
+    ranked.sort(key=lambda r: -r[0])
+    return [f"https://www.youtube.com/watch?v={e['id']}" for _s, e in ranked[:n]]
+
+
+def pick_video(title, artist, dur=None, want_variant=False):
+    """بهترین نتیجه‌ی یوتیوب: کانال «- Topic» (نسخه‌ی رسمی)، نزدیک‌ترین مدت، بدون ریمیکس/لایو."""
+    urls = pick_videos(title, artist, dur, want_variant, n=1)
+    return urls[0] if urls else None
 
 _ARIA = shutil.which("aria2c") if os.environ.get("DL_ARIA2", "1") == "1" else None
 
@@ -1763,13 +1812,25 @@ def _job(title, artist, dur, cover_url, yt):
         log.info("download cache hit: %s - %s", artist, title)
         return final                                   # کش: دانلود دوباره لازم نیست
     cover_f = _DPOOL.submit(find_cover, title, artist, cover_url)     # کاور موازی با جستجو/دانلود
-    url = yt or pick_video(title, artist, dur, want_variant=bool(_DL_VARIANT.search(title)))
+    wv = bool(_DL_VARIANT.search(title))
+    urls = [yt] if yt else pick_videos(title, artist, dur, want_variant=wv)
     t_search = time.time() - t0
-    if not url:
+    if not urls:
         raise RuntimeError("no video found")
     base = os.path.join(DL_DIR, key + "_raw")
     t1 = time.time()
-    raw = _fetch_audio(url, base)
+    raw, err, i = None, None, 0
+    while raw is None and i < min(3, len(urls)):          # یه ویدیو خطا داد (محدودیت سنی/منطقه/حذف‌شده): نفر بعدی
+        try:
+            raw = _fetch_audio(urls[i], base)
+        except Exception as e:
+            err = e
+            log.info("download attempt %d failed (%s): %s", i + 1, urls[i][-11:], str(e)[:120])
+            if i == 0 and yt and len(urls) == 1:          # لینک آماده (ACR) کار نکرد: بگرد
+                urls += [u for u in pick_videos(title, artist, dur, want_variant=wv) if u != yt]
+        i += 1
+    if raw is None:
+        raise RuntimeError("download failed: %s" % str(err)[:120])
     t_fetch = time.time() - t1
     t2 = time.time()
     try:
