@@ -1,5 +1,12 @@
 """
-recognition.py - v16.25 (یک فایل کامل، جای recognition.py قبلی؛ bot.py بدون تغییر کار می‌کنه)
+recognition.py - v16.26 (یک فایل کامل، جای recognition.py قبلی؛ bot.py بدون تغییر کار می‌کنه)
+
+تغییرهای v16.26 نسبت به v16.25 (متن ترانه و ملودی دست‌نخورده):
+  - «قبول نرم» (soft accept): اگه یک موتور صوتی (ACR / Shazam / دیتابیس) همون آهنگ رو روی حداقل ۲ تکه‌ی مختلف داده،
+    وزنش >= SOFT_ACCEPT_W (0.6) و فاصله‌اش با نفر دوم >= SOFT_ACCEPT_GAP (0.25) باشه، همون لحظه قبول می‌شه
+    (قبلاً با وزن 0.73 < 0.75 رد می‌شد و ۱۲ تا ۲۸ ثانیه تو آخرین راه و با سهمیه‌ی ACR هدر می‌رفت)
+  - اگه Shazam هنوز منتظره، حداکثر SOFT_ACCEPT_GRACE (3 ثانیه) صبر می‌شه
+  - خاموش‌کردن: SOFT_ACCEPT_PIECES=99
 
 تغییرهای v16.25 نسبت به v16.24 (متن ترانه دست‌نخورده):
   - ملودی: امتیاز خیلی قوی (وزن >= HUM_SOLO_W=0.66) بدون رقیب = قبول فوری؛ امتیاز نسبتاً قوی (>= HUM_SOLO_MIN=0.55) = آخر کار
@@ -64,6 +71,7 @@ recognition.py - v16.25 (یک فایل کامل، جای recognition.py قبلی
 
 محیط (.env) - همه اختیاری:
   GUESS_MIN_W=0.75  TOTAL_TIMEOUT=100
+  SOFT_ACCEPT_W=0.6  SOFT_ACCEPT_GAP=0.25  SOFT_ACCEPT_PIECES=2  SOFT_ACCEPT_GRACE=3
   WHISPER_MODEL=small   (دقیق‌تر: medium یا large-v3-turbo؛ خالی = متن ترانه خاموش)
   WHISPER_COMPUTE=int8  WHISPER_LANG=  WHISPER_THREADS=4  WHISPER_MAX_PIECES=2  WHISPER_WAIT=45
   WHISPER_BEAM=1 (برای دقت بیشتر ۳ یا ۵؛ کندتر)  WHISPER_PRELOAD=1
@@ -171,6 +179,11 @@ MAX_PIECES = 3
 MULTI_FAST_W = _f("MULTI_FAST_W", 1.0)      # دو نوع شاهد مستقل (مثلاً ملودی + ترانه) هم‌نظر شدن و وزن >= این: بدون صبر قبول
 PREFETCH = os.environ.get("PREFETCH", "1") == "1"   # دانلود از همون لحظه‌ای که آهنگ محتمل شد شروع می‌شه
 PREFETCH_W = _f("PREFETCH_W", 0.6)
+# «قبول نرم»: یک موتور صوتی همون آهنگ رو روی چند تکه‌ی مختلف داده و رقیب ضعیفه -> قبول، بدون آخرین راه
+SOFT_W = _f("SOFT_ACCEPT_W", 0.6)           # حداقل وزن
+SOFT_GAP = _f("SOFT_ACCEPT_GAP", 0.25)      # حداقل فاصله با نفر دوم
+SOFT_PIECES = int(_f("SOFT_ACCEPT_PIECES", 2))   # حداقل تعداد تکه‌های مختلف که همین آهنگ رو دادن (99 = خاموش)
+SOFT_GRACE = _f("SOFT_ACCEPT_GRACE", 3)     # اگه Shazam هنوز منتظره، حداکثر این‌قدر صبر کن (ثانیه)
 
 _POOL = ThreadPoolExecutor(max_workers=12, thread_name_prefix="rec")
 _WPOOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="whisper")
@@ -203,7 +216,7 @@ def init(load_accounts, local_fn=None, words_fn=None):
     if words_fn and WHISPER_MODEL and WHISPER_PRELOAD:
         threading.Thread(target=_get_whisper, daemon=True, name="whisper-load").start()
     threading.Thread(target=_sh_warm, daemon=True, name="shazam-warm").start()
-    log.info("recognition v16.25: local=%s lyrics=%s whisper=%s",
+    log.info("recognition v16.26: local=%s lyrics=%s whisper=%s",
              bool(local_fn), bool(words_fn), ("groq+" if GROQ_KEY else "") + (WHISPER_MODEL or "off"))
 
 
@@ -1163,6 +1176,19 @@ def _decide(items, rejected):
     return groups, second
 
 
+def _soft_ok(groups, second):
+    """«قبول نرم»: یک موتور صوتی (ACR / Shazam / دیتابیس) همون آهنگ رو روی چند تکه‌ی مختلف داده،
+    وزنش به حد معقول رسیده و رقیب نزدیکی نداره. مثلاً وزن 0.73 با رقیب 0.39 (قبلاً چون < 0.75 بود رد می‌شد)."""
+    if not groups:
+        return False
+    g = groups[0]
+    if g["w"] < SOFT_W or g["w"] - second < SOFT_GAP:
+        return False
+    idxs = {c.get("idx") for c in g["items"]
+            if c["src"] in ("acr", "shazam", "local") and c.get("idx") is not None}
+    return len(idxs) >= SOFT_PIECES
+
+
 def _to_song(groups):
     top = groups[0]
     its = sorted(top["items"], key=lambda c: _NAME_PRIORITY.get(c["src"], 9))
@@ -1342,7 +1368,7 @@ def _ask_engines(paths, rejected, items, stop):
     acr_f = {}
     sh_f = {}
     handled = set()
-    st = {"launched": 0, "last": t0, "lyr": None, "lyr_taken": False, "logged": -1, "pf": False}
+    st = {"launched": 0, "last": t0, "lyr": None, "lyr_taken": False, "logged": -1, "pf": False, "soft_t": None}
 
     def left():
         return max(0.2, deadline - time.time())
@@ -1444,6 +1470,18 @@ def _ask_engines(paths, rejected, items, stop):
                 log.info("fast accept (independent evidence agrees: %s): %s", "+".join(sorted(groups[0]["srcs"])),
                          groups[0]["items"][0]["title"])
                 return _to_song(groups)
+            if _soft_ok(groups, second):
+                # همون آهنگ روی چند تکه‌ی مختلف از یک موتور صوتی اومده و رقیب ضعیفه: بدون آخرین راه قبول
+                acr_busy = any(k == "acr" and not f.done() for f, (k, _p, _i) in futs.items())
+                if not acr_busy and st["launched"] >= min(2, len(pieces)):
+                    if st["soft_t"] is None:
+                        st["soft_t"] = now
+                    if not online_pending() or now - st["soft_t"] >= SOFT_GRACE:
+                        log.info("soft accept (same song on several pieces, w=%.2f): %s",
+                                 groups[0]["w"], groups[0]["items"][0]["title"])
+                        return _to_song(groups)
+            else:
+                st["soft_t"] = None
             if len(groups) >= 2 and not online_pending() and st["launched"] >= min(2, len(pieces)):
                 # دو موتور آنلاین (ACR و Shazam) هر دو جواب قوی دادن ولی اسم‌ها فرق داره (مثلاً فارسی/لاتین).
                 # صبر برای ترانه یا آخرین راه فایده‌ای نداره: همین حالا قبول می‌شه.
@@ -1493,6 +1531,9 @@ def _ask_engines(paths, rejected, items, stop):
         take_lyrics(block=True)
         groups, second = _decide(items, rejected)
         show("final")
+        if _soft_ok(groups, second):
+            log.info("soft accept at final (w=%.2f): %s", groups[0]["w"], groups[0]["items"][0]["title"])
+            return _to_song(groups)
         if groups and groups[0]["w"] >= GUESS_MIN_W and (groups[0]["w"] - second >= TIE_GAP or not LAST_RESORT):
             return _to_song(groups)
         tie = bool(groups and groups[0]["w"] >= GUESS_MIN_W)
@@ -1534,6 +1575,10 @@ def _ask_engines(paths, rejected, items, stop):
             groups, second = _decide(items, rejected)
             if groups and groups[0]["w"] >= GUESS_MIN_W:
                 log.info("found by the last resort: %s", groups[0]["items"][0]["title"])
+                return _to_song(groups)
+            if _soft_ok(groups, second):
+                log.info("soft accept after the last resort (w=%.2f): %s", groups[0]["w"],
+                         groups[0]["items"][0]["title"])
                 return _to_song(groups)
 
         if tie:
@@ -1698,6 +1743,7 @@ def pick_video(title, artist, dur=None, want_variant=False):
     """بهترین نتیجه‌ی یوتیوب: کانال «- Topic» (نسخه‌ی رسمی)، نزدیک‌ترین مدت، بدون ریمیکس/لایو."""
     urls = pick_videos(title, artist, dur, want_variant, n=1)
     return urls[0] if urls else None
+
 
 _ARIA = shutil.which("aria2c") if os.environ.get("DL_ARIA2", "1") == "1" else None
 
