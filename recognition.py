@@ -1,5 +1,16 @@
 """
-recognition.py - v16.21 (یک فایل کامل، جای recognition.py قبلی؛ bot.py بدون تغییر کار می‌کنه)
+recognition.py - v16.23 (یک فایل کامل، جای recognition.py قبلی؛ bot.py بدون تغییر کار می‌کنه)
+
+تغییرهای v16.23 نسبت به v16.22 (بخش متن ترانه دست نخورده):
+  - ملودی: امتیاز >= 0.85 سقف وزن بالاتر (HUM_CAP_STRONG=0.7)؛ ملودی تنها هنوز قبول نمی‌شه، ولی با هر شاهد دوم (تکه‌ی دیگه/ترانه) قبول می‌شه
+  - سرعت: دو شاهد مستقل (مثلاً ملودی + ترانه) هم‌نظر و وزن >= 1.0: فوری قبول (بدون صبر برای Shazam/آخرین راه). MULTI_FAST_W
+  - دانلود: از همون لحظه‌ای که آهنگ محتمل شد (وزن >= 0.6) تو پس‌زمینه شروع می‌شه (PREFETCH=0 برای خاموش‌کردن)؛ اگه aria2c نصب باشه
+    با چند اتصال دانلود می‌شه (apt install aria2)
+
+تغییرهای v16.22 نسبت به v16.21:
+  - باگ ملودی (humming) درست شد: امتیاز ملودی ۰..۱ می‌آد (مثلاً ۰.۹۶) ولی تقسیم بر ۱۰۰ می‌شد و وزنش ~۰.۰۱ می‌شد
+    (یعنی ملودی از اول هیچ تأثیری نداشت). حالا ملودی قوی وزن واقعی داره. HUM_MIN=0.3: امتیاز کمتر = نویز
+  - اگه حدس ضعیف ترانه با ملودی/شاهد دیگه هم‌نظر بود، منتظر تموم شدن کل کار ترانه نمی‌مونه (قبلاً ~۴۲ ثانیه، حالا خیلی کمتر)
 
 تغییرهای v16.21 نسبت به v16.20:
   - مثل بات اصلی: اگه ترانه‌ی هیچ کاندیدایی تأیید نشد، نتیجه‌های بالای جستجو (تأییدنشده) به‌عنوان حدس/لیست «شاید» داده می‌شن
@@ -61,6 +72,7 @@ import inspect
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -96,6 +108,8 @@ FP_STRONG_SINGLE = _f("FP_STRONG_SINGLE", 45)
 FP_WEAK_MIN = _f("FP_WEAK_MIN", 12)
 LOCAL_PIECES = max(1, int(_f("LOCAL_PIECES", 3)))
 HUM_CAP = _f("HUM_CAP", 0.6)
+HUM_CAP_STRONG = _f("HUM_CAP_STRONG", 0.7)   # سقف وزن ملودی وقتی امتیازش >= 0.85 باشه
+HUM_MIN = _f("HUM_MIN", 0.3)            # امتیاز ملودی (۰..۱) کمتر از این = نویز، نادیده گرفته می‌شه
 HUM_VOTE_BONUS = _f("HUM_VOTE_BONUS", 0.2)
 HUM_VOTE_CAP = _f("HUM_VOTE_CAP", 0.4)
 ACR_VARIANT_KINDS = {k.strip() for k in os.environ.get("ACR_VARIANT_KINDS", "clean,vocal").split(",") if k.strip()}
@@ -139,6 +153,9 @@ EARLY_W = 1.6
 EARLY_GAP = 0.5
 LAST_GAP = 0.3
 MAX_PIECES = 3
+MULTI_FAST_W = _f("MULTI_FAST_W", 1.0)      # دو نوع شاهد مستقل (مثلاً ملودی + ترانه) هم‌نظر شدن و وزن >= این: بدون صبر قبول
+PREFETCH = os.environ.get("PREFETCH", "1") == "1"   # دانلود از همون لحظه‌ای که آهنگ محتمل شد شروع می‌شه
+PREFETCH_W = _f("PREFETCH_W", 0.6)
 
 _POOL = ThreadPoolExecutor(max_workers=12, thread_name_prefix="rec")
 _WPOOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="whisper")
@@ -171,7 +188,7 @@ def init(load_accounts, local_fn=None, words_fn=None):
     if words_fn and WHISPER_MODEL and WHISPER_PRELOAD:
         threading.Thread(target=_get_whisper, daemon=True, name="whisper-load").start()
     threading.Thread(target=_sh_warm, daemon=True, name="shazam-warm").start()
-    log.info("recognition v16.21: local=%s lyrics=%s whisper=%s",
+    log.info("recognition v16.23: local=%s lyrics=%s whisper=%s",
              bool(local_fn), bool(words_fn), ("groq+" if GROQ_KEY else "") + (WHISPER_MODEL or "off"))
 
 
@@ -382,9 +399,14 @@ def _acr_parse(j) -> list:
             sp = ((ext.get("spotify") or {}).get("track") or {}).get("id")
             yt = (ext.get("youtube") or {}).get("vid")
             ms = _num(m.get("duration_ms"))
-            score = _num(m.get("score")) / 100
+            raw_score = _num(m.get("score"))
+            score = raw_score / 100
             if kind == "humming":
-                w = min(HUM_CAP, score * 0.7) * (1.0 - 0.08 * rank)      # ملودی تنها هرگز قبول نمی‌شه
+                # امتیاز ملودی ۰..۱ می‌آد (مثلاً ۰.۹۶)، نه ۰..۱۰۰؛ قبلاً تقسیم بر ۱۰۰ می‌شد و ملودیِ قوی عملاً صفر می‌شد
+                score = raw_score if raw_score <= 1.0 else raw_score / 100
+                if score < HUM_MIN:
+                    continue
+                w = min(HUM_CAP_STRONG if score >= 0.85 else HUM_CAP, score * 0.75) * (1.0 - 0.08 * rank)      # ملودی تنها هرگز قبول نمی‌شه
                 src = "hum"
                 log.info("acr hum #%d: '%s' raw score=%s -> w=%.2f", rank + 1, m["title"], m.get("score"), w)
             elif kind == "music":
@@ -1221,6 +1243,18 @@ def _try_variant(path, kind, rejected):
 # ======================================================================================
 # موتورهای آنلاین + رای‌گیری (۱ سهمیه‌ی کاربر)
 # ======================================================================================
+def _prefetch(song):
+    """دانلود رو تو پس‌زمینه شروع می‌کنه؛ start_download کش داره، پس وقتی bot.py بعداً صداش بزنه فایل آماده‌ست."""
+    if not PREFETCH or not song or not song.get("title"):
+        return
+    try:
+        start_download(song["title"], song.get("artist") or "", dur=song.get("dur"),
+                       cover_url=song.get("cover"), yt=song.get("yt"))
+        log.info("prefetch started: %s - %s", song.get("artist"), song["title"])
+    except Exception as e:
+        log.info("prefetch failed: %s", str(e)[:80])
+
+
 def ask_engines(paths, rejected=(), _unused1=None, _unused2=None, extra=None):
     stop = threading.Event()
     t0 = time.time()
@@ -1244,6 +1278,8 @@ def ask_engines(paths, rejected=(), _unused1=None, _unused2=None, extra=None):
             except Exception as e:
                 log.info("DEBUG save failed: %s", str(e)[:100])
         res = _ask_engines(paths, set(rejected or ()), list(extra or []), stop)
+        if res and not res.get("guess"):
+            _prefetch(res)
         if res:
             log.info("RESULT (%.1fs): %s - %s [%s]", time.time() - t0, res.get("artist"), res.get("title"),
                      res.get("engine"))
@@ -1277,7 +1313,7 @@ def _ask_engines(paths, rejected, items, stop):
     acr_f = {}
     sh_f = {}
     handled = set()
-    st = {"launched": 0, "last": t0, "lyr": None, "lyr_taken": False, "logged": -1}
+    st = {"launched": 0, "last": t0, "lyr": None, "lyr_taken": False, "logged": -1, "pf": False}
 
     def left():
         return max(0.2, deadline - time.time())
@@ -1310,7 +1346,17 @@ def _ask_engines(paths, rejected, items, stop):
         if not lyr.done():
             if not block:
                 return
-            wait([lyr], timeout=max(0.0, min(deadline, t0 + WHISPER_WAIT) - time.time()))
+            end = min(deadline, t0 + WHISPER_WAIT)
+            while time.time() < end and not lyr.done():
+                wait([lyr], timeout=min(0.5, max(0.0, end - time.time())))
+                if partial and not lyr.done():
+                    # حدس ضعیف ترانه با شاهد دیگه (مثلاً ملودی) هم‌نظره: منتظر تموم شدن بقیه‌ی کار ترانه نمی‌مونیم
+                    g, sec = _decide(items + list(partial), rejected)
+                    if g and g[0]["w"] >= GUESS_MIN_W and g[0]["w"] - sec >= TIE_GAP:
+                        log.info("lyrics guess agrees with other evidence: not waiting for the rest of the lyrics job")
+                        items.extend(list(partial))
+                        st["lyr_taken"] = True
+                        return
             if not lyr.done():
                 return
         st["lyr_taken"] = True
@@ -1354,9 +1400,20 @@ def _ask_engines(paths, rejected, items, stop):
             harvest(futs)
             take_lyrics()
             show("round")
-            groups, second = _decide(items, rejected)
+            cur = (items + list(partial)) if (partial and not st["lyr_taken"]) else items
+            groups, second = _decide(cur, rejected)
             now = time.time()
+            if (PREFETCH and not st["pf"] and groups and groups[0]["w"] >= PREFETCH_W
+                    and groups[0]["w"] - second >= 0.3
+                    and any(x in groups[0]["srcs"] for x in ("local", "shazam", "acr", "hum"))):
+                st["pf"] = True        # آهنگ محتمل شد: دانلود از همین حالا (اگه آخرش همین نبود، فقط یه فایل کش اضافه می‌مونه)
+                _prefetch(sorted(groups[0]["items"], key=lambda c: _NAME_PRIORITY.get(c["src"], 9))[0])
             if groups and groups[0]["w"] >= EARLY_W and groups[0]["w"] - second >= EARLY_GAP:
+                return _to_song(groups)
+            if (groups and len(groups[0]["srcs"]) >= 2 and groups[0]["w"] >= MULTI_FAST_W
+                    and groups[0]["w"] - second >= 0.4):
+                log.info("fast accept (independent evidence agrees: %s): %s", "+".join(sorted(groups[0]["srcs"])),
+                         groups[0]["items"][0]["title"])
                 return _to_song(groups)
             if len(groups) >= 2 and not online_pending() and st["launched"] >= min(2, len(pieces)):
                 # دو موتور آنلاین (ACR و Shazam) هر دو جواب قوی دادن ولی اسم‌ها فرق داره (مثلاً فارسی/لاتین).
@@ -1573,9 +1630,22 @@ def pick_video(title, artist, dur=None, want_variant=False):
     return f"https://www.youtube.com/watch?v={best['id']}" if best else None
 
 
+_ARIA = shutil.which("aria2c") if os.environ.get("DL_ARIA2", "1") == "1" else None
+
+
 def _fetch_audio(url, out_base):
-    with _ydl(format="bestaudio[ext=m4a]/bestaudio/best", outtmpl=out_base + ".%(ext)s",
-              concurrent_fragment_downloads=FRAGMENTS, noplaylist=True) as y:
+    kw = dict(format="bestaudio[ext=m4a]/bestaudio/best", outtmpl=out_base + ".%(ext)s",
+              concurrent_fragment_downloads=FRAGMENTS, noplaylist=True)
+    if _ARIA:        # اتصال چندتکه‌ای (apt install aria2)؛ اگه خطا داد، روش معمولی
+        try:
+            with _ydl(external_downloader="aria2c",
+                      external_downloader_args={"aria2c": ["-x16", "-s16", "-k1M", "--file-allocation=none"]},
+                      **kw) as y:
+                info = y.extract_info(url, download=True)
+                return y.prepare_filename(info)
+        except Exception as e:
+            log.info("aria2c download failed (%s), falling back", str(e)[:80])
+    with _ydl(**kw) as y:
         info = y.extract_info(url, download=True)
         return y.prepare_filename(info)
 
